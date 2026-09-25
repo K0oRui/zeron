@@ -1,6 +1,6 @@
 // Standalone graphics-driver footprint reproduction; no window or app data.
 // clang -fobjc-arc -Wall -Wextra -framework Foundation -framework Metal \
-//   -framework MetalPerformanceShaders scripts/macos-metal-memory-probe.m \
+//   -framework MetalPerformanceShaders scripts/perf/macos-metal-memory-probe.m \
 //   -o /tmp/metal-memory-probe
 // /tmp/metal-memory-probe [blit|render|mixed|blur]
 #import <Foundation/Foundation.h>

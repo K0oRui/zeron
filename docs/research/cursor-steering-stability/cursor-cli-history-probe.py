@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in native CLI comparison: requires Cursor login and uses Muse Spark quota.
 
-Run: python3 scripts/cursor-cli-history-probe.py
+Run: python3 docs/research/cursor-steering-stability/cursor-cli-history-probe.py
 All prompts are synthetic; never resumes an existing user conversation.
 """
 

@@ -1,11 +1,11 @@
 // chat2 wire-level E2E against a deployed worker (AUTH_MODE=dev).
 // Speaks the binary frame protocol from edge/src/chat-frames.ts and drives
 // every route + guard in edge/src/chat-room.ts per docs/chat2-sync.md B.
-// Usage: node chat2-e2e.mjs <baseUrl>
+// Usage: node chat2-check.mjs <baseUrl>
 import { randomUUID, randomBytes } from "node:crypto";
 
 const base = process.argv[2];
-if (!base) throw new Error("usage: node chat2-e2e.mjs <baseUrl>");
+if (!base) throw new Error("usage: node chat2-check.mjs <baseUrl>");
 const wsBase = base.replace(/^http/, "ws");
 const userA = "e2e-user-a";
 const userB = "e2e-user-b";

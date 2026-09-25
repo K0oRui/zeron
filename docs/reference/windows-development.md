@@ -73,8 +73,8 @@ also run on an interactive Windows desktop after building the release app:
 
 ```powershell
 cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
-./scripts/test-windows-lifecycle.ps1 -Runs 5
-./scripts/test-windows-rendering.ps1
+./scripts/test/test-windows-lifecycle.ps1 -Runs 5
+./scripts/test/test-windows-rendering.ps1
 ```
 
 The lifecycle probe uses isolated data and provider homes. The renderer probe

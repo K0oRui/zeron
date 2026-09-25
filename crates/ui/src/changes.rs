@@ -305,6 +305,25 @@ impl DiffHorizontalGeometry {
 
 /// Measure the same runs the row paints. Color boundaries can break kerning
 /// and ligatures on native platforms even when every run uses the same font.
+///
+/// Bounded: shaping runs on the render path (via `FileHorizontalState::metrics`
+/// on first paint), so a minified single-line blob or a tens-of-thousands-line
+/// file must not shape unbounded text there — the native shaper can take
+/// seconds or OOM on megabytes of shaped text in one line. Lines past
+/// [`MAX_SHAPED_LINE_CHARS`] and files past [`MAX_SHAPED_LINES`] keep the
+/// column-estimate floor only.
+const MAX_SHAPED_LINES: usize = 5_000;
+const MAX_SHAPED_LINE_CHARS: usize = 2_000;
+
+/// True when shaping this line must be skipped. Bounded: a bare
+/// `chars().count()` would decode the whole line (a minified megabyte on one
+/// line) just to decide to skip it. Bytes upper-bound chars in UTF-8, so
+/// short lines shortcut and the rest decode at most LIMIT+1 chars.
+fn line_exceeds_shape_limit(text: &str) -> bool {
+    text.len() > MAX_SHAPED_LINE_CHARS
+        && text.chars().take(MAX_SHAPED_LINE_CHARS + 1).count() > MAX_SHAPED_LINE_CHARS
+}
+
 fn max_shaped_text_width(
     file: &FileDiff,
     highlights: Option<&DiffHighlights>,
@@ -320,16 +339,20 @@ fn max_shaped_text_width(
     file.hunks
         .iter()
         .flat_map(|hunk| &hunk.lines)
+        .take(MAX_SHAPED_LINES)
         .fold(0.0f32, |widest, line| {
+            // Preserve the old column estimate as a floor, including tab stops.
+            let floor = visual_columns(&line.text) as f32 * column_width;
+            let widest = widest.max(floor);
+            if line_exceeds_shape_limit(&line.text) {
+                return widest;
+            }
             let runs = line_runs(line, highlights, theme);
             let shaped = text_system
                 .shape_line(line.text.clone().into(), size, &runs, None)
                 .width()
                 .as_f32();
-            // Preserve the old column estimate as a floor, including tab stops.
-            widest
-                .max(shaped)
-                .max(visual_columns(&line.text) as f32 * column_width)
+            widest.max(shaped)
         })
 }
 
@@ -1034,6 +1057,7 @@ fn excerpt_side(
             SourceSide::Old => line.old_no,
             SourceSide::New => line.new_no,
         })
+        .filter(|number| *number > 0)
         .max()
         .unwrap_or(0) as usize;
     if max_line > MAX_EXCERPT_SOURCE_LINES {
@@ -1067,7 +1091,15 @@ fn excerpt_side(
         })
         .ok()?;
         for ((number, _), spans) in visible.into_iter().zip(document.lines) {
-            lines[number as usize - 1] = spans;
+            // Line 0 never addresses a source line (e.g. `@@ -0,0` headers on
+            // the untouched side); skip it instead of underflowing the index.
+            let Some(slot) = (number as usize)
+                .checked_sub(1)
+                .and_then(|ix| lines.get_mut(ix))
+            else {
+                continue;
+            };
+            *slot = spans;
         }
     }
     Some(Arc::new(zeron_syntax::HighlightedDocument {
@@ -2347,6 +2379,12 @@ impl Changes {
             return;
         };
         let body = range.start + 1..range.end;
+        // The ranges must stay in lockstep with `rows`; a stale range (e.g. a
+        // fold settling after a re-parse replaced the model) must not panic
+        // the render path — bail and let the next sync rebuild both.
+        if body.end > self.rows.len() {
+            return;
+        }
         let delta = new_body.len() as isize - body.len() as isize;
         // Only splice the rows that moved: `ListState::splice` clamps the
         // scroll anchor to the range start when the anchored row is inside it,
@@ -3164,20 +3202,35 @@ impl Changes {
         let highlight = files
             .get(row.file())
             .and_then(|file| self.request_highlight(file, &parsed_key, cx));
-        let horizontal = &self.parsed.as_ref().unwrap().horizontal[row.file()];
-        let code_width = match files.get(row.file()) {
-            Some(file) if !self.wrap_lines => DiffCodeWidth::Scrollable(horizontal.metrics(
-                file,
-                highlight.as_ref(),
-                &theme,
-                window.text_system(),
-                crate::typography::generation(cx),
-            )),
+        // `rows` and `parsed` are rebuilt together, but a row can outlive its
+        // parse across an async boundary — never index blindly in render.
+        let horizontal = self
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.horizontal.get(row.file()));
+        let code_width = match (files.get(row.file()), horizontal) {
+            (Some(file), Some(horizontal)) if !self.wrap_lines => {
+                DiffCodeWidth::Scrollable(horizontal.metrics(
+                    file,
+                    highlight.as_ref(),
+                    &theme,
+                    window.text_system(),
+                    crate::typography::generation(cx),
+                ))
+            }
             _ => DiffCodeWidth::Wrapped,
         };
-        let code_scroll = DiffCodeScrollContext {
-            handle: horizontal.scroll.clone(),
-            prefix: SharedString::from(format!("changes-code-row-{ix}")),
+        let code_scroll = match horizontal {
+            Some(horizontal) => DiffCodeScrollContext {
+                handle: horizontal.scroll.clone(),
+                prefix: SharedString::from(format!("changes-code-row-{ix}")),
+            },
+            // No horizontal state (stale row): the scroll id is only used as
+            // an element key, so a throwaway handle keeps the row renderable.
+            None => DiffCodeScrollContext {
+                handle: gpui::ScrollHandle::new(),
+                prefix: SharedString::from(format!("changes-code-row-{ix}")),
+            },
         };
         match row {
             DiffRow::FileHeader { file } => {
@@ -6364,6 +6417,40 @@ rename to new_name.rs
                 .iter()
                 .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
         );
+    }
+
+    #[test]
+    fn excerpt_skips_zero_line_numbers_without_panicking() {
+        // `@@ -0,0` headers leave the untouched side at line 0; the excerpt
+        // must skip those instead of underflowing the line index.
+        let files = parse_patch(
+            "diff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+fn main() {}\n+// done\n",
+        );
+        assert_eq!(files.len(), 1);
+        let highlights = excerpt_highlights(&files[0], Lang::Rust).expect("excerpt");
+        let added = &files[0].hunks[0].lines[0];
+        assert_eq!(added.new_no, Some(1));
+        let _ = highlights.spans(added);
+    }
+
+    #[test]
+    fn shape_limit_gate_matches_full_count_without_walking_megablobs() {
+        assert!(!line_exceeds_shape_limit(""));
+        assert!(!line_exceeds_shape_limit(
+            &"x".repeat(MAX_SHAPED_LINE_CHARS)
+        ));
+        assert!(line_exceeds_shape_limit(
+            &"x".repeat(MAX_SHAPED_LINE_CHARS + 1)
+        ));
+        // Multi-byte: byte length alone must not trip the gate.
+        assert!(!line_exceeds_shape_limit(
+            &"é".repeat(MAX_SHAPED_LINE_CHARS)
+        ));
+        assert!(line_exceeds_shape_limit(
+            &"é".repeat(MAX_SHAPED_LINE_CHARS + 1)
+        ));
+        // Minified megabyte on one line: over the limit.
+        assert!(line_exceeds_shape_limit(&"y".repeat(10 * 1024 * 1024)));
     }
 
     #[test]

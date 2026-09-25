@@ -4,7 +4,7 @@
 #   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
 # containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
 #
-# Usage: scripts/package-macos.sh
+# Usage: scripts/package/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
 #        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
 #        API key (.p8) for notarization; all three set → notarize + staple the
@@ -81,7 +81,7 @@ tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
-# ascii-hands artwork (committed renders from scripts/dmg-background.py).
+# ascii-hands artwork (committed renders from scripts/package/dmg-background.py).
 # dmgbuild writes the .DS_Store (background, icon view, icon positions)
 # directly — no Finder scripting, so it also works on headless CI runners.
 python3 -c 'import dmgbuild' 2>/dev/null ||
@@ -114,7 +114,7 @@ dmgbuild.build_dmg(
         "show_pathbar": False,
         "show_sidebar": False,
         "default_view": "icon-view",
-        # Window and icon geometry must match scripts/dmg-background.py.
+        # Window and icon geometry must match scripts/package/dmg-background.py.
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,

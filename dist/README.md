@@ -3,8 +3,8 @@
 ## Linux (implemented)
 
 ```sh
-scripts/package-linux.sh            # release build (thin LTO, stripped)
-PROFILE=debug scripts/package-linux.sh   # fast smoke package
+scripts/package/package-linux.sh            # release build (thin LTO, stripped)
+PROFILE=debug scripts/package/package-linux.sh   # fast smoke package
 ```
 
 Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
@@ -20,7 +20,7 @@ The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 ## macOS
 
 ```sh
-scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
+scripts/package/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
 ```
 
 Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc

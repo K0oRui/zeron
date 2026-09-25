@@ -276,7 +276,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
 - ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, workspace
-  registry sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
+  registry sync, WorkOS auth + org gate, presence. Proven live by `scripts/dev/e2e-smoke.sh`:
   two headless engines against a real edge — B queues a run into the chat doc, the durable
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
@@ -284,7 +284,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   attachment UI (engine upload RPCs exist), Cursor harness.
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
-  (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
+  (`scripts/package/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
   not executed — needs a Mac). Gaps: prefers-reduced-motion, engine hardening
   (instance lock, watchdogs), edge production deploy.
 

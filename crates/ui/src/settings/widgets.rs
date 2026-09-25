@@ -1652,7 +1652,11 @@ impl RenderOnce for SettingsScroll {
 pub struct TextTooltip(pub SharedString);
 
 impl Render for TextTooltip {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .max_w(px(320.0))

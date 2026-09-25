@@ -122,7 +122,7 @@ node_modules/.bin/wrangler deploy --config wrangler.transport-test.jsonc
 cd ..
 
 # Use the isolated workers.dev URL printed by deployment.
-python3 scripts/run-transport-matrix.py \
+python3 scripts/transport/run-transport-matrix.py \
   --binary target/debug/examples/transport_live \
   --origin https://zeron-transport-385-20260915.YOUR-SUBDOMAIN.workers.dev \
   --profile stream --output /tmp/transport-stream.json

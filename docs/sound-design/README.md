@@ -11,7 +11,7 @@ from the separate Appshots contribution.
   rising rounded pair.
 - [`attention.wav`](../../crates/ui/assets/sounds/attention.wav): failure or
   durable disconnection, restrained downward rounded pair.
-- [`generate-notification-sounds.py`](../../scripts/generate-notification-sounds.py):
+- [`generate-notification-sounds.py`](../../scripts/sound/generate-notification-sounds.py):
   reproduces the completion and question assets;
   `--variants-dir <directory>` also exports the two click-only alternatives.
 
@@ -29,7 +29,7 @@ references without triggers.
 Earlier click-only alternatives: [completion](auditions/done-minimal.wav) and
 [agent question](auditions/request-minimal.wav).
 
-Run `python3 scripts/generate-sound-auditions.py --install-attention` to regenerate
+Run `python3 scripts/sound/generate-sound-auditions.py --install-attention` to regenerate
 the ten numbered WAVs, their manifest, and the selected attention asset. All
 synthesis uses Python's standard library and original rounded pressure pulses,
 with no external samples.

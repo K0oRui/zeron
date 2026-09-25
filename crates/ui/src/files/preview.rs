@@ -483,15 +483,25 @@ fn file_highlight_result_is_current(
 
 fn renamed_document_path(path: &str, old_path: &str, new_path: &str) -> Option<String> {
     if path == old_path {
-        Some(new_path.to_string())
-    } else {
-        path.strip_prefix(&format!("{old_path}/"))
-            .map(|suffix| format!("{new_path}/{suffix}"))
+        return Some(new_path.to_string());
     }
+    // Document paths are native-flavored (`\` on Windows): match either
+    // separator and rejoin with the one the path used, so a `/`-only join
+    // can't strand renamed buffers under a stale key (same class as the
+    // folder-browser `C:\/...` rows).
+    let rest = path.strip_prefix(old_path)?;
+    let sep = rest.chars().next()?;
+    if !matches!(sep, '/' | '\\') {
+        return None;
+    }
+    Some(format!("{new_path}{sep}{}", &rest[sep.len_utf8()..]))
 }
 
 fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
-    path == ancestor || path.starts_with(&format!("{ancestor}/"))
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with(['/', '\\']))
 }
 
 pub(super) struct FileEditorTooltip {
@@ -3470,6 +3480,15 @@ mod tests {
             renamed_document_path("src-old/lib.rs", "src", "crates/ui/src"),
             None
         );
+        // Windows-native flavor: same matching, separator preserved.
+        assert_eq!(
+            renamed_document_path("C:\\proj\\src\\f.rs", "C:\\proj\\src", "C:\\proj\\lib"),
+            Some("C:\\proj\\lib\\f.rs".into())
+        );
+        assert_eq!(
+            renamed_document_path("C:\\proj\\src-old\\f.rs", "C:\\proj\\src", "C:\\proj\\lib"),
+            None
+        );
     }
 
     #[test]
@@ -3477,6 +3496,19 @@ mod tests {
         assert!(path_is_same_or_descendant("src/lib.rs", "src/lib.rs"));
         assert!(path_is_same_or_descendant("src/files/mod.rs", "src"));
         assert!(!path_is_same_or_descendant("src-old/lib.rs", "src"));
+        // Windows-native flavor, including the sibling-prefix guard.
+        assert!(path_is_same_or_descendant(
+            "C:\\proj\\f.rs",
+            "C:\\proj\\f.rs"
+        ));
+        assert!(path_is_same_or_descendant(
+            "C:\\proj\\src\\f.rs",
+            "C:\\proj"
+        ));
+        assert!(!path_is_same_or_descendant(
+            "C:\\proj-old\\f.rs",
+            "C:\\proj"
+        ));
     }
 
     #[test]

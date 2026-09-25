@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Linux/macOS end-to-end resource profile. Node >=22; no npm dependencies.
-// Usage: node scripts/resource-profile.mjs BINARY OUTPUT_DIR [claude-code|mock]
+// Usage: node scripts/perf/resource-profile.mjs BINARY OUTPUT_DIR [claude-code|mock]
 // DISPLAY must name a working X server; unset WAYLAND_DISPLAY for Xvfb.
 // Uses isolated local data and a real harness (Haiku by default). This costs
 // one API turn. RSS/CPU for the CLI child are reported separately from Zeron.

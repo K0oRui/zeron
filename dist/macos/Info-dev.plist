@@ -24,7 +24,7 @@
     <string>__VERSION__</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
-    <!-- Filled by scripts/run-macos-dev.sh. Keeping these in the bundle (not
+    <!-- Filled by scripts/dev/run-macos-dev.sh. Keeping these in the bundle (not
          only the parent shell) means macOS privacy's “Quit & Reopen” starts
          the same isolated development instance. -->
     <key>LSEnvironment</key>

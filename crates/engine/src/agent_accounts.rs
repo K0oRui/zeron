@@ -913,8 +913,7 @@ impl AgentAccounts {
     ) -> Result<(), EngineError> {
         if self.live_account_key(harness).as_deref() != Some(expected_account_key) {
             return Err(EngineError::Other(
-                "The live login changed while it was being removed — refresh and try again."
-                    .into(),
+                "The live login changed while it was being removed — refresh and try again.".into(),
             ));
         }
         match harness {
@@ -3245,7 +3244,10 @@ fn pkce_pair() -> (String, String) {
 /// actually redirects to — a buggy or hostile peer can't make us bind (and
 /// receive local traffic on) an arbitrary loopback port.
 pub(crate) fn tunnel_port_allowed(port: u16, url: Option<&str>) -> bool {
-    port >= 1024 && url.and_then(loopback_port).is_some_and(|redirect| redirect == port)
+    port >= 1024
+        && url
+            .and_then(loopback_port)
+            .is_some_and(|redirect| redirect == port)
 }
 
 pub(crate) fn loopback_port(url: &str) -> Option<u16> {
@@ -3730,7 +3732,9 @@ mod probe_tests {
         assert!(start.url.contains("state="));
         // The verifier never rides the authorize url.
         let verifier = match lock(&accounts.inner.flows).get(&start.login_id) {
-            Some(LoginFlow::Claude { verifier, state, .. }) => {
+            Some(LoginFlow::Claude {
+                verifier, state, ..
+            }) => {
                 assert_ne!(verifier, state);
                 verifier.clone()
             }

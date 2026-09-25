@@ -82,7 +82,10 @@ gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "103f13da
 similar = "2"
 
 # async / net
-tokio = { version = "1", features = ["full"] }
+# NOTE: `signal` IS used (crates/engine/src/lib.rs shutdown signal handling).
+# `process` IS used (crates/update/src/windows.rs, harness tests),
+# `sync` IS used (watch/mpsc/oneshot), `io-std` backs AsyncBufReadExt lines().
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 libc = "0.2"
 gethostname = "1"
@@ -136,7 +139,7 @@ ignore = "0.4"
 nucleo-matcher = "0.3"
 
 [profile.release]
-# Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat
+# Distribution profile (scripts/package/package-linux.sh): thin LTO buys most of fat
 # LTO's size/speed win at a fraction of the link time; strip debug symbols.
 lto = "thin"
 strip = "symbols"

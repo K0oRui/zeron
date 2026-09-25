@@ -121,7 +121,7 @@ if __name__=='__main__':
           '|---|---|---|---:|---:|']
     for n,item in enumerate(manifest,1):
         rows.append(f"| {n:02} | [{item['name']}]({item['file']}) | {item['description']} | {item['duration']:.2f}s | {item['peak_dbfs']:.1f} dBFS |")
-    rows += ['\nRegenerate with `python3 scripts/generate-sound-auditions.py`; pass `--install-attention` to refresh the selected runtime copy. Stereo 48 kHz, 16-bit PCM. No external samples. Perceived loudness depends on playback; no upward normalization is applied.',
+    rows += ['\nRegenerate with `python3 scripts/sound/generate-sound-auditions.py`; pass `--install-attention` to refresh the selected runtime copy. Stereo 48 kHz, 16-bit PCM. No external samples. Perceived loudness depends on playback; no upward normalization is applied.',
              '\nThe action names are audition contexts, not recommendations to enable all ten. Frequent actions such as Send and Undo stay silent; the product sound scope is intentionally limited to completion, input required, errors or durable disconnections, and Appshot capture.']
     (folder/'README.md').write_text('\n'.join(rows)+'\n')
     print(json.dumps(manifest,indent=2))

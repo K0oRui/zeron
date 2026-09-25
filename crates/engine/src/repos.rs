@@ -81,11 +81,13 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `~` / `~/…` → this host's home directory. Anything else passes through.
+/// `~` / `~/…` / `~…` (either slash) → this host's home directory.
+/// Anything else passes through. Both separators are accepted unconditionally
+/// so a `~\…` cwd from a Windows client expands even when joined here.
 pub(crate) fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix('~') {
         Some("") => home_dir().to_string_lossy().into_owned(),
-        Some(rest) if rest.starts_with('/') => {
+        Some(rest) if rest.starts_with(['/', '\\']) => {
             home_dir().join(&rest[1..]).to_string_lossy().into_owned()
         }
         _ => cwd.to_string(),
@@ -2198,6 +2200,7 @@ mod tests {
         let home = home_dir();
         assert_eq!(expand_home("~"), home.to_string_lossy());
         assert_eq!(expand_home("~/proj"), home.join("proj").to_string_lossy());
+        assert_eq!(expand_home("~\\proj"), home.join("proj").to_string_lossy());
         assert_eq!(expand_home("/abs/path"), "/abs/path");
         assert_eq!(expand_home("~nope"), "~nope");
     }

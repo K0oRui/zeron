@@ -50,14 +50,14 @@ builds, immutable executable copies, fresh UI data directories, the same isolate
 mock-engine fixture, a dedicated 1280×900 Xvfb window, and `LP_NUM_THREADS=4`.
 Compilation was finished before each measurement. Linux x86_64, Rust 1.97.1.
 
-[The profiler](../scripts/profile-composer.py) drives real key, clipboard, and
+[The profiler](../scripts/perf/profile-composer.py) drives real key, clipboard, and
 wheel events without submitting a turn. It samples RSS every 100ms and reads
 process and main-thread CPU counters at phase boundaries. The fixture has two
 seeded chats in its sidebar and no streaming activity. For each binary, use a
 fresh output directory on the dedicated display:
 
 ```sh
-python3 scripts/profile-composer.py /path/to/zeron /tmp/composer-run-1 \
+python3 scripts/perf/profile-composer.py /path/to/zeron /tmp/composer-run-1 \
   --settings /path/to/mock-ui/ui-settings.json \
   --ipc-port 27997 --display :117
 ```

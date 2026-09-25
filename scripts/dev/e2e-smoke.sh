@@ -8,7 +8,7 @@
 # Both engines run as the SAME user (alice@org1) on different devices — zeron's
 # one-user-many-devices model; chat/device rooms are claim-on-first-join per user.
 #
-# Usage: scripts/e2e-smoke.sh
+# Usage: scripts/dev/e2e-smoke.sh
 # Env:   ZERON_E2E_EDGE_PORT (default 27640), ZERON_E2E_KEEP_LOGS=1 to keep logs.
 
 set -euo pipefail

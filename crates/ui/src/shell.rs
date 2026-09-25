@@ -4333,9 +4333,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts
-            | SettingsSection::General
-            | SettingsSection::Appshots => {
+            SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
@@ -6990,13 +6988,19 @@ impl Shell {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
         let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn.chats.iter()
+        let chat = conn
+            .chats
+            .iter()
             .find(|c| Some(c.chat_id.as_str()) == selected);
         let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
             _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
                 "Changes could not be saved".into(),
-                div().size(px(5.0)).rounded_full().bg(theme.warning).into_any_element(),
+                div()
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(theme.warning)
+                    .into_any_element(),
             ),
             S::Disabled => return None,
             S::Connected => {
@@ -7004,9 +7008,13 @@ impl Shell {
                 (
                     caption.into(),
                     loaders::mini_mono_spinner(
-                        "chat-sync-spinner", 2.0, theme.text_muted,
-                        self.sidebar_pane.entity_id(), cx,
-                    ).into_any_element(),
+                        "chat-sync-spinner",
+                        2.0,
+                        theme.text_muted,
+                        self.sidebar_pane.entity_id(),
+                        cx,
+                    )
+                    .into_any_element(),
                 )
             }
             S::Offline => (
@@ -7258,7 +7266,6 @@ impl Shell {
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
-
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -9966,22 +9973,20 @@ impl Shell {
                 // up the carve-out. The bubble dispatch reaches the chip
                 // before the strip, and the handler consumes the drag, so
                 // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(
-                    move |this, payload: &RightTabDrag, _, cx| {
-                        if payload.panel_key != this.panel_key(cx) {
-                            this.right_tab_drag = None;
-                            cx.notify();
-                            return;
-                        }
-                        let to = this
-                            .right_tab_drag
-                            .as_ref()
-                            .map(|d| d.over)
-                            .unwrap_or(payload.from);
+                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
                         this.right_tab_drag = None;
-                        this.reorder_right_tabs(payload.from, to, cx);
-                    },
-                ))
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                }))
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -11722,17 +11727,26 @@ mod tests {
 
         chat.sync_state = S::Waiting;
         chat.connected = false;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
         chat.sync_state = S::Offline;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Offline — changes are saved")
+        );
 
         // Real pending pushes remain visible even with a live room.
         chat.connected = true;
         chat.pending_pushes = 1;
         chat.sync_state = S::Waiting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
@@ -14228,9 +14242,7 @@ mod right_tab_mouse_regressions {
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
-        cx.update(|_, cx| {
-            assert!(cx.has_active_drag(), "tab drag did not start")
-        });
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab drag did not start"));
         cx.simulate_mouse_up(start, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_down(start, MouseButton::Middle, gpui::Modifiers::default());
         cx.simulate_mouse_up(start, MouseButton::Middle, gpui::Modifiers::default());

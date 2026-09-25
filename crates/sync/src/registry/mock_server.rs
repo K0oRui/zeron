@@ -3,7 +3,7 @@
 //! (`zeron_doc::apply_op`). Test infrastructure only (`mock-server` feature):
 //! zeron-sync's client tests and zeron-engine's two-engine integration tests
 //! run against this; TS↔Rust interop is proven separately against a real DO
-//! by the `--ignored` live-edge tests and scripts/e2e-smoke.sh.
+//! by the `--ignored` live-edge tests and scripts/dev/e2e-smoke.sh.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

@@ -42,6 +42,47 @@ pub fn presence_key(device_id: &str) -> String {
     format!("presence/{device_id}")
 }
 
+/// UNC prefix (`\\server\share` or `//server/share`).
+pub fn is_unc_path(path: &str) -> bool {
+    path.starts_with("\\\\") || path.starts_with("//")
+}
+
+/// Path smells like Windows: backslashes, a drive prefix, or UNC.
+/// Flavor-keyed (not `cfg!(windows)`) so cross-platform docs/tests agree.
+pub fn is_windows_flavored(path: &str) -> bool {
+    path.contains('\\') || has_drive_prefix(path) || is_unc_path(path)
+}
+
+/// Strict drive prefix: `X:` + separator or end (`C:`, `C:\`, `C:/`).
+/// Drive-relative (`C:foo`) is not a prefix and never triggers rewrites.
+/// Bare `C:` counts as a prefix by design (it means the drive root in the
+/// folder browser's model, not strict Win32 drive-relative semantics).
+pub fn has_drive_prefix(path: &str) -> bool {
+    let b = path.as_bytes();
+    path.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (path.len() == 2 || b[2] == b'/' || b[2] == b'\\')
+}
+
+/// Repair a Windows path with a drive/UNC prefix into canonical form
+/// (`C:\/dir/sub` → `C:\dir\sub`). Conservative: only drive (`X:` + separator
+/// or end) and UNC-prefixed paths are touched; Unix paths, MSYS mounts,
+/// relatives, drive-relative (`C:foo`), and `~` pass through byte-identical.
+/// A bare drive (`C:`) is treated as its root (`C:\`) by design — this is the
+/// folder browser's model, not strict Win32 drive-relative semantics.
+pub fn normalize_windows_path(path: &str) -> String {
+    let unc = is_unc_path(path);
+    if !unc && !has_drive_prefix(path) {
+        return path.to_string();
+    }
+    let segments: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    if unc {
+        return format!("\\\\{}", segments.join("\\"));
+    }
+    format!("{}\\{}", segments[0], segments[1..].join("\\"))
+}
+
 /// Everything in the workspace doc, materialized (`read_all`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -662,7 +703,7 @@ impl From<RawSpace> for Space {
         Space {
             id: raw.id,
             device_id: raw.device_id,
-            path: raw.path,
+            path: normalize_windows_path(&raw.path),
             name: raw.name,
             git_detected: raw.git_detected,
             git_checked_at: raw.git_checked_at.map(dt),
@@ -742,7 +783,7 @@ impl From<RawChat> for Chat {
             device_id: raw.device_id,
             title: raw.title,
             archived: raw.archived,
-            cwd: raw.cwd,
+            cwd: raw.cwd.map(|c| normalize_windows_path(&c)),
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             source_context: raw.source_context,
@@ -807,6 +848,36 @@ mod tests {
             cursor_sdk_version: None,
             capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn windows_paths_repair_mixed_separators() {
+        // The exact row shape the pre-fix folder browser stored from a drive
+        // root (`child_path("C:\\", name)` joined with `/`).
+        assert_eq!(
+            normalize_windows_path("C:\\/UserFiles/Projects/Ai Stuff/zeron"),
+            "C:\\UserFiles\\Projects\\Ai Stuff\\zeron"
+        );
+        assert_eq!(normalize_windows_path("C:\\"), "C:\\");
+        assert_eq!(normalize_windows_path("C:"), "C:\\");
+        assert_eq!(normalize_windows_path("C:\\a\\"), "C:\\a");
+        assert_eq!(normalize_windows_path("C:/a/b"), "C:\\a\\b");
+        assert_eq!(normalize_windows_path("C:\\UserFiles"), "C:\\UserFiles");
+        assert_eq!(
+            normalize_windows_path("\\\\srv\\share\\x"),
+            "\\\\srv\\share\\x"
+        );
+        // Non-drive paths pass through byte-identical: Unix absolutes, MSYS
+        // mounts, relatives, `~` (expanded host-side later), empties, roots.
+        assert_eq!(normalize_windows_path("/tmp/repo"), "/tmp/repo");
+        assert_eq!(normalize_windows_path("/c/Users/x"), "/c/Users/x");
+        assert_eq!(normalize_windows_path("foo/bar"), "foo/bar");
+        assert_eq!(normalize_windows_path("~"), "~");
+        assert_eq!(normalize_windows_path("~/x"), "~/x");
+        assert_eq!(normalize_windows_path(""), "");
+        assert_eq!(normalize_windows_path("\\"), "\\");
+        assert_eq!(normalize_windows_path("C:foo"), "C:foo");
+        assert_eq!(normalize_windows_path("C:foo/bar"), "C:foo/bar");
     }
 
     #[test]

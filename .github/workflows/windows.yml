@@ -9,8 +9,8 @@ on:
       - 'apps/zeron/**'
       - 'dist/windows/**'
       - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
+      - 'scripts/test/test-windows-*.ps1'
+      - 'scripts/package/package-windows.ps1'
       - '.github/workflows/windows.yml'
   push:
     branches: [main]
@@ -21,8 +21,8 @@ on:
       - 'apps/zeron/**'
       - 'dist/windows/**'
       - 'crates/**'
-      - 'scripts/test-windows-*.ps1'
-      - 'scripts/package-windows.ps1'
+      - 'scripts/test/test-windows-*.ps1'
+      - 'scripts/package/package-windows.ps1'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
@@ -76,7 +76,7 @@ jobs:
       - name: Build application
         run: cargo build --release --locked -p zeron
       - name: Verify portable packaging
-        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+        run: ./scripts/package/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - name: Shader layout tests
         run: cargo test --release --locked -p gpui_windows --lib layout
       - name: Application and updater tests
@@ -88,7 +88,7 @@ jobs:
       - name: Auth integration tests
         run: cargo test --release --locked -p zeron-engine --test auth
       - name: GUI subsystem and redirected CLI output
-        run: ./scripts/test-windows-startup.ps1
+        run: ./scripts/test/test-windows-startup.ps1
       - name: CLI startup without HOME
         run: |
           # Exercise real path resolution without touching the runner's account.
@@ -150,9 +150,9 @@ jobs:
           name: windows-gui-binaries
           path: target/release
       - name: App lifecycle tests
-        run: ./scripts/test-windows-lifecycle.ps1
+        run: ./scripts/test/test-windows-lifecycle.ps1
       - name: Rendering tests
-        run: ./scripts/test-windows-rendering.ps1
+        run: ./scripts/test/test-windows-rendering.ps1
       - name: Upload GUI test results
         if: always()
         uses: actions/upload-artifact@v4

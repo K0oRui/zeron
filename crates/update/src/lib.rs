@@ -507,7 +507,7 @@ pub async fn stage_headless(
         download_release_file(edge_url, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
-        // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
+        // Tarball root is the versioned stage dir (see scripts/package/package-linux.sh);
         // strip it exactly as install.sh does.
         run(
             "tar",

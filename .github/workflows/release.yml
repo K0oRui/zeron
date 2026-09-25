@@ -1,9 +1,9 @@
 name: release
 
 # Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-#   - Windows portable zip (x86_64) via scripts/package-windows.ps1
+#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package/package-linux.sh
+#   - macOS dmg (Apple silicon) via scripts/package/package-macos.sh
+#   - Windows portable zip (x86_64) via scripts/package/package-windows.ps1
 # then create a GitHub Release AND upload everything to the
 # `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
 # `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
@@ -46,7 +46,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: package
-        run: scripts/package-linux.sh
+        run: scripts/package/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
@@ -105,7 +105,7 @@ jobs:
             echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
           } >>"$GITHUB_ENV"
       - name: package dmg
-        run: scripts/package-macos.sh
+        run: scripts/package/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ runner.arch }}
@@ -132,7 +132,7 @@ jobs:
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
       - name: package portable app
-        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+        run: ./scripts/package/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ runner.arch }}

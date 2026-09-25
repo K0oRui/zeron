@@ -9207,7 +9207,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -11769,6 +11768,7 @@ name = "zeron"
 version = "0.2.90"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "embed-resource",
  "libc",

@@ -139,9 +139,9 @@ an isolated profile and the bundled sanitized fixture; it makes no model API cal
 ```sh
 cargo build --release --locked -p zeron
 ZERON_FRAME_STATS=0 ZERON_PROFILE_IDLE_MS=10000 \
-  CLAUDE_CODE_EXECUTABLE="$PWD/scripts/replay-claude.py" \
+  CLAUDE_CODE_EXECUTABLE="$PWD/scripts/perf/replay-claude.py" \
   ZERON_REPLAY_JOURNAL="$PWD/scripts/fixtures/resource-stream.jsonl" \
-  node scripts/resource-profile.mjs target/release/zeron /tmp/zeron-native claude-code
+  node scripts/perf/resource-profile.mjs target/release/zeron /tmp/zeron-native claude-code
 
 # UI-only offscreen replay of those verified protocol frames:
 cargo build --release --locked -p zeron-ui --features resource-profile \
@@ -155,7 +155,7 @@ ZERON_VERIFY_CACHE=1 ZERON_VERIFY_INTERACTIONS=1 ZERON_FRAME_STATS=0 \
 # and a fresh output directory.
 
 # Native counter usable with either process (CPU uses 100% per core):
-xcrun clang -O2 scripts/macos-resource-stat.c -o /tmp/zeron-stat
+xcrun clang -O2 scripts/perf/macos-resource-stat.c -o /tmp/zeron-stat
 /tmp/zeron-stat PID
 ```
 

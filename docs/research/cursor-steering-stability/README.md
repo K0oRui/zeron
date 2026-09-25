@@ -100,7 +100,7 @@ ZERON_CURSOR_STATE_DIR=$(mktemp -d) ZERON_CURSOR_TEST_MODEL=muse-spark-1.3 \
   cargo run -p zeron-harness --example cursor_stability_probe -- cancel-burst 40
 
 cursor-agent update
-python3 scripts/cursor-cli-history-probe.py
+python3 docs/research/cursor-steering-stability/cursor-cli-history-probe.py
 ```
 
 For accelerated auth expiry, use the clock-preload command in the

@@ -17,6 +17,6 @@ The numbered files remain audition references. `06-attention.wav` is also the so
 | 09 | [Connection restored](09-reconnected.wav) | Three growing taps land on a soft two-note harmony. | 0.76s | -19.2 dBFS |
 | 10 | [Undo / restore](10-undo.wav) | Two reversed-weight clicks with a brief falling chime. | 0.49s | -19.2 dBFS |
 
-Regenerate with `python3 scripts/generate-sound-auditions.py`; pass `--install-attention` to refresh the selected runtime copy. Stereo 48 kHz, 16-bit PCM. No external samples. Perceived loudness depends on playback; no upward normalization is applied.
+Regenerate with `python3 scripts/sound/generate-sound-auditions.py`; pass `--install-attention` to refresh the selected runtime copy. Stereo 48 kHz, 16-bit PCM. No external samples. Perceived loudness depends on playback; no upward normalization is applied.
 
 The action names are audition contexts, not recommendations to enable all ten. Frequent actions such as Send and Undo stay silent; the product sound scope is intentionally limited to completion, input required, errors or durable disconnections, and Appshot capture.

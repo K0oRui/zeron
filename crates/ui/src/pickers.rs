@@ -303,6 +303,21 @@ pub fn traits_customized(
 
 /// Parent of an absolute path; `None` at the filesystem root.
 pub fn parent_path(path: &str) -> Option<String> {
+    if zeron_doc::is_windows_flavored(path) {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        let at = trimmed.rfind(['/', '\\'])?;
+        if at == 0 {
+            return Some("\\".to_string());
+        }
+        let parent = &trimmed[..at];
+        if zeron_doc::has_drive_prefix(parent) && parent.len() == 2 {
+            return Some(format!("{parent}\\")); // `C:\a` -> `C:\`
+        }
+        if zeron_doc::is_unc_path(parent) && !parent[2..].contains(['/', '\\']) {
+            return None; // `\\server\share` — cannot ascend past the share
+        }
+        return Some(parent.to_string());
+    }
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return None; // was "/" (or empty)
@@ -316,6 +331,13 @@ pub fn parent_path(path: &str) -> Option<String> {
 
 /// Join a listing path and an entry name.
 pub fn child_path(base: &str, name: &str) -> String {
+    if zeron_doc::is_windows_flavored(base) {
+        let base = zeron_doc::normalize_windows_path(base);
+        return format!(
+            "{base}{}{name}",
+            if base.ends_with('\\') { "" } else { "\\" }
+        );
+    }
     if base.ends_with('/') {
         format!("{base}{name}")
     } else {
@@ -363,25 +385,38 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
 }
 
 /// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
-/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
-/// trailing slash trimmed. `home` is the device's resolved home — `None`
-/// until the first listing lands, when `~` can't expand yet. A query like
-/// `~foo` is a folder name, not a path.
+/// or home-relative (`~`, `~/github`). Windows also accepts `\`-separated
+/// and drive-absolute queries (`C:\proj`, `C:/proj`, `~\github`).
 pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
     let query = query.trim();
     if let Some(rest) = query.strip_prefix('~') {
-        let home = home?.trim_end_matches('/');
+        // Both separators accepted on every platform: `~/g` and `~\g` expand,
+        // `~foo` stays a folder name. (Flavor-gating this on cfg!(windows)
+        // would leave `~\…` unexpanded for cross-platform docs/tests.)
+        let home = home?.trim_end_matches(['/', '\\']);
         if rest.is_empty() {
             return Some(home.to_string());
         }
-        let rest = rest.strip_prefix('/')?.trim_end_matches('/');
+        let rest = rest
+            .strip_prefix(['/', '\\'])?
+            .trim_end_matches(['/', '\\']);
         return Some(if rest.is_empty() {
             home.to_string()
+        } else if home.contains('\\') {
+            zeron_doc::normalize_windows_path(&format!("{home}/{rest}"))
         } else {
             format!("{home}/{rest}")
         });
     }
-    if query.starts_with('/') {
+    if query.starts_with(['/', '\\']) || zeron_doc::has_drive_prefix(query) {
+        if zeron_doc::is_windows_flavored(query) {
+            let normalized = zeron_doc::normalize_windows_path(query.trim_end_matches(['/', '\\']));
+            return Some(if normalized.is_empty() {
+                "\\".to_string()
+            } else {
+                normalized
+            });
+        }
         let trimmed = query.trim_end_matches('/');
         return Some(if trimmed.is_empty() {
             "/".to_string()
@@ -394,6 +429,29 @@ pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
 
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
+    if zeron_doc::is_windows_flavored(path) {
+        let mut segments = path.split(['/', '\\']).filter(|s| !s.is_empty());
+        let (root, rest): (String, Vec<&str>) = if zeron_doc::is_unc_path(path) {
+            let server = segments.next().unwrap_or("");
+            let share = segments.next().unwrap_or("");
+            (format!("\\\\{server}\\{share}"), segments.collect())
+        } else if zeron_doc::has_drive_prefix(path) {
+            let drive = segments.next().unwrap_or("");
+            (format!("{drive}\\"), segments.collect())
+        } else {
+            ("\\".to_string(), segments.collect())
+        };
+        let mut out = vec![(root.clone(), root.clone())];
+        let mut acc = root;
+        for segment in rest {
+            if !acc.ends_with('\\') {
+                acc.push('\\');
+            }
+            acc.push_str(segment);
+            out.push((segment.to_string(), acc.clone()));
+        }
+        return out;
+    }
     let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
     let mut acc = String::new();
     for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -899,10 +957,9 @@ impl Pickers {
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(title) = &self.title {
             // Only the saved agent's tab shows a selected row.
-            return title
-                .model
-                .as_deref()
-                .filter(|_| title.harness.is_some() && title.harness == self.effective_harness(cx));
+            return title.model.as_deref().filter(|_| {
+                title.harness.is_some() && title.harness == self.effective_harness(cx)
+            });
         }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -4999,18 +5056,19 @@ impl Render for Pickers {
                 traits_active.then(|| theme.text.opacity(0.85)),
             )
         });
-        let fast = self.title.is_none() && self.selected_model(cx).is_some_and(|model| {
-            model.options.iter().any(|option| {
-                option.id == "serviceTier"
-                    && self
-                        .resolved(cx)
-                        .model_options
-                        .get(&option.id)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        == "fast"
-            })
-        });
+        let fast = self.title.is_none()
+            && self.selected_model(cx).is_some_and(|model| {
+                model.options.iter().any(|option| {
+                    option.id == "serviceTier"
+                        && self
+                            .resolved(cx)
+                            .model_options
+                            .get(&option.id)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&option.default_choice)
+                            == "fast"
+                })
+            });
         let model_chip = self
             .trigger_chip(
                 PickerKind::HarnessModel,
@@ -6669,6 +6727,49 @@ mod tests {
         assert_eq!(labels, ["/", "home", "w", "dev"]);
         assert_eq!(crumbs[2].1, "/home/w");
         assert_eq!(breadcrumbs("/").len(), 1);
+    }
+
+    /// Drive-root browsing joined with `/` stored `C:\/...` space rows, which
+    /// wedged agent runs with zero output and no error (the location never
+    /// resolved server-side). Platform-independent by design: the helpers key
+    /// off path flavor, not `cfg!(windows)`, so this runs everywhere.
+    #[test]
+    fn folder_paths_use_native_separators_on_windows() {
+        assert_eq!(child_path("C:\\", "UserFiles"), "C:\\UserFiles");
+        assert_eq!(
+            child_path("C:\\UserFiles", "Projects"),
+            "C:\\UserFiles\\Projects"
+        );
+        assert_eq!(
+            child_path("C:/UserFiles", "Projects"),
+            "C:\\UserFiles\\Projects"
+        );
+        // Unix-flavored input keeps the historical `/` behavior.
+        assert_eq!(child_path("/home", "w"), "/home/w");
+        assert_eq!(parent_path("/home"), Some("/".to_string()));
+        assert_eq!(
+            parent_path("C:\\UserFiles\\Projects"),
+            Some("C:\\UserFiles".to_string())
+        );
+        assert_eq!(parent_path("C:\\UserFiles"), Some("C:\\".to_string()));
+        assert_eq!(parent_path("C:\\"), None);
+        assert_eq!(
+            parent_path("\\\\srv\\share\\x"),
+            Some("\\\\srv\\share".to_string())
+        );
+        assert_eq!(parent_path("\\\\srv\\share"), None);
+        let crumbs = breadcrumbs("C:\\UserFiles\\Projects");
+        let labels: Vec<&str> = crumbs.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["C:\\", "UserFiles", "Projects"]);
+        assert_eq!(crumbs[2].1, "C:\\UserFiles\\Projects");
+        assert_eq!(
+            typed_path_target("C:\\UserFiles\\", Some("C:\\Users\\wing")),
+            Some("C:\\UserFiles".into())
+        );
+        assert_eq!(
+            typed_path_target("~\\github", Some("C:\\Users\\wing")),
+            Some("C:\\Users\\wing\\github".into())
+        );
     }
 
     #[test]

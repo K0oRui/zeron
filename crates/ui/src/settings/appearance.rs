@@ -3314,7 +3314,9 @@ mod tests {
         });
         let (_page, cx) = cx.add_window_view(|_, cx| AppearancePage::new(cx));
         cx.update(|window, cx| window.draw(cx).clear());
-        let trigger = cx.debug_bounds("appearance-surface").expect("glass trigger");
+        let trigger = cx
+            .debug_bounds("appearance-surface")
+            .expect("glass trigger");
         cx.simulate_click(trigger.center(), gpui::Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear());
         let frosted = cx

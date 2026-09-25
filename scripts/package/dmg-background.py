@@ -8,11 +8,11 @@ drag-to-Applications window (app icon at x=165, Applications at x=495,
 both at y=195).
 
 Outputs dist/macos/dmg-background.png (1x) and dmg-background@2x.png;
-scripts/package-macos.sh pairs them into a hidpi tiff with tiffutil.
+scripts/package/package-macos.sh pairs them into a hidpi tiff with tiffutil.
 Both outputs are committed so CI never needs Pillow — rerun this only
 when changing the artwork.
 
-Usage: python3 scripts/dmg-background.py
+Usage: python3 scripts/package/dmg-background.py
 """
 
 import os
@@ -24,7 +24,7 @@ FONT = os.path.join(ROOT, "crates/ui/assets/fonts/GeistMono.ttf")
 OUT = os.path.join(ROOT, "dist/macos")
 
 # Window geometry in points; must match the dmgbuild settings in
-# scripts/package-macos.sh.
+# scripts/package/package-macos.sh.
 W, H = 660, 400
 
 BG = (6, 4, 10)  # --bg

@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: '22'
       - name: Check stable SDK version
-        run: python3 scripts/update-cursor-sdk.py
+        run: python3 scripts/cursor/update-cursor-sdk.py
       - name: Open or refresh the dependency PR and run compatibility checks
         env:
           GH_TOKEN: ${{ github.token }}

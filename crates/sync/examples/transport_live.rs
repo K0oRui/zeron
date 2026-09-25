@@ -1,5 +1,5 @@
 //! Production ChatClient + Loro + SQLite against an explicit test edge.
-//! Run through scripts/transport-proxy.py for controlled network conditions.
+//! Run through scripts/transport/transport-proxy.py for controlled network conditions.
 //! Usage: transport_live <proxy-base> <cloudflare-origin> <stream|outage|http|catchup|upload>
 use futures::future::BoxFuture;
 use loro::{ExportMode, LoroDoc, VersionVector};

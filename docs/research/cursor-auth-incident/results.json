@@ -48,9 +48,9 @@
     "crates/harness/tests/fixtures/fake-cursor-sdk.mjs": "8d9f6cc4189e379b68ef64680cce3ea72ac6685a82be9b872753691447c7aff4",
     "crates/harness/examples/cursor_stability_probe.rs": "4f206de4f9877586b8201d223ad06c6060fb58addac08dbd5033dbe98a3c8171",
     "crates/harness/tests/fixtures/cursor-auth-clock.mjs": "c9179d7c06ee4be07d6dd6ff053624b59b6cde7159b86059e2d7c908b5fa55b0",
-    "scripts/test-cursor-sdk-auth.mjs": "889bfc43a87a9b09592f4fecdbca67162c6fab37993e34d30e53c9804435dbb4",
-    "scripts/update-cursor-sdk.py": "027ee4261711ba914c65f0242c0dbdbaad1b4cdce49baf6756e9f28defc32a56",
-    "scripts/test-update-cursor-sdk.py": "dffe8977c013420bf72e58de0e2f4dc235e52a1290a46dad589f7ac1b07ba38d"
+    "scripts/test/test-cursor-sdk-auth.mjs": "889bfc43a87a9b09592f4fecdbca67162c6fab37993e34d30e53c9804435dbb4",
+    "scripts/cursor/update-cursor-sdk.py": "027ee4261711ba914c65f0242c0dbdbaad1b4cdce49baf6756e9f28defc32a56",
+    "scripts/test/test-update-cursor-sdk.py": "dffe8977c013420bf72e58de0e2f4dc235e52a1290a46dad589f7ac1b07ba38d"
   },
   "localIncident": {
     "shimAgeMinutes": 64.8121,

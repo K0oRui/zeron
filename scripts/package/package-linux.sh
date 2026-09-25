@@ -4,7 +4,7 @@
 # containing the binary, the .desktop entry, and the icon, plus an install.sh
 # that drops them into ~/.local (XDG) paths.
 #
-# Usage: scripts/package-linux.sh
+# Usage: scripts/package/package-linux.sh
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
 
 set -euo pipefail

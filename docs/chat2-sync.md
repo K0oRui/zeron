@@ -213,7 +213,7 @@ explicit request; the real healing is M1.
   checkpoint age > 7 days (the passive failure mode this design trades into — make it
   visible from day one; silent truncation of the old wedge class must not become
   silent growth of a new one).
-- e2e: extend `scripts/e2e-smoke.sh` — two engines, chat2 room, kill/rejoin mid-push,
+- e2e: extend `scripts/dev/e2e-smoke.sh` — two engines, chat2 room, kill/rejoin mid-push,
   cursor resume, checkpoint-skip via frontier match, 1 MB fixture load under
   `tc`-throttled 1.2 Mbps (load must complete and be Range-resumable).
 - Exit criterion mirroring the registry migration: `churn_stays_bounded` equivalent —

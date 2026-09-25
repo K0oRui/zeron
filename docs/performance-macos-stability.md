@@ -150,11 +150,11 @@ build or test workload. The native helper sizes the foreground window to 1320×8
 points and rejects focus loss. Default dark appearance and animations are enabled.
 
 ```sh
-CLAUDE_CODE_EXECUTABLE="$PWD/scripts/replay-claude.py" \
+CLAUDE_CODE_EXECUTABLE="$PWD/scripts/perf/replay-claude.py" \
 ZERON_REPLAY_JOURNAL="$PWD/scripts/fixtures/resource-stream.jsonl" \
 ZERON_PROFILE_BACKGROUND_CHATS=50 ZERON_PROFILE_SUBMIT_UI=1 \
 ZERON_PROFILE_PROMPT='Replay fixture.' \
-node scripts/resource-profile.mjs /path/to/zeron /tmp/fresh-profile claude-code
+node scripts/perf/resource-profile.mjs /path/to/zeron /tmp/fresh-profile claude-code
 ```
 
 The fixture emits 52,624 combined text/reasoning bytes with a 40 ms delta delay.

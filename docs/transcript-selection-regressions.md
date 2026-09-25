@@ -48,7 +48,7 @@ The existing suite also covers runway geometry, wheel escape and re-sticking,
 resizes, completion shrinkage, viewport restoration, and selection edge scrolling.
 The native app also built with `cargo build --release --locked -p zeron`.
 
-Replay with `scripts/resource-profile.mjs` and `scripts/replay-claude.py`:
+Replay with `scripts/perf/resource-profile.mjs` and `scripts/perf/replay-claude.py`:
 use `scripts/fixtures/transcript-selection-stream.jsonl` at 1200 ms per delta
 for the short turn, or `scripts/fixtures/resource-stream.jsonl` at 300 ms per
 delta for overflow. Set `ZERON_PROFILE_SUBMIT_UI=1`; the short-turn prompt

@@ -1,8 +1,8 @@
-#[path = "browser-fixture/transcript_links.rs"]
-mod transcript_links;
 #[cfg(target_os = "linux")]
 #[path = "browser-fixture/linux.rs"]
 mod linux;
+#[path = "browser-fixture/transcript_links.rs"]
+mod transcript_links;
 // Real shell + native WebKit smoke test and screenshot fixture. Synthetic
 // chat data, isolated temp storage, loopback-only website, no engine services.
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};

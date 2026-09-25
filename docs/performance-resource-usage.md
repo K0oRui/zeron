@@ -191,9 +191,9 @@ Xvfb :98 -screen 0 1440x900x24 -nolisten tcp
 # In another terminal:
 DISPLAY=:98 WAYLAND_DISPLAY= LP_NUM_THREADS=4 ZERON_FRAME_STATS=0 \
   ZERON_PROFILE_PSS=1 ZERON_PROFILE_IDLE_MS=45000 \
-  CLAUDE_CODE_EXECUTABLE="$PWD/scripts/replay-claude.py" \
+  CLAUDE_CODE_EXECUTABLE="$PWD/scripts/perf/replay-claude.py" \
   ZERON_REPLAY_JOURNAL="$PWD/scripts/fixtures/resource-stream.jsonl" \
-  node scripts/resource-profile.mjs target/release/zeron /tmp/zeron-short claude-code
+  node scripts/perf/resource-profile.mjs target/release/zeron /tmp/zeron-short claude-code
 
 # Use LP_NUM_THREADS=1 for the one-worker check.
 # Add ZERON_REPLAY_REPEAT=10 ZERON_REPLAY_DELAY_MS=8 for the long workload.

@@ -7,7 +7,8 @@ on:
       - 'crates/engine/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'scripts/*cursor-sdk*'
+      - 'scripts/test/*cursor-sdk*'
+      - 'scripts/cursor/*cursor-sdk*'
       - '.github/workflows/cursor-*.yml'
   workflow_dispatch:
   workflow_call:
@@ -24,7 +25,7 @@ jobs:
           node-version: '22'
       - uses: Swatinem/rust-cache@v2
       - name: Dependency updater validation
-        run: python3 scripts/test-update-cursor-sdk.py
+        run: python3 scripts/test/test-update-cursor-sdk.py
       - name: Harness compatibility, steering, and session recovery
         run: cargo test --locked -p zeron-harness
       - name: Durable commands and engine message delivery
@@ -37,4 +38,4 @@ jobs:
           pin=$(python3 -c 'import re; print(re.search(r"const CURSOR_SDK_PIN: &str = \"([^\"]+)\"", open("crates/harness/src/cursor/mod.rs").read())[1])')
           npm install --prefix "$RUNNER_TEMP/cursor-sdk-contract" --ignore-scripts --no-audit --no-fund "$pin"
       - name: Actual SDK token expiry, stream invalidation, and transient auth recovery
-        run: node scripts/test-cursor-sdk-auth.mjs "$RUNNER_TEMP/cursor-sdk-contract/node_modules/@cursor/sdk"
+        run: node scripts/test/test-cursor-sdk-auth.mjs "$RUNNER_TEMP/cursor-sdk-contract/node_modules/@cursor/sdk"

@@ -25,7 +25,7 @@ cargo build -p zeron
 cargo build -p zeron-ui --example browser-fixture --features browser-fixture
 ZERON_TRANSCRIPT_LINK_FIXTURE_ONLY=1 \
   BROWSER_FIXTURE_BINARY=target/debug/examples/browser-fixture \
-  scripts/test-linux-browser.sh /tmp/zeron-transcript-links
+  scripts/test/test-linux-browser.sh /tmp/zeron-transcript-links
 ```
 
 If FFmpeg lacks `libx264`, add `BROWSER_FIXTURE_VIDEO_CODEC=mpeg4` to the runner environment.
@@ -36,7 +36,7 @@ On macOS, build the same example and run it with the release application's Info.
 
 ```sh
 ZERON_TRANSCRIPT_LINK_FIXTURE_ONLY=1 \
-  scripts/run-macos-browser-fixture.sh target/debug/examples/browser-fixture \
+  scripts/test/run-macos-browser-fixture.sh target/debug/examples/browser-fixture \
   /tmp/zeron-transcript-links-macos
 ```
 
