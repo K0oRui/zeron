@@ -13,7 +13,8 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-/// Archived rows in sidebar (recency) order. Pure.
+/// Archived rows in sidebar (recency) order. Pure. Side chats stay listed:
+/// once archived and closed, this is the only place to restore them.
 pub fn archived_chats(chats: &[Chat]) -> Vec<&Chat> {
     chats.iter().filter(|c| c.archived).collect()
 }
@@ -93,6 +94,7 @@ impl popover::ScrollRailHost for ArchivedPage {
 
 impl Render for ArchivedPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = chrono::Utc::now();
         let (rows, device_names, count): (
@@ -384,22 +386,6 @@ impl Render for ArchivedPage {
                                     &theme,
                                     "Hidden from the sidebar until restored.",
                                 ))
-                                .when_some(self.error.clone(), |el, message| {
-                                    el.child(
-                                        widgets::error_strip(&theme, message)
-                                            .id("archived-error")
-                                            .cursor_pointer()
-                                            .tab_index(0)
-                                            .role(gpui::Role::Button)
-                                            .focus_visible(|s| {
-                                                s.border_2().border_color(theme.accent).opacity(1.0)
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.error = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                })
                                 .child(body)
                                 .children(pagination),
                         ),
@@ -453,5 +439,17 @@ mod tests {
         let rows = archived_chats(&chats);
         let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["b", "c"]);
+    }
+
+    #[test]
+    fn archived_side_chats_stay_restorable() {
+        let mut side = chat("side", true);
+        side.parent_chat_id = Some("main".into());
+        let chats = vec![chat("main", false), side];
+        let ids: Vec<&str> = archived_chats(&chats)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["side"]);
     }
 }

@@ -58,6 +58,7 @@ pub fn dropdown(
         content,
         closing,
         trigger_height,
+        align: popover::MenuAlign::End,
     }
     .into_any_element()
 }
@@ -68,6 +69,7 @@ struct SettingsDropdown {
     content: gpui::Div,
     closing: Option<std::time::Instant>,
     trigger_height: f32,
+    align: popover::MenuAlign,
 }
 
 impl RenderOnce for SettingsDropdown {
@@ -79,6 +81,7 @@ impl RenderOnce for SettingsDropdown {
             self.closing,
             self.trigger_height,
             limits,
+            self.align,
         )
     }
 }
@@ -1258,6 +1261,7 @@ pub fn select<V: 'static>(
         menu_width: None,
         font: None,
         heading: None,
+        align: popover::MenuAlign::End,
         reach: Rc::new(reach),
         on_select: None,
     }
@@ -1273,6 +1277,7 @@ pub struct Select<V: 'static> {
     menu_width: Option<f32>,
     font: Option<SharedString>,
     heading: Option<&'static str>,
+    align: popover::MenuAlign,
     reach: SelectReach<V>,
     on_select: Option<SelectHandler<V>>,
 }
@@ -1342,6 +1347,13 @@ impl<V: 'static> Select<V> {
         self
     }
 
+    /// Open the menu rightward from the trigger's left edge, for triggers
+    /// that lead a row rather than end it.
+    pub fn open_rightward(mut self) -> Self {
+        self.align = popover::MenuAlign::Start;
+        self
+    }
+
     pub fn render(self, state: &SelectState, cx: &mut Context<V>) -> gpui::Stateful<gpui::Div> {
         let Self {
             id,
@@ -1353,6 +1365,7 @@ impl<V: 'static> Select<V> {
             menu_width,
             font,
             heading,
+            align,
             reach,
             on_select,
         } = self;
@@ -1488,12 +1501,13 @@ impl<V: 'static> Select<V> {
                     SELECT_HEIGHT,
                     if heading.is_some() { 32.0 } else { 8.0 },
                 ));
-            trigger = trigger.child(dropdown(
-                format!("{id}-menu"),
-                menu,
-                state.menu.closing_since(),
-                SELECT_HEIGHT,
-            ));
+            trigger = trigger.child(SettingsDropdown {
+                id: format!("{id}-menu").into(),
+                content: menu,
+                closing: state.menu.closing_since(),
+                trigger_height: SELECT_HEIGHT,
+                align,
+            });
         }
         trigger
     }
@@ -1649,7 +1663,14 @@ impl RenderOnce for SettingsScroll {
 
 /// A one-line hover note for settings controls (reset times, icon-only
 /// actions), in the same frosted chip as the rest of the app's tooltips.
-pub struct TextTooltip(pub SharedString);
+pub struct TextTooltip {
+    text: SharedString,
+    above: bool,
+}
+
+/// How far a [`text_tooltip_above`] chip sits over the pointer; clears a
+/// small control the pointer is anywhere inside.
+const TOOLTIP_ABOVE_GAP: f32 = 20.0;
 
 impl Render for TextTooltip {
     fn render(
@@ -1668,8 +1689,20 @@ impl Render for TextTooltip {
             .bg(crate::popover::surface_bg(theme))
             .text_size(px(11.0))
             .text_color(theme.text_muted)
-            .child(self.0.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+            .child(self.text.clone());
+        let card = crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card);
+        if !self.above {
+            return card.into_any_element();
+        }
+        // gpui hangs a tooltip below-right of the pointer. A zero-height box
+        // with end-aligned content makes the chip overflow upward instead.
+        div()
+            .h(px(0.0))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .child(div().relative().bottom(px(TOOLTIP_ABOVE_GAP)).child(card))
+            .into_any_element()
     }
 }
 
@@ -1678,5 +1711,26 @@ pub fn text_tooltip(
     text: impl Into<SharedString>,
 ) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
     let text: SharedString = text.into();
-    move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            text: text.clone(),
+            above: false,
+        })
+        .into()
+    }
+}
+
+/// Like [`text_tooltip`], shown above the pointer instead of below it, for
+/// controls with content underneath that the chip would otherwise cover.
+pub fn text_tooltip_above(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| {
+        cx.new(|_| TextTooltip {
+            text: text.clone(),
+            above: true,
+        })
+        .into()
+    }
 }

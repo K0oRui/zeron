@@ -17,7 +17,7 @@ use zeron_proto::{
 };
 
 use super::{
-    FilesCloseDisposition, FilesEvent, FilesSurface,
+    FileColumn, FilesCloseDisposition, FilesEvent, FilesSurface,
     client::{FilesRequestContext, WorkspaceFilesClient},
     document::{DocumentKey, DocumentPhase, FileDocument},
     toolbar, toolbar_button,
@@ -97,7 +97,7 @@ enum ReloadDecision {
 
 pub(super) struct FilePreviewState {
     images_visible: bool,
-    documents: HashMap<String, FileDocument>,
+    pub(super) documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
     active: Option<String>,
     highlights: HashMap<String, HighlightedFile>,
@@ -587,7 +587,7 @@ impl FilesSurface {
     pub(crate) fn navigate_to_line(
         &mut self,
         line: u32,
-        column: Option<u32>,
+        column: Option<FileColumn>,
         cx: &mut Context<Self>,
     ) {
         if line == 0 {
@@ -638,8 +638,19 @@ impl FilesSurface {
         if let Some(editor) = editor {
             editor.update(cx, |state, cx| {
                 let row = (line - 1).min(state.text().lines_len().saturating_sub(1) as u32);
+                let character = match column {
+                    Some(FileColumn::Character(column)) => column.saturating_sub(1),
+                    Some(FileColumn::Byte(column)) => {
+                        // Convert against the loaded line, not the trimmed and
+                        // truncated search preview (which may omit indentation).
+                        let text = state.text().slice_line(row as usize);
+                        let byte = column.min(text.len() as u64) as usize;
+                        text.byte_to_char_idx(byte) as u32
+                    }
+                    None => 0,
+                };
                 state.set_cursor_position(
-                    gpui_base::input::Position::new(row, column.unwrap_or(1).saturating_sub(1)),
+                    gpui_base::input::Position::new(row, character),
                     window,
                     cx,
                 );
@@ -1230,7 +1241,7 @@ impl FilesSurface {
                     }
                     Err(error) => {
                         tracing::warn!(path = %task_path, error = %error, "workspace file load failed");
-                        document.set_error(error.to_string());
+                        document.set_error(read_error_message(&error));
                         surface.sync_preview_list();
                     }
                 }
@@ -1493,7 +1504,10 @@ impl FilesSurface {
     }
 
     pub(super) fn schedule_autosave(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.preview.autosave_enabled || self.preview.autosave_paused_for_reload(&path) {
+        if self.mutation_blocks_path(&path)
+            || !self.preview.autosave_enabled
+            || self.preview.autosave_paused_for_reload(&path)
+        {
             return;
         }
         let delay = Duration::from_millis(self.preview.autosave_delay_ms);
@@ -1532,7 +1546,7 @@ impl FilesSurface {
     }
 
     pub(super) fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
-        if self.target_change_pending {
+        if self.mutation_blocks_path(&path) || self.target_change_pending {
             return;
         }
         let Some(context) = self.request_context.clone() else {
@@ -1921,10 +1935,24 @@ impl FilesSurface {
             document.reconcile_task = None;
             document.pending_save = None;
             document.key.path = new_document_path.clone();
+            let was_markdown = super::markdown_preview::is_markdown(old_document_path);
+            let is_markdown = super::markdown_preview::is_markdown(new_document_path);
+            if was_markdown != is_markdown {
+                document.show_markdown = is_markdown;
+                if let Some(view) = document.markdown.take() {
+                    view.update(cx, |view, cx| view.suspend(cx));
+                }
+            }
             if let Some(file) = document.file.as_mut() {
                 file.path = new_document_path.clone();
             }
             if let Some(editor) = document.editor.clone() {
+                // Retarget the existing editor so selection and undo survive.
+                // Its previous adapter captures parsed spans for the old language.
+                editor.update(cx, |editor, cx| {
+                    editor.set_highlighter(new_document_path.clone(), cx);
+                    editor.set_highlighter_factory(Rc::new(|_| None), cx);
+                });
                 let event_path = new_document_path.clone();
                 document.editor_events =
                     Some(super::editor::subscribe_to_changes(&editor, event_path, cx));
@@ -1938,11 +1966,7 @@ impl FilesSurface {
             if self.editor_path.as_deref() == Some(old_document_path) {
                 self.editor_path = Some(new_document_path.clone());
             }
-            if let Some(highlight) = self.preview.highlights.remove(old_document_path) {
-                self.preview
-                    .highlights
-                    .insert(new_document_path.clone(), highlight);
-            }
+            self.preview.highlights.remove(old_document_path);
             if let Some(anchors) = self.preview.comment_anchors.remove(old_document_path) {
                 self.preview
                     .comment_anchors
@@ -1977,6 +2001,17 @@ impl FilesSurface {
                     .is_some_and(FileDocument::is_dirty)
             {
                 self.read_file(path.clone(), cx);
+            } else if let Some(document) = self.preview.documents.get(path) {
+                if let Some(editor) = &document.editor {
+                    let source = editor.read(cx).value().to_string();
+                    self.request_editor_highlight(path.clone(), source, document.revision, cx);
+                } else if let Some((text, hash)) = document
+                    .file
+                    .as_ref()
+                    .and_then(|file| file.text.clone().zip(file.content_hash.clone()))
+                {
+                    self.request_file_highlight(path.clone(), text, hash, cx);
+                }
             }
         }
         if !renames.is_empty() {
@@ -2283,6 +2318,16 @@ impl FilesSurface {
         Some(self.render_breadcrumb(&path, theme, cx))
     }
 
+    /// Where the system's default app can open `path`. Only a workspace on
+    /// this device shares the viewport's filesystem; remote spaces live on
+    /// another device, so they get no path.
+    fn system_open_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        self.request_context
+            .as_ref()
+            .filter(|context| context.target_device_id.is_none())
+            .map(|context| std::path::Path::new(&context.cwd).join(path))
+    }
+
     fn render_breadcrumb(
         &mut self,
         path: &str,
@@ -2295,8 +2340,14 @@ impl FilesSurface {
             .documents
             .get(path)
             .is_some_and(|d| d.show_markdown);
-        let parts = path.split('/').collect::<Vec<_>>();
+        // Outside paths are absolute: the empty crumb before their leading
+        // slash is not a segment.
+        let parts = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
         let reveal_path = path.to_string();
+        let system_path = self.system_open_path(path);
         let tooltip_path: SharedString = path.to_string().into();
         let can_save = !self.target_change_pending
             && self
@@ -2485,6 +2536,17 @@ impl FilesSurface {
                             .text_color(theme.text_muted),
                     ),
             )
+            .when_some(system_path, |element, system_path| {
+                element.child(
+                    toolbar_button("files-open-with-system", "Open in default editor")
+                        .on_click(move |_, _, cx| cx.open_with_system(&system_path))
+                        .child(
+                            icon(icons::ARROW_UP_RIGHT)
+                                .size(px(crate::surface_chrome::ICON_SIZE))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+            })
             .child(
                 toolbar_button(
                     "files-toggle-word-wrap",
@@ -2671,8 +2733,33 @@ impl FilesSurface {
         if let Some(editor) = &editor {
             self.sync_editor_comment_anchors(path, editor, cx);
         }
+        let outside = self
+            .preview
+            .documents
+            .get(path)
+            .and_then(|document| document.file.as_ref())
+            .is_some_and(|file| {
+                file.read_only_reason == Some(WorkspaceReadOnlyReason::OutsideWorkspace)
+            });
         if let Some(view) = self.prepare_markdown_preview(path, editor.as_ref(), cx) {
-            return view.into_any_element();
+            return if outside {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(outside_read_only_row(theme))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .child(view.into_any_element()),
+                    )
+                    .into_any_element()
+            } else {
+                view.into_any_element()
+            };
         }
 
         let Some(document) = self.preview.documents.get(path) else {
@@ -2759,6 +2846,9 @@ impl FilesSurface {
             .min_h_0()
             .flex()
             .flex_col()
+            .when(outside, |element| {
+                element.child(outside_read_only_row(theme))
+            })
             .when(truncated, |element| {
                 element.child(
                     div()
@@ -2962,6 +3052,7 @@ impl FilesSurface {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_editor_comment(&id, cx)
                             }))
+                            .tooltip(crate::settings::widgets::text_tooltip("Remove comment"))
                             .child(
                                 icon(icons::CLOSE_CIRCLE)
                                     .size(px(12.0))
@@ -3259,6 +3350,38 @@ fn centered_state(message: impl Into<SharedString>, color: gpui::Hsla) -> AnyEle
         .into_any_element()
 }
 
+/// The read-only line an outside file shows above its content — text or
+/// rendered Markdown — matching the truncated-preview row's shape.
+fn outside_read_only_row(theme: &Theme) -> AnyElement {
+    div()
+        .h(px(28.0))
+        .flex_none()
+        .px(px(10.0))
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(crate::theme::wash(0.03))
+        .flex()
+        .items_center()
+        .text_size(px(10.0))
+        .text_color(theme.text_muted)
+        .child(read_only_message(Some(
+            WorkspaceReadOnlyReason::OutsideWorkspace,
+        )))
+        .into_any_element()
+}
+
+/// A failed read surfaces in the document's error state: a missing file
+/// shows its own message instead of the transport's RPC framing; every
+/// other failure keeps its wording.
+fn read_error_message(error: &super::client::FilesClientError) -> SharedString {
+    match error {
+        super::client::FilesClientError::Request(message) if message == "file not found" => {
+            "File not found.".into()
+        }
+        _ => error.to_string().into(),
+    }
+}
+
 fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
     match reason {
         Some(WorkspaceReadOnlyReason::Binary) => "Binary files cannot be previewed.",
@@ -3271,6 +3394,7 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
         Some(WorkspaceReadOnlyReason::MixedLineEndings) => {
             "Files with mixed line endings are read-only."
         }
+        Some(WorkspaceReadOnlyReason::OutsideWorkspace) => "Read-only: outside this chat's folder.",
         Some(WorkspaceReadOnlyReason::NotRegularFile) | None => "This file cannot be previewed.",
     }
     .into()
@@ -3279,6 +3403,165 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn renaming_markdown_to_text_keeps_dirty_editor_and_undo(cx: &mut TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let editor = files.update_in(cx, |files, window, cx| {
+            let theme = Theme::of(cx).clone();
+            let editor = super::super::editor::new_file_editor(
+                "# Original",
+                "note.md",
+                false,
+                &theme,
+                window,
+                cx,
+            );
+            let mut document = cached_document("note.md", "# Original");
+            document.set_loaded(zeron_proto::WorkspaceFileText {
+                checkout_id: "checkout".into(),
+                path: "note.md".into(),
+                text: Some("# Original".into()),
+                content_hash: Some("saved-hash".into()),
+                size: 10,
+                modified_at: None,
+                encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                read_only_reason: None,
+                truncated: false,
+            });
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(10..10, cx);
+                editor.replace(" unsaved", window, cx);
+                editor.set_selected_range(2..10, cx);
+            });
+            document.editor = Some(editor.clone());
+            document.mark_user_edit();
+            files.preview.documents.insert("note.md".into(), document);
+            files.preview.active = Some("note.md".into());
+            files.editor_path = Some("note.md".into());
+            files.presentation = super::super::FilesPresentation::Editor;
+            assert!(
+                files
+                    .prepare_markdown_preview("note.md", Some(&editor), cx)
+                    .is_some()
+            );
+            files.apply_semantic_mutation(
+                &zeron_proto::WorkspaceFileChange {
+                    operation_id: Some("rename-md".into()),
+                    kind: zeron_proto::WorkspaceFileChangeKind::Renamed,
+                    path: "note.txt".into(),
+                    old_path: Some("note.md".into()),
+                },
+                None,
+                true,
+                cx,
+            );
+            let document = &files.preview.documents["note.txt"];
+            assert!(!document.show_markdown);
+            assert!(document.markdown.is_none());
+            assert!(document.is_dirty());
+            assert_eq!(document.phase, DocumentPhase::Ready);
+            assert_eq!(document.editor.as_ref(), Some(&editor));
+            assert_eq!(editor.read(cx).value().as_ref(), "# Original unsaved");
+            assert_eq!(editor.read(cx).selected_range(), 2..10);
+            assert_eq!(document.saved_hash.as_deref(), Some("saved-hash"));
+            assert!(
+                files
+                    .prepare_markdown_preview("note.txt", Some(&editor), cx)
+                    .is_none()
+            );
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+            editor
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+            window.dispatch_action(Box::new(gpui_base::input::Undo), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.value().to_string()),
+            "# Original"
+        );
+    }
+
+    #[gpui::test]
+    fn rename_refreshes_language_and_preserves_markdown_view_choice(cx: &mut TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update_in(cx, |files, window, cx| {
+            let theme = Theme::of(cx).clone();
+            let editor = super::super::editor::new_file_editor(
+                "let value = 1;",
+                "note.txt",
+                false,
+                &theme,
+                window,
+                cx,
+            );
+            let mut document = cached_document("note.txt", "let value = 1;");
+            document.editor = Some(editor);
+            files.preview.documents.insert("note.txt".into(), document);
+            files.rename_documents("note.txt", "note.rs".into(), cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        files.update_in(cx, |files, _, cx| {
+            let key = DocumentHighlightKey::new(
+                zeron_syntax::language_for_path("note.rs").unwrap(),
+                "let value = 1;",
+            );
+            assert!(
+                files.preview.syntax_cache.get(&key).is_some(),
+                "the open editor must be parsed in the new language without an edit"
+            );
+            files.rename_documents("note.rs", "note.md".into(), cx);
+            assert!(files.preview.documents["note.md"].show_markdown);
+            files
+                .preview
+                .documents
+                .get_mut("note.md")
+                .unwrap()
+                .show_markdown = false;
+            files.rename_documents("note.md", "renamed.md".into(), cx);
+            assert!(
+                !files.preview.documents["renamed.md"].show_markdown,
+                "renaming within Markdown must preserve the user's code view choice"
+            );
+            files.rename_documents("renamed.md", "renamed.txt".into(), cx);
+            assert!(
+                files.preview.documents["renamed.txt"]
+                    .highlight_task
+                    .is_none()
+            );
+            assert!(!files.preview.highlights.contains_key("renamed.txt"));
+        });
+    }
+
+    /// A missing file gets its own wording — the transport's RPC framing
+    /// never reaches the reader — while every other failure keeps its own.
+    #[test]
+    fn missing_files_and_outside_reads_show_their_own_wording() {
+        assert_eq!(
+            read_error_message(&crate::files::client::FilesClientError::Request(
+                "file not found".into()
+            )),
+            SharedString::from("File not found.")
+        );
+        assert_eq!(
+            read_error_message(&crate::files::client::FilesClientError::Transport(
+                "gone".into()
+            ))
+            .to_string(),
+            "workspace connection unavailable: gone"
+        );
+        assert_eq!(
+            read_only_message(Some(WorkspaceReadOnlyReason::OutsideWorkspace)),
+            SharedString::from("Read-only: outside this chat's folder.")
+        );
+    }
 
     // Rendering a preview needs a window, so this asserts on `line_height`,
     // the single source both the uniform-height hint passed to
@@ -3762,6 +4045,96 @@ mod markdown_buffer_tests {
     use gpui::{AppContext, TestAppContext};
 
     #[gpui::test]
+    fn content_search_byte_columns_place_cursor_at_match_after_unicode(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let path = "search.txt";
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new_editor(
+                state,
+                "chat".into(),
+                path.into(),
+                false,
+                1000,
+                13.0,
+                false,
+                false,
+                cx,
+            )
+        });
+        for prefix in [
+            "plain ",
+            "café ",
+            "🦀 ",
+            "café 🦀 ",
+            "\u{2003}\tcafé 🦀 ",
+            "cafe\u{301} ",
+        ] {
+            let source = format!("first line\n{prefix}needle suffix\nlast line");
+            window
+                .update(cx, |surface, window, cx| {
+                    surface.preview.documents.insert(
+                        path.into(),
+                        FileDocument::loading(DocumentKey {
+                            chat_id: "chat".into(),
+                            checkout_id: Some("checkout".into()),
+                            path: path.into(),
+                        }),
+                    );
+                    surface.navigate_to_line(2, Some(FileColumn::Byte(prefix.len() as u64)), cx);
+                    // Navigation can arrive before the file contents do.
+                    surface.apply_line_navigation(path, None, window, cx);
+                    assert!(surface.pending_line_navigation.is_some());
+                    surface.preview.documents.get_mut(path).unwrap().set_loaded(
+                        zeron_proto::WorkspaceFileText {
+                            checkout_id: "checkout".into(),
+                            path: path.into(),
+                            text: Some(source.clone()),
+                            content_hash: Some("hash".into()),
+                            size: source.len() as u64,
+                            modified_at: None,
+                            encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                            line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                            read_only_reason: None,
+                            truncated: false,
+                        },
+                    );
+                    let editor = cx.new(|cx| {
+                        gpui_base::input::EditorState::new(window, cx).default_value(source.clone())
+                    });
+                    surface.apply_line_navigation(path, Some(&editor), window, cx);
+                    assert!(surface.pending_line_navigation.is_none());
+                    assert_eq!(
+                        editor.read(cx).cursor(),
+                        source.find("needle").unwrap(),
+                        "{prefix:?}"
+                    );
+                    assert_eq!(
+                        editor.read(cx).cursor_position(),
+                        gpui_base::input::Position::new(1, prefix.chars().count() as u32)
+                    );
+                    // Opening a link to the same character must keep its existing
+                    // one-based character semantics, even on a multibyte line.
+                    surface.navigate_to_line(
+                        2,
+                        Some(FileColumn::Character(prefix.chars().count() as u32 + 1)),
+                        cx,
+                    );
+                    surface.apply_line_navigation(path, Some(&editor), window, cx);
+                    assert_eq!(
+                        editor.read(cx).cursor(),
+                        source.find("needle").unwrap(),
+                        "file link: {prefix:?}"
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn chat_line_link_opens_markdown_source_and_centers_the_requested_line(
         cx: &mut TestAppContext,
     ) {
@@ -3796,8 +4169,8 @@ mod markdown_buffer_tests {
                     path: path.into(),
                 });
                 assert!(document.show_markdown);
-                surface.navigate_to_line(20, Some(3), cx);
-                surface.navigate_to_line(90, Some(6), cx);
+                surface.navigate_to_line(20, Some(FileColumn::Character(3)), cx);
+                surface.navigate_to_line(90, Some(FileColumn::Character(6)), cx);
                 surface.preview.active = Some(path.into());
                 surface.preview.documents.insert(path.into(), document);
             })
@@ -3810,7 +4183,10 @@ mod markdown_buffer_tests {
         .unwrap();
         window
             .update(cx, |surface, _, cx| {
-                assert_eq!(surface.pending_line_navigation, Some((90, Some(6))));
+                assert_eq!(
+                    surface.pending_line_navigation,
+                    Some((90, Some(FileColumn::Character(6))))
+                );
                 surface.preview.documents.get_mut(path).unwrap().set_loaded(
                     zeron_proto::WorkspaceFileText {
                         checkout_id: "checkout".into(),
@@ -4536,6 +4912,41 @@ mod markdown_buffer_tests {
                 assert!(surface.staged_file_comments("a.rs", cx).is_empty());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn default_editor_opens_only_files_on_this_device(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let surface = cx.new(|cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "chat".into(), false, 1000, 13.0, false, false, cx)
+        });
+        surface.update(cx, |surface, _| {
+            assert_eq!(surface.system_open_path("src/lib.rs"), None);
+            let local = FilesRequestContext {
+                target: zeron_proto::WorkspaceTarget {
+                    chat_id: Some("chat".into()),
+                    space_id: None,
+                    checkout_path: None,
+                },
+                target_device_id: None,
+                cwd: "/workspace".into(),
+                checkout_id: Some("checkout".into()),
+            };
+            surface.request_context = Some(local.clone());
+            assert_eq!(
+                surface.system_open_path("src/lib.rs"),
+                Some(std::path::PathBuf::from("/workspace/src/lib.rs"))
+            );
+            surface.request_context = Some(FilesRequestContext {
+                target_device_id: Some("other-device".into()),
+                ..local
+            });
+            assert_eq!(surface.system_open_path("src/lib.rs"), None);
+        });
     }
 
     #[gpui::test]

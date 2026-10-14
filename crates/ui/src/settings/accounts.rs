@@ -160,6 +160,21 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
+/// "Session: resets 3:45 PM · Week: resets Thu" — the usage meters' tooltip.
+pub(crate) fn usage_resets(
+    windows: &[zeron_proto::AgentUsageWindow],
+    now: DateTime<Utc>,
+) -> String {
+    windows
+        .iter()
+        .map(|window| match format_reset(window.resets_at, now) {
+            Some(reset) => format!("{}: {reset}", window.label),
+            None => window.label.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// The providers zeron can sign into, in display order: (harness, name, CLI
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
@@ -1192,15 +1207,7 @@ impl AccountsPage {
                 .flex_none()
                 .into_any_element()
         } else {
-            let resets = account
-                .usage_windows
-                .iter()
-                .map(|window| match format_reset(window.resets_at, now) {
-                    Some(reset) => format!("{}: {reset}", window.label),
-                    None => window.label.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
+            let resets = usage_resets(&account.usage_windows, now);
             div()
                 .id(("account-usage", ix))
                 .w(px(USAGE_COLUMN_WIDTH))
@@ -1270,6 +1277,7 @@ impl AccountsPage {
             .tab_index(0)
             .role(gpui::Role::Button)
             .aria_label(format!("Actions for {email}"))
+            .tooltip(widgets::text_tooltip("Account actions"))
             .aria_expanded(menu_open)
             .focus_visible(|s| s.border_2().border_color(theme.accent))
             .on_mouse_down(
@@ -1836,21 +1844,6 @@ impl AccountsPage {
                             ),
                     ),
             )
-            .when_some(self.error.clone(), |el, message| {
-                el.child(
-                    widgets::error_strip(theme, message)
-                        .mt(px(4.0))
-                        .id("accounts-action-error")
-                        .role(gpui::Role::Button)
-                        .aria_label("Dismiss account error")
-                        .tab_index(0)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|page, _, _, cx| {
-                            page.error = None;
-                            cx.notify();
-                        })),
-                )
-            })
             .children(match &self.snapshot {
                 Loadable::Ready(snapshot) => snapshot
                     .warnings
@@ -1879,6 +1872,7 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
@@ -2185,20 +2179,6 @@ impl Render for AccountsPage {
                                     )
                                     .child(self.render_device_switcher(&theme, cx)),
                             )
-                            .when_some(self.error.clone(), |el, message| {
-                                el.child(
-                                    widgets::error_strip(&theme, message)
-                                        .id("accounts-action-error")
-                                        .cursor_pointer()
-                                        .tab_index(0)
-.role(gpui::Role::Button)
-.focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-.on_click(cx.listener(|this, _, _, cx| {
-                                            this.error = None;
-                                            cx.notify();
-                                        })),
-                                )
-                            })
                             .children(sections)
                             // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
                             // text-muted-foreground/60`).
@@ -2307,6 +2287,29 @@ mod tests {
                 monthly.with_timezone(&Local).format("%b %-d")
             ))
         );
+    }
+
+    #[test]
+    fn usage_resets_lists_every_window() {
+        let now = Utc::now();
+        let soon = now + TimeDelta::minutes(125);
+        let windows = [
+            zeron_proto::AgentUsageWindow {
+                label: "Session".into(),
+                used_fraction: 0.07,
+                resets_at: Some(soon),
+            },
+            zeron_proto::AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.44,
+                resets_at: None,
+            },
+        ];
+        assert_eq!(
+            usage_resets(&windows, now),
+            format!("Session: {} · Week", format_reset(Some(soon), now).unwrap())
+        );
+        assert_eq!(usage_resets(&[], now), "");
     }
 
     #[test]
