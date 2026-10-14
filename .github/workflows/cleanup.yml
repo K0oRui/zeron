@@ -25,6 +25,11 @@ on:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    # One cleanup at a time: every workflow completion triggers this, so
+    # superseded runs cancel instead of piling up behind each other.
+    concurrency:
+      group: cleanup
+      cancel-in-progress: true
     permissions:
       actions: write
       contents: read
@@ -37,8 +42,11 @@ jobs:
           for workflow in $(gh api "/repos/$REPO/actions/workflows" --jq '.workflows[].id'); do
             count=$(gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=1" --jq '.total_count')
             [ "$count" -le 1 ] && continue
+            # Keep the newest run overall; delete older runs only once they
+            # are completed. Deleting a queued or in-progress run answers
+            # 403 and aborts the whole step.
             gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=100" --jq '.workflow_runs' \
-              | jq -r 'sort_by(.run_number) | reverse | .[1:] | .[].id' \
+              | jq -r 'sort_by(.run_number) | reverse | .[1:] | map(select(.status == "completed")) | .[].id' \
               | xargs -r -I{} gh api -X DELETE "/repos/$REPO/actions/runs/{}"
           done
 
