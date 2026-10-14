@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).with_name('update-cursor-sdk.py').resolve()
+SCRIPT = Path(__file__).resolve().parent.parent / 'cursor' / 'update-cursor-sdk.py'
 
 class UpdateTests(unittest.TestCase):
     def run_update(self, version):

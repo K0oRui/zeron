@@ -109,7 +109,7 @@ jobs:
       - name: Build application
         run: cargo build --release --locked -p zeron
       - name: Verify portable and installer packaging
-        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+        run: ./scripts/package/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
       - name: Installer install/uninstall
         run: ./scripts/test-windows-installer.ps1
       - name: GUI subsystem and redirected CLI output

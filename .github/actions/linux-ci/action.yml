@@ -63,7 +63,11 @@ runs:
     # are part of the rust-cache key, so every job sharing a cache must set the same.
     - name: Build settings
       shell: bash
-      run: echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+      run: |
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
@@ -72,6 +76,17 @@ runs:
         add-job-id-key: false
         save-if: ${{ inputs.save-rust-cache == 'true' && github.ref == 'refs/heads/main' }}
         cache-on-failure: true
+
+    # Shared compilation cache across jobs and runs: the workspace is large
+    # and every job recompiles its own crates even with warm rust-cache.
+    # Bounded so it cannot crowd out the other caches (10 GB repo limit).
+    # Env is set both here (the upload runs as this step's post action) and
+    # in Build settings above (the compiler itself reads it at build time).
+    - name: Enable sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        SCCACHE_CACHE_SIZE: 2G
 
     # After the cache restore, so the checksum-verified binary is the one that
     # runs (rust-cache restores ~/.cargo/bin).

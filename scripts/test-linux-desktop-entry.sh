@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline check that both Linux installers (the curl one in edge/src/install.sh
-# and the install.sh scripts/package-linux.sh puts in the tarball) write a
+# and the install.sh scripts/package/package-linux.sh puts in the tarball) write a
 # launcher entry with absolute paths plus the icon, idempotently, under a
 # throwaway HOME. Nothing touches the network, systemd, or the real home.
 #
@@ -27,15 +27,15 @@ printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) exec /us
 chmod 755 "$WORK/shim/uname"
 
 # The tarball's install.sh lives in a heredoc inside package-linux.sh.
-sed -n "/<<'INSTALL'/,/^INSTALL\$/p" "$ROOT/scripts/package-linux.sh" | sed '1d;$d' \
+sed -n "/<<'INSTALL'/,/^INSTALL\$/p" "$ROOT/scripts/package/package-linux.sh" | sed '1d;$d' \
   | sed "s/__VERSION__/$VERSION/" >"$WORK/pkg/$PKG/install.sh"
 chmod 755 "$WORK/pkg/$PKG/install.sh"
 
 # The two copies of install_desktop_entry must stay identical.
 fn_body() { sed -n '/^install_desktop_entry() {$/,/^}$/p' "$1"; }
 [ -n "$(fn_body "$ROOT/edge/src/install.sh")" ] || fail "install_desktop_entry not found"
-[ "$(fn_body "$ROOT/edge/src/install.sh")" = "$(fn_body "$ROOT/scripts/package-linux.sh")" ] \
-  || fail "install_desktop_entry differs between edge/src/install.sh and scripts/package-linux.sh"
+[ "$(fn_body "$ROOT/edge/src/install.sh")" = "$(fn_body "$ROOT/scripts/package/package-linux.sh")" ] \
+  || fail "install_desktop_entry differs between edge/src/install.sh and scripts/package/package-linux.sh"
 
 # run_curl HOME [ENV=VALUE ...] / run_tarball HOME [ENV=VALUE ...]
 # Each run gets its own TMPDIR, which must be empty again afterwards (the curl

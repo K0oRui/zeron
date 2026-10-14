@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - 'edge/src/install.sh'
-      - 'scripts/package-linux.sh'
+      - 'scripts/package/package-linux.sh'
       - 'scripts/test-linux-desktop-entry.sh'
       - 'scripts/ci/apt-install.sh'
       - 'dist/zeron.desktop'
@@ -14,7 +14,7 @@ on:
     branches: [main]
     paths:
       - 'edge/src/install.sh'
-      - 'scripts/package-linux.sh'
+      - 'scripts/package/package-linux.sh'
       - 'scripts/test-linux-desktop-entry.sh'
       - 'scripts/ci/apt-install.sh'
       - 'dist/zeron.desktop'
