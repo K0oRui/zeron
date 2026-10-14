@@ -1026,11 +1026,10 @@ const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 const SIDEBAR_FOOTER_BUTTON_SIZE: f32 = 28.0;
 const SIDEBAR_FOOTER_AVATAR_SIZE: f32 = 16.0;
 
-/// Keep the fade short so only the last few glyphs recede. Static fade, no
-/// scroll handle: one handle per label per row meant hundreds of fresh
-/// handles and tracked scrollers on every sidebar frame. Fitting labels
-/// over-fade by up to one band, which matches the title's resting state.
+/// Keep the fade short so only the last few glyphs recede. Tracking clipped
+/// content lets the shared paint-time overflow gate leave fitting labels intact.
 pub(crate) fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) -> impl IntoElement {
+    let overflow = gpui::ScrollHandle::new();
     crate::edge_fade::edge_faded(
         20.0,
         false,
@@ -1041,10 +1040,12 @@ pub(crate) fn sidebar_faded_label(id: SharedString, fill: bool, label: impl Into
             .when(fill, |el| el.flex_1())
             .min_w_0()
             .overflow_hidden()
+            .track_scroll(&overflow)
             .flex()
             .child(div().flex_none().whitespace_nowrap().child(label)),
     )
     .fade_right(true)
+    .fade_label_overflow(&overflow)
 }
 
 /// One sidebar title's marquee bookkeeping, keyed by chat id.
