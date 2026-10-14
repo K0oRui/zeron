@@ -154,13 +154,10 @@ impl TitleGenerator {
         let settings = self.inner.registry.title_settings();
         let enabled = self.inner.registry.enabled_set();
         let harness_id = settings.harness.or_else(|| {
-            if zeron_harness::supports_titles(harness_id) {
+            if enabled.contains(&harness_id) {
                 Some(harness_id)
             } else {
-                enabled
-                    .iter()
-                    .copied()
-                    .find(|id| zeron_harness::supports_titles(*id))
+                enabled.first().copied()
             }
         })?;
         if !zeron_harness::supports_titles(harness_id) {

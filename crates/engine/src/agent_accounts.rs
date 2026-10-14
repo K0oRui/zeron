@@ -1424,9 +1424,18 @@ impl AgentAccounts {
                 self.reap_spawned_flows(HarnessId::ClaudeCode);
                 self.start_claude_login().await
             }
-            HarnessId::Codex => self.start_codex_login(requester).await?,
+            HarnessId::Codex => match provider {
+                Some("api-key") => AgentLoginStart {
+                    login_id: new_id(),
+                    url: String::new(),
+                    mode: AgentLoginMode::ApiKey,
+                    callback_port: None,
+                },
+                Some("oauth") | None => self.start_codex_login(requester).await?,
+                Some(other) => return Err(stores::unsupported_login(harness, other)),
+            },
             HarnessId::Cursor => self.start_cursor_login().await?,
-            HarnessId::Antigravity => self.start_antigravity_login(requester),
+            HarnessId::Antigravity => self.start_antigravity_login(requester)?,
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
             HarnessId::Opencode => match provider.unwrap_or("openai") {
@@ -1773,36 +1782,92 @@ impl AgentAccounts {
     /// the browser url once the server prints it. A server that already holds
     /// a valid token answers `authenticate` without any browser at all, which
     /// is success: the poll reports done and the list shows the login.
-    fn start_antigravity_login(&self, requester: Option<&str>) -> AgentLoginStart {
+    fn start_antigravity_login(
+        &self,
+        requester: Option<&str>,
+    ) -> Result<AgentLoginStart, EngineError> {
         self.reap_spawned_flows(HarnessId::Antigravity);
+        let acp = self
+            .acp_harness(HarnessId::Antigravity)
+            .ok_or_else(|| EngineError::Other("Antigravity has no sign-in".into()))?;
         let login_id = new_id();
         let state = Arc::new(Mutex::new(TaskLoginState {
             requester: requester.map(str::to_string),
             ..Default::default()
         }));
+        // A throwaway home for the recording browser's url file — reclaimed
+        // on cancel (flow `home`) and on completion below.
+        let login_home = self.login_home(&login_id).ok();
+        let url_file = login_home.as_ref().map(|home| home.join("browser-url"));
+        if let Some(url_file) = &url_file {
+            let _ = write_file_atomic(url_file, b"", true);
+        }
+        // Record the page the server asks the OS to open instead of opening
+        // it: the app opens the one tab once the url lands — via the
+        // recording, or via the server's printed link as before. A server
+        // that never prints its link still lands through the recording.
         #[cfg(unix)]
-        let browser = {
-            self.inner
-                .config
-                .private_root()
-                .ok()
-                .and_then(|root| ensure_noop_browser(&root))
-        };
+        let browser = self
+            .inner
+            .config
+            .private_root()
+            .ok()
+            .and_then(|root| ensure_recording_browser(&root));
         #[cfg(not(unix))]
         let browser = None;
+        let sign_in_env: Vec<(String, std::ffi::OsString)> = url_file
+            .clone()
+            .map(|file| {
+                vec![("ZERON_LOGIN_URL_FILE".to_string(), file.into_os_string())]
+            })
+            .unwrap_or_default();
         let home = self.inner.config.antigravity_home.clone();
         let keychain = self.inner.config.antigravity_keychain;
         let task_state = state.clone();
+        let task_home = login_home.clone();
+        let watch_state = state.clone();
+        let watch_file = url_file.clone();
+        let watch_accounts = self.clone();
+        let watch_id = login_id.clone();
+        // The recording browser's file, until the sign-in ends: a server
+        // that opens its page without printing it still lands here. Ends
+        // with the flow (cancel included), so a dismissed dialog leaves no
+        // polling task behind.
+        let watcher = tokio::spawn(async move {
+            loop {
+                if lock(&watch_state).url.is_some()
+                    || !lock(&watch_accounts.inner.flows).contains_key(&watch_id)
+                {
+                    break;
+                }
+                if let Some(file) = &watch_file
+                    && let Some(url) = recorded_browser_url(file)
+                {
+                    lock(&watch_state).url = Some(url);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
         let handle = tokio::spawn(async move {
             let progress_state = task_state.clone();
-            let mut outcome = zeron_harness::AcpHarness::antigravity()
-                .sign_in(browser, move |progress| match progress {
+            let options = zeron_harness::acp::SignInOptions {
+                browser,
+                env: sign_in_env,
+                ..Default::default()
+            };
+            let mut outcome = acp
+                .sign_in_with(options, move |progress| match progress {
                     zeron_harness::acp::SignInProgress::OpenBrowser(url) => {
-                        lock(&progress_state).url = Some(url);
+                        let mut state = lock(&progress_state);
+                        if state.url.is_none() {
+                            state.url = Some(url);
+                        }
                     }
                 })
                 .await
                 .map_err(|e| e.to_string());
+            watcher.abort();
             // A success the list can't show would drop the user back at
             // "Connect" with no word why — say where the login went missing.
             if outcome.is_ok()
@@ -1814,6 +1879,9 @@ impl AgentAccounts {
                     home.join("antigravity-acp").display()
                 ));
             }
+            if let Some(home) = &task_home {
+                let _ = std::fs::remove_dir_all(home);
+            }
             lock(&task_state).outcome = Some(outcome);
         });
         lock(&self.inner.flows).insert(
@@ -1823,16 +1891,16 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 state,
                 handle,
-                home: None,
+                home: login_home,
                 port: None,
             },
         );
-        AgentLoginStart {
+        Ok(AgentLoginStart {
             login_id,
             url: String::new(),
             mode: AgentLoginMode::Browser,
             callback_port: None,
-        }
+        })
     }
 
     /// Cursor: the SDK's own PKCE browser flow, driven through the zeron shim
@@ -1903,6 +1971,33 @@ impl AgentAccounts {
         .await?;
         self.remove_flow(login_id);
         self.list(false).await
+    }
+
+    /// Save a pasted Codex API key (`OPENAI_API_KEY`) as an account slot.
+    /// No browser flow runs; the key lands in the same slot system OAuth
+    /// uses, so swap/forget/usage behave identically. First key with no
+    /// live login becomes live via [`Self::adopt_if_live`].
+    pub async fn save_codex_api_key(
+        &self,
+        raw_key: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let key = validate_codex_api_key(raw_key)?;
+        let credentials = serde_json::json!({ "OPENAI_API_KEY": key });
+        let detected =
+            parse_codex_auth(credentials.clone()).ok_or_else(|| {
+                EngineError::Other("That key could not be saved — try again.".into())
+            })?;
+        let _ops = self.inner.ops.lock().await;
+        self.snapshot_detected(HarnessId::Codex, &detected)?;
+        let id = slot_id_for(HarnessId::Codex, &detected.account_key);
+        if let Some(slot) = self
+            .read_slots(HarnessId::Codex)
+            .into_iter()
+            .find(|s| s.id == id)
+        {
+            self.adopt_if_live(&slot).await?;
+        }
+        self.list_locked(false).await
     }
 
     /// Redeem a Claude authorization code at `token_url` and save the account
@@ -3259,6 +3354,40 @@ fn with_claude_ai_oauth(
     }
 }
 
+/// Validate a pasted Codex API key without echoing it. OpenAI keys start
+/// with `sk-`; require that prefix, a sane length, and no whitespace so
+/// truncated pastes fail fast instead of becoming a mystery auth error.
+fn validate_codex_api_key(raw: &str) -> Result<String, EngineError> {
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        return Err(EngineError::Other(
+            "That key looks empty — paste the whole key.".into(),
+        ));
+    }
+    if key.chars().any(char::is_whitespace) {
+        return Err(EngineError::Other(
+            "That key contains whitespace — paste the whole key without spaces.".into(),
+        ));
+    }
+    if !key.starts_with("sk-") || key.len() < 20 {
+        return Err(EngineError::Other(
+            "That doesn't look like an OpenAI API key — it should start with `sk-`.".into(),
+        ));
+    }
+    Ok(key)
+}
+
+/// First non-blank line of a recording browser's url file — the page the
+/// agent asked the OS to open.
+fn recorded_browser_url(file: &Path) -> Option<String> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse a codex `auth.json` (the live one or a fresh login's).
 fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     if let Some(id_token) = auth
@@ -4183,6 +4312,74 @@ mod tests {
         assert_eq!(codex_plan(Some("plus")).as_deref(), Some("ChatGPT Plus"));
         assert_eq!(codex_plan(Some("free")).as_deref(), Some("ChatGPT Free"));
         assert_eq!(codex_plan(None), None);
+    }
+
+    #[test]
+    fn codex_api_key_validation_rejects_junk_without_echoing_it() {
+        assert!(validate_codex_api_key("sk-test-12345678abcd").is_ok());
+        assert!(validate_codex_api_key("  sk-test-12345678abcd  ").is_ok());
+        for bad in ["sk-short", "not-a-key", "sk-abc def", "pk-test-12345678abcd"] {
+            let err = validate_codex_api_key(bad).expect_err("rejects junk");
+            let msg = err.to_string();
+            assert!(!msg.contains(bad.trim()), "error must not echo the key");
+        }
+        for bad in ["", "   "] {
+            validate_codex_api_key(bad).expect_err("rejects blank");
+        }
+    }
+
+    #[test]
+    fn recorded_browser_url_reads_the_first_non_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("browser-url");
+        assert_eq!(recorded_browser_url(&file), None);
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(recorded_browser_url(&file), None);
+        std::fs::write(
+            &file,
+            "  \n  https://accounts.google.com/o/oauth2/auth?x=1  \nhttps://second.example/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_browser_url(&file).as_deref(),
+            Some("https://accounts.google.com/o/oauth2/auth?x=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_start_without_a_server_fails_cleanly_and_reaps_its_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig::isolated(dir.path());
+        let accounts = AgentAccounts::new(config.clone());
+        // Pin the server to a path that cannot resolve, so the outcome is
+        // a fast failure whatever the machine has installed.
+        accounts.override_cli(
+            HarnessId::Antigravity,
+            dir.path().join("no-such-server"),
+        );
+        let start = accounts
+            .start_login(HarnessId::Antigravity)
+            .await
+            .expect("start");
+        assert_eq!(start.mode, AgentLoginMode::Browser);
+        assert!(start.url.is_empty());
+        let home = config
+            .data_dir
+            .join("agent-accounts")
+            .join(format!(".login-{}", start.login_id));
+        // The task reports the missing server; the throwaway home (and its
+        // url file) is reaped with it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let poll = accounts.poll_login(&start.login_id).await.expect("poll");
+            if poll.status == AgentLoginStatus::Error {
+                assert!(poll.message.is_some());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "sign-in never failed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!home.exists(), "throwaway login home is reaped");
     }
 
     #[test]

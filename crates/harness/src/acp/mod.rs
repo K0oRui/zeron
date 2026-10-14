@@ -210,7 +210,7 @@ fn grok_spec() -> AcpAgentSpec {
         display_name: "Grok",
         executable: "grok",
         env_override: "GROK_EXECUTABLE",
-        // Flag placement verified against grok 1.0.4: `--no-auto-update` is
+        // Flag placement verified against grok 1.0.x: `--no-auto-update` is
         // TOP-LEVEL (before the subcommand) and kills the launch-time update
         // check (a silent multi-second network stall); `--no-leader` lives on
         // the `agent` subcommand and starts a fresh agent even when
@@ -218,7 +218,7 @@ fn grok_spec() -> AcpAgentSpec {
         // shared process via ~/.grok/leader.sock, so a wedged/stale leader
         // (the user's TUI) reads as total silent non-response in zeron.
         args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
-        npm_package: Some("@xai-official/grok@1.0.4"),
+        npm_package: Some("@xai-official/grok@1.0.44"),
         archive: None,
         extra_paths: grok_install_paths,
         cli_executable: "grok",
@@ -229,17 +229,43 @@ fn grok_spec() -> AcpAgentSpec {
              `curl -fsSL https://x.ai/cli/install.sh | bash` or \
              `npm install -g @xai-official/grok`; set GROK_EXECUTABLE to override)",
         models: || {
-            vec![Model {
-                id: "grok-4.5".into(),
-                label: "Grok 4.5".into(),
-                description: Some("xAI's coding model — 500k context".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                ],
-                options: Vec::new(),
-            }]
+            vec![
+                Model {
+                    id: "grok-4.7".into(),
+                    label: "Grok 4.7".into(),
+                    description: Some("xAI's frontier coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "grok-4.6".into(),
+                    label: "Grok 4.6".into(),
+                    description: Some("xAI's coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "grok-4.5".into(),
+                    label: "Grok 4.5".into(),
+                    description: Some("xAI's coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                    options: Vec::new(),
+                },
+            ]
         },
         // No `_session/steering` extension: a steer preempts the generation
         // (waiting out running tools) and continues the turn — immediate.
@@ -250,11 +276,12 @@ fn grok_spec() -> AcpAgentSpec {
             ReasoningLevel::Low,
             ReasoningLevel::Medium,
             ReasoningLevel::High,
+            ReasoningLevel::XHigh,
         ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
-        // Verified live (1.0.4): the notification fires with the echoed
+        // Verified live (1.0.x): the notification fires with the echoed
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
         prompt_stall: Some(Duration::from_secs(30)),
@@ -262,7 +289,10 @@ fn grok_spec() -> AcpAgentSpec {
              process or a hung startup check; zeron launches it with --no-leader \
              and --no-auto-update to avoid both.",
         effort_in_model_id: false,
-        auth_method: None,
+        // Grok answers unauthenticated `session/new` with auth_required
+        // (code -32000). Naming the method routes that into the Settings
+        // connect flow instead of a raw protocol error.
+        auth_method: Some("cached_token"),
         skill_dirs: Vec::new,
         hidden_commands: &[],
         drops_unstarted_cancelled_prompt: true,
@@ -1658,13 +1688,16 @@ impl AcpHarness {
     }
 
     fn configure_adapter_environment(&self, cmd: &mut Command, executable: &Path) {
-        if self.spec.id == HarnessId::Antigravity
-            && let Some(parent) = executable.parent()
-        {
-            let sibling = parent.join("localharness_external");
-            if sibling.is_file() {
-                cmd.env("ANTIGRAVITY_HARNESS_PATH", sibling);
-                cmd.env("PYTHONUNBUFFERED", "1");
+        if self.spec.id == HarnessId::Antigravity {
+            // The server is Python behind pipes: a buffered auth-link print
+            // would sit in the stdout buffer until exit — while the sign-in
+            // waits on it. Unbuffer always, not just for the dev layout.
+            cmd.env("PYTHONUNBUFFERED", "1");
+            if let Some(parent) = executable.parent() {
+                let sibling = parent.join("localharness_external");
+                if sibling.is_file() {
+                    cmd.env("ANTIGRAVITY_HARNESS_PATH", sibling);
+                }
             }
         }
     }
@@ -1776,6 +1809,24 @@ impl AcpHarness {
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
             let mut commands = scan_available_commands(&init);
+            if self.spec.id == HarnessId::Grok {
+                let has_api_key = std::env::var("XAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
+                match grok_auth_method(&init, has_api_key) {
+                    Some(method) => {
+                        client
+                            .request(
+                                "authenticate",
+                                json!({ "methodId": method, "_meta": { "headless": true } }),
+                            )
+                            .await?;
+                    }
+                    None => {
+                        return Err(HarnessError::Protocol(not_signed_in(
+                            self.spec.display_name,
+                        )));
+                    }
+                }
+            }
             {
                 let cwd = cwd
                     .map(std::path::Path::to_path_buf)
@@ -1843,9 +1894,27 @@ impl AcpHarness {
             }
         };
         let discovery = async {
-            client
+            let init = client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
+            if self.spec.id == HarnessId::Grok {
+                let has_api_key = std::env::var("XAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
+                match grok_auth_method(&init, has_api_key) {
+                    Some(method) => {
+                        client
+                            .request(
+                                "authenticate",
+                                json!({ "methodId": method, "_meta": { "headless": true } }),
+                            )
+                            .await?;
+                    }
+                    None => {
+                        return Err(HarnessError::Protocol(not_signed_in(
+                            self.spec.display_name,
+                        )));
+                    }
+                }
+            }
             let cwd = crate::executable::home_or_current_dir();
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
@@ -2341,6 +2410,20 @@ impl Harness for AcpHarness {
         Ok(commands)
     }
 
+    async fn run_title(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        request.sandbox = zeron_proto::SandboxLevel::ReadOnly;
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         request: RunRequest,
@@ -2553,6 +2636,27 @@ fn steering_supported(init: &Value) -> bool {
         .and_then(|s| s.get("supported"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Grok's `authenticate` method from `initialize.authMethods` (current docs):
+/// `xai.api_key` when `XAI_API_KEY` is set, else the local `cached_token`
+/// login. `None` means neither is advertised and the run cannot proceed.
+fn grok_auth_method(init: &Value, has_api_key: bool) -> Option<String> {
+    let methods: Vec<&str> = init
+        .get("authMethods")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    if has_api_key && methods.contains(&"xai.api_key") {
+        return Some("xai.api_key".to_owned());
+    }
+    if methods.contains(&"cached_token") {
+        return Some("cached_token".to_owned());
+    }
+    None
 }
 
 /// Depth-limited scan for an `availableCommands` array anywhere in a response
@@ -2948,30 +3052,73 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
     })
 }
 
+/// Rate-limit signals a Grok turn can carry: an HTTP 429, the terse
+/// `rate_limit` code, or vendor prose ("usage limit", "quota exceeded",
+/// "too many requests"). Matched case-insensitively against RPC errors and
+/// turn response messages.
+fn is_rate_limit_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // `429` only on digit boundaries: `exit 4290` and `14293 tokens` are
+    // not rate limits.
+    let rate_limited = lower.split(|c: char| !c.is_ascii_digit()).any(|t| t == "429");
+    rate_limited
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("ratelimit")
+        || lower.contains("usage limit")
+        || lower.contains("quota exceeded")
+        || lower.contains("too many requests")
+}
+
 /// Map a finished `session/prompt` result to the run's terminal status.
 fn stop_outcome(
     res: &Result<Value, HarnessError>,
     interrupted: bool,
+    agent_name: &str,
 ) -> (DoneStatus, Option<String>) {
     if interrupted {
         return (DoneStatus::Interrupted, None);
     }
     match res {
-        Ok(resp) => match resp.get("stopReason").and_then(Value::as_str) {
-            Some("cancelled") => (DoneStatus::Interrupted, None),
-            Some("error") => (
-                DoneStatus::Errored,
-                Some("The agent failed to complete the turn.".to_owned()),
-            ),
-            Some("refusal") => (
-                DoneStatus::Errored,
-                Some("The agent refused to continue.".to_owned()),
-            ),
-            // end_turn / max_tokens / max_turn_requests: the turn ended;
-            // partial output is already in the doc.
-            _ => (DoneStatus::Completed, None),
-        },
-        Err(e) => (DoneStatus::Errored, Some(e.to_string())),
+        Ok(resp) => {
+            let message = ["error", "message", "detail"]
+                .iter()
+                .find_map(|k| resp.get(*k).and_then(Value::as_str))
+                .filter(|m| !m.is_empty())
+                .map(|m| {
+                    if is_rate_limit_text(m) {
+                        format!(
+                            "{agent_name} usage limit reached — try again after the limit resets."
+                        )
+                    } else {
+                        m.to_owned()
+                    }
+                });
+            match resp.get("stopReason").and_then(Value::as_str) {
+                Some("cancelled") => (DoneStatus::Interrupted, None),
+                Some("error") => (
+                    DoneStatus::Errored,
+                    message.or_else(|| Some("The agent failed to complete the turn.".to_owned())),
+                ),
+                Some("refusal") => (
+                    DoneStatus::Errored,
+                    message.or_else(|| Some("The agent refused to continue.".to_owned())),
+                ),
+                // end_turn / max_tokens / max_turn_requests: the turn ended;
+                // partial output is already in the doc.
+                _ => (DoneStatus::Completed, None),
+            }
+        }
+        Err(e) => {
+            let raw = e.to_string();
+            let message = if is_rate_limit_text(&raw) {
+                format!("{agent_name} usage limit reached — try again after the limit resets.")
+            } else {
+                raw
+            };
+            (DoneStatus::Errored, Some(message))
+        }
     }
 }
 
@@ -3742,6 +3889,31 @@ async fn run_session(session: Session) {
         let init = client
             .request("initialize", initialize_params(harness))
             .await?;
+        // Current Grok requires an explicit `authenticate` after
+        // `initialize` (docs: `xai.api_key` when XAI_API_KEY is set, else
+        // the local `cached_token`). Without it `session/new` answers
+        // auth_required even for signed-in users.
+        if harness == HarnessId::Grok {
+            let has_api_key = std::env::var("XAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
+            match grok_auth_method(&init, has_api_key) {
+                Some(method) => {
+                    if let Err(e) = request_draining(
+                        &client,
+                        &mut incoming,
+                        "authenticate",
+                        json!({ "methodId": method, "_meta": { "headless": true } }),
+                    )
+                    .await
+                    {
+                        if is_auth_required(&e) {
+                            return Err(HarnessError::Protocol(not_signed_in(agent_name)));
+                        }
+                        return Err(e);
+                    }
+                }
+                None => return Err(HarnessError::Protocol(not_signed_in(agent_name))),
+            }
+        }
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
@@ -4219,7 +4391,8 @@ async fn run_session(session: Session) {
                     && !queued_steers.is_empty();
                 preempt_pending = false;
                 if !preempted {
-                    let (status, mut error) = stop_outcome(&res, interrupted || stopped);
+                    let (status, mut error) =
+                        stop_outcome(&res, interrupted || stopped, agent_name);
                     if !interrupted
                         && auth_method.is_some()
                         && res.as_ref().is_err_and(is_auth_required)
@@ -4431,7 +4604,7 @@ async fn run_session(session: Session) {
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
                         }
-                        let (status, error) = stop_outcome(&res, interrupted);
+                        let (status, error) = stop_outcome(&res, interrupted, agent_name);
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
@@ -5128,6 +5301,83 @@ mod tests {
         for path in [r"C:\semi;colon\zeron.exe", r"C:\percent%s\zeron.exe"] {
             assert!(windows_noop_browser(Path::new(path)).is_err());
         }
+    }
+
+    #[test]
+    fn grok_auth_prefers_api_key_then_cached_token() {
+        let init = json!({ "authMethods": [{"id": "cached_token"}, {"id": "xai.api_key"}] });
+        assert_eq!(
+            grok_auth_method(&init, true).as_deref(),
+            Some("xai.api_key")
+        );
+        assert_eq!(
+            grok_auth_method(&init, false).as_deref(),
+            Some("cached_token")
+        );
+        let cached_only = json!({ "authMethods": [{"id": "cached_token"}] });
+        assert_eq!(
+            grok_auth_method(&cached_only, true).as_deref(),
+            Some("cached_token")
+        );
+        assert_eq!(grok_auth_method(&json!({}), false), None);
+    }
+
+    #[test]
+    fn rate_limit_text_matches_vendor_signals() {
+        for signal in [
+            "HTTP 429",
+            "rate_limit",
+            "Rate limit exceeded",
+            "rate-limited",
+            "usage limit reached",
+            "quota exceeded",
+            "Too Many Requests",
+        ] {
+            assert!(is_rate_limit_text(signal), "{signal:?}");
+        }
+        assert!(!is_rate_limit_text("The agent refused to continue."));
+        assert!(!is_rate_limit_text(""));
+    }
+
+    #[test]
+    fn stop_outcome_names_rate_limits() {
+        let limited = Err(HarnessError::Protocol(
+            "request failed (code -32603): 429".into(),
+        ));
+        let (status, error) = stop_outcome(&limited, false, "Grok");
+        assert_eq!(status, DoneStatus::Errored);
+        assert_eq!(
+            error.as_deref(),
+            Some("Grok usage limit reached — try again after the limit resets.")
+        );
+        let refusal = Ok(json!({"stopReason": "refusal", "message": "quota exceeded"}));
+        let (status, error) = stop_outcome(&refusal, false, "Grok");
+        assert_eq!(status, DoneStatus::Errored);
+        assert!(error.is_some_and(|m| m.contains("usage limit")));
+        let plain = Ok(json!({"stopReason": "refusal"}));
+        let (status, error) = stop_outcome(&plain, false, "Grok");
+        assert_eq!(status, DoneStatus::Errored);
+        assert_eq!(error.as_deref(), Some("The agent refused to continue."));
+    }
+
+    #[test]
+    fn grok_static_catalog_offers_current_models() {
+        let catalog = (grok_spec().models)();
+        let ids: Vec<&str> = catalog.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"grok-4.7"), "{ids:?}");
+        assert!(ids.contains(&"grok-4.6"), "{ids:?}");
+        assert!(catalog[0].reasoning_levels.contains(&ReasoningLevel::XHigh));
+    }
+
+    // TODO(pi-acp): enable with the `pi_spec()` / `AcpHarness::pi()`
+    // constructor it exercises (half-written WIP, kept for its author).
+    #[cfg(any())]
+    #[test]
+    fn pi_discovery_allows_cold_extension_startup() {
+        let pi = AcpHarness::pi();
+        assert_eq!(pi.model_discovery_timeout, Duration::from_secs(60));
+        assert_eq!(pi.handshake_timeout, Duration::from_secs(120));
+        assert!(pi.spec.prompt_stall.is_none());
     }
 
     #[test]

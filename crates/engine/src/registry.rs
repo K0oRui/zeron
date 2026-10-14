@@ -436,8 +436,8 @@ impl HarnessRegistry {
 
     pub fn set_title_settings(&self, mut settings: TitleSettings) -> Result<(), String> {
         if let Some(id) = settings.harness {
-            if !zeron_harness::supports_titles(id) || !self.enabled_set().contains(&id) {
-                return Err("Choose an enabled harness that supports title generation".into());
+            if !self.enabled_set().contains(&id) {
+                return Err("Choose an enabled harness for title generation".into());
             }
         } else if settings.model.is_some() {
             return Err("Choose a title harness before choosing a model".into());
@@ -1247,6 +1247,9 @@ mod title_tests {
         registry.register(Arc::new(
             zeron_harness::ClaudeHarness::new().with_executable(std::env::current_exe().unwrap()),
         ));
+        registry.register(Arc::new(
+            zeron_harness::CursorHarness::new().with_executable(std::env::current_exe().unwrap()),
+        ));
         let settings = TitleSettings {
             harness: Some(HarnessId::ClaudeCode),
             model: Some("haiku-test".into()),
@@ -1263,15 +1266,29 @@ mod title_tests {
                 })
                 .is_err()
         );
+        // Any enabled provider works for thread naming.
+        registry
+            .set_title_settings(TitleSettings {
+                harness: Some(HarnessId::Cursor),
+                model: None,
+            })
+            .unwrap();
+        // Unknown or disabled harnesses still refuse.
         assert!(
             registry
                 .set_title_settings(TitleSettings {
-                    harness: Some(HarnessId::Cursor),
+                    harness: Some(HarnessId::Pi),
                     model: None
                 })
                 .is_err()
         );
-        assert_eq!(registry.title_settings(), settings);
+        assert_eq!(
+            registry.title_settings(),
+            TitleSettings {
+                harness: Some(HarnessId::Cursor),
+                model: None
+            }
+        );
         registry
             .set_title_settings(TitleSettings::default())
             .unwrap();

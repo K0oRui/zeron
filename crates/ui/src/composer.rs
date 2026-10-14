@@ -26,8 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, TodoItem, ToolCall,
+    UserInputAnswer, UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -670,6 +670,22 @@ pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &s
                     ..
                 } if rid == request_id
             )
+        })
+    })
+}
+
+/// The agent's live todo list: the latest `ToolCall::Todo` surviving in the
+/// transcript, if any. Drives the strip above the composer input — every
+/// harness folds todo tool calls the same way, so this is wire-agnostic
+/// (claude `TodoWrite`, opencode `todowrite` on v1 and v2 alike).
+pub fn latest_todo_list(transcript: &[SessionMessageEntry]) -> Option<Vec<TodoItem>> {
+    transcript.iter().rev().find_map(|entry| {
+        entry.parts.iter().rev().find_map(|part| match part {
+            MessagePart::Tool {
+                call: ToolCall::Todo { items },
+                ..
+            } => Some(items.clone()),
+            _ => None,
         })
     })
 }
@@ -9807,6 +9823,109 @@ impl Composer {
 
     // ---- render pieces ----
 
+    /// The agent's live todo list, stacked directly above the composer input
+    /// (one row per item, checkbox state per row). Reads the latest Todo tool
+    /// call in the transcript, so it tracks every harness without any
+    /// wire-specific state. `None` when the agent keeps no list.
+    fn render_todo_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let items = latest_todo_list(&self.state.read(cx).transcript)?;
+        if items.is_empty() {
+            return None;
+        }
+        let done = items.iter().filter(|item| item.done).count();
+        // The strip lives in normal flow: cap long plans so one list can't
+        // push the transcript off the pane.
+        const SHOWN: usize = 8;
+        let rows = items.iter().take(SHOWN).enumerate().map(|(ix, item)| {
+            // The first open item is the one being worked.
+            let current = !item.done && items[..ix].iter().all(|item| item.done);
+            let box_border = if item.done {
+                gpui::transparent_black()
+            } else {
+                crate::theme::hairline(0.14)
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(12.0))
+                .py(px(4.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(14.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(box_border)
+                        .when(item.done, |el| el.bg(crate::theme::ink(0.1)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(item.done, |el| {
+                            el.child(
+                                crate::icons::icon(crate::icons::CHECK)
+                                    .size(px(10.0))
+                                    .text_color(theme.text_muted),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(12.5))
+                        .text_color(if item.done {
+                            theme.text_muted.opacity(0.55)
+                        } else if current {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(item.text.clone())),
+                )
+        });
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .pb(px(4.0))
+                    .child(
+                        crate::icons::icon(crate::icons::CHECKLIST)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted.opacity(0.7)),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child(SharedString::from(format!("Todos {done}/{}", items.len()))),
+                    ),
+            )
+            .children(rows);
+        if items.len() > SHOWN {
+            strip = strip.child(
+                div()
+                    .px(px(38.0))
+                    .pb(px(2.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child(SharedString::from(format!("+{} more", items.len() - SHOWN))),
+            );
+        }
+        Some(strip.into_any_element())
+    }
+
     /// The agent-asked-a-question panel (zeron question-panel.tsx), rendered in
     /// place of the composer: the same floating-pill chrome (`rounded-[26px]
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
@@ -10957,6 +11076,18 @@ impl Render for Composer {
                 ))
             },
         );
+        // Live todos sit directly above the composer input they describe —
+        // the same tray treatment as the queue (the wizard path above
+        // already returned, so the two never compete for the slot).
+        let container = container.when_some(self.render_todo_strip(cx), |el, strip| {
+            el.child(motion::fade_quick(
+                "composer-todos",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                    .child(strip),
+            ))
+        });
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
         // to the mention/slash popups, which outrank this while they're open.
@@ -15184,6 +15315,75 @@ mod tests {
             multiline: false,
             multi_select: multi,
         }
+    }
+
+    fn todo_entry(items: Vec<(&str, bool)>) -> SessionMessageEntry {
+        use zeron_doc::MessageStatus;
+        SessionMessageEntry {
+            id: "m".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "t1".into(),
+                call: ToolCall::Todo {
+                    items: items
+                        .into_iter()
+                        .map(|(text, done)| TodoItem::new(
+                            text,
+                            if done {
+                                zeron_proto::TodoStatus::Completed
+                            } else {
+                                zeron_proto::TodoStatus::Pending
+                            },
+                        ))
+                        .collect(),
+                },
+                is_error: false,
+                resolved: true,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn latest_todo_list_tracks_the_newest_plan() {
+        assert!(latest_todo_list(&[]).is_none());
+        // No tool calls at all → no strip.
+        let plain = SessionMessageEntry {
+            id: "m".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t".into(),
+                text: "just text".into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        assert!(latest_todo_list(&[plain]).is_none());
+        // The newest Todo call wins, wherever it sits.
+        let t = vec![
+            todo_entry(vec![("old", true)]),
+            todo_entry(vec![("a", true), ("b", false)]),
+        ];
+        let items = latest_todo_list(&t).expect("todos present");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].done && !items[1].done);
+        assert_eq!(items[1].text, "b");
     }
 
     #[test]

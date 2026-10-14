@@ -94,9 +94,12 @@ enum HarnessCatalog {
         switch harness {
         case "grok":
             return [
-                ModelInfo(id: "grok-4.5", label: "Grok 4.5",
+                ModelInfo(id: "grok-4.7", label: "Grok 4.7",
+                          description: "xAI's frontier coding model — 500k context",
+                          reasoningLevels: ["low", "medium", "high", "xhigh"]),
+                ModelInfo(id: "grok-4.6", label: "Grok 4.6",
                           description: "xAI's coding model — 500k context",
-                          reasoningLevels: ["low", "medium", "high"]),
+                          reasoningLevels: ["low", "medium", "high", "xhigh"]),
             ]
         case "devin":
             return [

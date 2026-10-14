@@ -858,6 +858,28 @@ fn output_line(line: &str) -> SharedString {
         None => SharedString::from(line.to_owned()),
     }
 }
+/// An edit call's old/new strings as a real diff detail — the same hunks /
+/// line-numbers / syntax pipeline as server-sent diffs. Used only when the
+/// part carries no diff of its own (those stay authoritative).
+fn edit_call_detail(call: &ToolCall) -> Option<ToolDetail> {
+    let ToolCall::EditFile {
+        path,
+        old_string: Some(old),
+        new_string: Some(new),
+    } = call
+    else {
+        return None;
+    };
+    tool_detail(
+        None,
+        Some(&zeron_proto::ToolDiff {
+            path: path.clone(),
+            old_text: Some(old.clone()),
+            new_text: new.clone(),
+        }),
+        None,
+    )
+}
 
 /// Columns at which an invocation line soft-wraps into continuation lines.
 /// The wrap is char-counted, not measured — block heights must be analytic —
@@ -886,7 +908,8 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         ToolCall::Exec { command } => command.clone(),
         ToolCall::ReadFile { path } => path.clone(),
         ToolCall::WriteFile { path, content } => match content {
-            Some(content) => format!("{path}\n{content}"),
+            // The header already names the file: the block is just the code.
+            Some(content) => content.clone(),
             None => path.clone(),
         },
         ToolCall::EditFile { path, .. } => path.clone(),
@@ -1470,6 +1493,7 @@ pub fn rows_for_entry(
                     is_error: *is_error,
                     resolved: *resolved,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
+                        .or_else(|| edit_call_detail(call))
                         .map(Arc::new),
                     invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
@@ -1657,14 +1681,20 @@ pub fn rows_for_entry(
                         id: part_id,
                         message,
                     } => {
+                        let text: SharedString = single_line(message).into();
+                        // Coalesce consecutive duplicates: old docs may already
+                        // persist Error + Done{error} pairs with the same text.
+                        let duplicate = rows.last().is_some_and(|row: &Row| {
+                            matches!(&row.kind, RowKind::ErrorChip { message: prev } if *prev == text)
+                        });
+                        if duplicate {
+                            continue;
+                        }
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
                             version: message.len() as u64,
                             turn_start: false,
-                            kind: RowKind::ErrorChip {
-                                // Harness-generated; the chip is one line.
-                                message: single_line(message).into(),
-                            },
+                            kind: RowKind::ErrorChip { message: text },
                             entry_id: entry_id.clone(),
                             timestamp: None,
                             copy_text: None,
@@ -3352,6 +3382,10 @@ pub struct Transcript {
     /// recently (click "Show full output" after a diff → see the output).
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
+    /// Horizontal scroll handles for expanded inline diffs, keyed by chip.
+    /// One handle pans every line of its chip in sync; entries are tiny and
+    /// bounded by the transcript's tool count, like `blob_details`.
+    diff_x_scroll: HashMap<SharedString, gpui::ScrollHandle>,
     _observe: Subscription,
     _text_changes: Subscription,
 }
@@ -3638,6 +3672,7 @@ impl Transcript {
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
+            diff_x_scroll: HashMap::new(),
             _observe: observe,
             _text_changes: text_changes,
         };
@@ -8390,7 +8425,7 @@ impl Transcript {
                                     .flex_none()
                                     .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
-                            .child(detail_body(invocation, None, &format!("{key}-call"), theme));
+                            .child(detail_body(invocation, None, &format!("{key}-call"), theme, None));
                     }
                     if let Some(images) = chip_images[ix].clone() {
                         panel = panel.child(
@@ -8398,6 +8433,12 @@ impl Transcript {
                         );
                     }
                     if let Some(detail) = detail.as_deref() {
+                        // Diff details pan sideways on a per-chip handle so
+                        // long lines scroll in sync instead of clipping.
+                        let x_scroll = matches!(detail, ToolDetail::Diff { .. }).then(|| {
+                            let handle = self.diff_x_scroll.entry(key.clone()).or_default().clone();
+                            (handle, key.clone())
+                        });
                         panel = panel
                             .child(
                                 div()
@@ -8410,6 +8451,7 @@ impl Transcript {
                                 detail_highlights[ix].clone(),
                                 &format!("{key}-out"),
                                 theme,
+                                x_scroll,
                             ));
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
@@ -9085,16 +9127,17 @@ fn file_badge_name(path: &str) -> &str {
 }
 
 /// The body of an expanded chip card, under the header's separator. Diffs
-/// render through the changes pane's section body — the real component, with
-/// hunk headers, dual line-number gutters, accent bars, row washes, and
-/// syntax runs — so an inline tool diff is indistinguishable from the
-/// checkout diff sidebar. Output renders as a code block: verbatim mono
-/// lines, indentation intact, counted-tail truncation.
+/// render compact (no `@@` hunk headers — the gutters already say it) while
+/// the changes pane keeps the full component; output renders as a code block:
+/// verbatim mono lines, indentation intact, counted-tail truncation.
+/// `x_scroll` carries the chip's horizontal scroll handle: with it, long code
+/// lines pan sideways instead of clipping mid-token.
 fn detail_body(
     detail: &ToolDetail,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
     selection_key: &str,
     theme: &Theme,
+    x_scroll: Option<(gpui::ScrollHandle, SharedString)>,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
     // Every line joins the transcript's selection, so paths, commands and
@@ -9126,13 +9169,24 @@ fn detail_body(
     match detail {
         // No comment layer: an inline tool diff is a record of what the
         // agent already did, not a review surface.
-        ToolDetail::Diff { file, .. } => body
-            .child(crate::changes::render_file_body_with_syntax(
-                file,
-                diff_highlights,
-                theme,
-            ))
-            .into_any_element(),
+        ToolDetail::Diff { file, .. } => match x_scroll {
+            Some((handle, prefix)) => body
+                .child(crate::changes::render_file_body_compact_scrollable(
+                    file,
+                    diff_highlights,
+                    theme,
+                    &handle,
+                    prefix,
+                ))
+                .into_any_element(),
+            None => body
+                .child(crate::changes::render_file_body_compact(
+                    file,
+                    diff_highlights,
+                    theme,
+                ))
+                .into_any_element(),
+        },
         ToolDetail::Stats { stats } => body
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
@@ -11791,6 +11845,7 @@ mod tests {
                         None,
                         "probe",
                         &theme,
+                        None,
                     ))
             }
         }
@@ -15781,6 +15836,39 @@ mod tests {
         assert_eq!(
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
             vec!["[x] a", "[~] b", "[ ] c"]
+        );
+
+        // Writes show just the code — the header already names the file.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::WriteFile {
+            path: "/w/a.rs".into(),
+            content: Some("let x = 1;".into()),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["let x = 1;"]
+        );
+
+        // Edits render through the real diff pipeline, not marker text.
+        let Some(ToolDetail::Diff { file, .. }) = edit_call_detail(&ToolCall::EditFile {
+            path: "/w/a.rs".into(),
+            old_string: Some("a".into()),
+            new_string: Some("b".into()),
+        }) else {
+            panic!("expected a diff detail")
+        };
+        assert_eq!(file.path, "/w/a.rs");
+        assert_eq!(file.additions, 1);
+        assert_eq!(file.deletions, 1);
+        // Missing strings → no synthesized diff (path-only invocation stays).
+        assert!(
+            edit_call_detail(&ToolCall::EditFile {
+                path: "/w/a.rs".into(),
+                old_string: None,
+                new_string: Some("b".into()),
+            })
+            .is_none()
         );
 
         // Blank invocation → no block; the chip stays a plain card.

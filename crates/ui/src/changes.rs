@@ -4943,15 +4943,12 @@ fn draft_cite_path(draft: &CommentDraft) -> &str {
     }
 }
 
-/// The expanded body of one file section: notices, hunk headers, +/-/context
-/// lines with a coloured accent bar, dual line-number gutters, a marker
-/// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
-/// Shared with the transcript's tool-diff detail blocks — the same component
-/// renders a checkout diff section and an inline ACP tool diff. (The changes
-/// pane itself virtualizes these rows individually; this stacked form serves
-/// the transcript and the fold tween's clipped stand-in.)
-/// Full-document old/new highlighting for tool and checkout diffs.
-pub(crate) fn render_file_body_with_syntax(
+/// Compact file body for inline tool-diff details: +/-/context lines with
+/// dual line-number gutters, accent bars, row washes, and paint-only syntax
+/// runs — but without `@@` hunk-header rows. In a chip the header duplicates
+/// what the gutters already say, and single-hunk diffs (the common inline
+/// case) read cleaner without it.
+pub(crate) fn render_file_body_compact(
     file: &FileDiff,
     highlights: Option<Arc<DiffHighlights>>,
     theme: &Theme,
@@ -4962,7 +4959,6 @@ pub(crate) fn render_file_body_with_syntax(
         children.push(notice_row(notice, theme));
     }
     for hunk in &file.hunks {
-        children.push(hunk_header_row(&hunk.header, theme));
         for line in &hunk.lines {
             let spans = highlights
                 .as_deref()
@@ -4976,6 +4972,68 @@ pub(crate) fn render_file_body_with_syntax(
                 DiffCodeWidth::Clipped,
                 None,
             ));
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .pb(px(BODY_BOTTOM_PAD))
+        .children(children)
+        .into_any_element()
+}
+
+/// Scrollable compact body: [`render_file_body_compact`] with per-line
+/// horizontal scrollers on one shared handle, so long code lines pan sideways
+/// instead of clipping mid-token. Widths are analytic (max visual columns ×
+/// a margined mono advance) rather than shaped — the same column floor
+/// [`max_shaped_text_width`] uses, without its per-frame shaping pass.
+/// `id_prefix` must be unique per chip; line indices keep slot ids stable.
+pub(crate) fn render_file_body_compact_scrollable(
+    file: &FileDiff,
+    highlights: Option<Arc<DiffHighlights>>,
+    theme: &Theme,
+    handle: &gpui::ScrollHandle,
+    id_prefix: SharedString,
+) -> AnyElement {
+    let gutter_px = gutter_width(file);
+    let widest = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .map(|line| visual_columns(&line.text))
+        .max()
+        .unwrap_or(0) as f32;
+    let metrics = DiffHorizontalMetrics {
+        // 0.62em bounds virtually every monospace advance (the shaper's own
+        // fallback is 0.6); overshoot only adds dead scroll room, while
+        // undershoot would clip the tail.
+        max_text_width: widest * diff_text_size(theme) * 0.62,
+        max_gutter_width: gutter_px,
+    };
+    let scroll = DiffCodeScrollContext {
+        handle: handle.clone(),
+        prefix: id_prefix,
+    };
+    let mut children: Vec<AnyElement> = Vec::new();
+    let mut line_ix = 0usize;
+    for notice in file_notices(file) {
+        children.push(notice_row(notice, theme));
+    }
+    for hunk in &file.hunks {
+        for line in &hunk.lines {
+            let spans = highlights
+                .as_deref()
+                .map(|highlights| highlights.spans(line))
+                .unwrap_or(&[]);
+            children.push(diff_line_row(
+                line,
+                spans,
+                theme,
+                gutter_px,
+                DiffCodeWidth::Scrollable(metrics),
+                Some(scroll.slot(line_ix)),
+            ));
+            line_ix += 1;
         }
     }
     div()

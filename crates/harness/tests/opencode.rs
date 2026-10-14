@@ -1003,6 +1003,59 @@ async fn session_error_with_no_content_settles_errored() {
 }
 
 #[tokio::test]
+async fn todowrite_tool_part_maps_to_todo_call() {
+    // End-to-end over the v1 wire: a `todowrite` tool part (the shape both
+    // wires deliver) must surface as a Todo call carrying each item — this
+    // is what feeds the transcript chip and the strip above the input.
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("plan the work"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await; // SessionStarted
+    let _ = next_event(&mut stream).await; // AvailableCommands
+
+    assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_todo", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "todowrite",
+            "state": {
+                "status": "running",
+                "input": { "todos": [
+                    {"content": "step one", "status": "completed", "priority": "high"},
+                    {"content": "step two", "status": "in_progress", "priority": "medium"},
+                ]},
+            },
+        }},
+    }));
+    let ev = next_event(&mut stream).await;
+    let AgentEvent::ToolCall { id, call } = &ev else {
+        panic!("expected a ToolCall, got {ev:?}");
+    };
+    assert_eq!(id, "prt_todo");
+    let ToolCall::Todo { items } = call else {
+        panic!("todowrite must map to a Todo call, got {call:?}");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text, "step one");
+    assert!(items[0].done);
+    assert!(!items[1].done);
+
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn subagent_task_streams_tagged_and_settles_from_the_task_part() {
     let fake = FakeOpencode::start().await;
     let (controls, _steer, _token) = controls();

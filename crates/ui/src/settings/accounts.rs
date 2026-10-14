@@ -254,6 +254,10 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         label,
     };
     match harness {
+        HarnessId::Codex => vec![
+            option("oauth", "ChatGPT"),
+            option("api-key", "API key"),
+        ],
         HarnessId::Opencode => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),
@@ -296,6 +300,10 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
         (HarnessId::ClaudeCode, _) => {
             "Finish signing in to Claude in your browser. The new login is saved next to \
              your current one — nothing changes until you switch."
+        }
+        (HarnessId::Codex, Some("api-key")) => {
+            "Paste an OpenAI API key. It is stored next to your current login — nothing \
+             changes until you switch. API keys have no plan usage meters."
         }
         (HarnessId::Codex, _) => {
             "Finish signing in to ChatGPT in your browser. The new login is saved next to \
@@ -452,12 +460,21 @@ enum LoginStep {
         submitting: bool,
         error: Option<SharedString>,
     },
+    /// Codex API key entry: the user pastes `OPENAI_API_KEY`, saved via
+    /// `SaveCodexApiKey` with no browser flow.
+    ApiKey {
+        submitting: bool,
+        error: Option<SharedString>,
+    },
     /// The start, a poll, or the provider failed — shown with Retry.
     Failed { message: SharedString },
 }
 
 impl LoginFlow {
     fn title(&self) -> String {
+        if self.harness == HarnessId::Codex && self.provider == Some("api-key") {
+            return format!("Add an API key for {}", provider_name(self.harness));
+        }
         let option = login_options(self.harness)
             .into_iter()
             .find(|option| option.provider == self.provider);
@@ -547,7 +564,10 @@ impl AccountsPage {
         let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_code(cx);
+                match &this.login.as_ref().map(|flow| &flow.step) {
+                    Some(LoginStep::ApiKey { .. }) => this.submit_api_key(cx),
+                    _ => this.submit_code(cx),
+                }
             }
         });
         let mut page = Self {
@@ -837,12 +857,35 @@ impl AccountsPage {
     // ---- add-account flows ----
 
     /// Start (or Retry) a sign-in: the same dialog for every provider.
+    /// Codex API keys skip the engine round-trip entirely — the key dialog
+    /// opens locally and saves via `SaveCodexApiKey` on submit.
     fn start_login(
         &mut self,
         harness: HarnessId,
         provider: Option<&'static str>,
         cx: &mut Context<Self>,
     ) {
+        if harness == HarnessId::Codex && provider == Some("api-key") {
+            self.login_attempts += 1;
+            let attempt = self.login_attempts;
+            self.login = Some(LoginFlow {
+                harness,
+                provider,
+                attempt,
+                login_id: None,
+                url: None,
+                step: LoginStep::ApiKey {
+                    submitting: false,
+                    error: None,
+                },
+            });
+            self.poll_task = None;
+            self.error = None;
+            self.code_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -904,6 +947,14 @@ impl AccountsPage {
                         self.code_input
                             .update(cx, |input, cx| input.set_text("", cx));
                     }
+                    AgentLoginMode::ApiKey => {
+                        flow.step = LoginStep::ApiKey {
+                            submitting: false,
+                            error: None,
+                        };
+                        self.code_input
+                            .update(cx, |input, cx| input.set_text("", cx));
+                    }
                     AgentLoginMode::Browser => self.spawn_poll(cx),
                 }
             }
@@ -955,6 +1006,72 @@ impl AccountsPage {
                     }
                     Err(err) => {
                         flow.step = LoginStep::PasteCode {
+                            submitting: false,
+                            error: Some(format!("{err}").into()),
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn submit_api_key(&mut self, cx: &mut Context<Self>) {
+        let Some(LoginFlow {
+            step: LoginStep::ApiKey { submitting, .. },
+            attempt,
+            ..
+        }) = &mut self.login
+        else {
+            return;
+        };
+        if *submitting {
+            return;
+        }
+        let key = self.code_input.read(cx).text().trim().to_string();
+        if key.is_empty() {
+            if let Some(flow) = self.login.as_mut() {
+                flow.step = LoginStep::ApiKey {
+                    submitting: false,
+                    error: Some("Paste a key first.".into()),
+                };
+            }
+            cx.notify();
+            return;
+        }
+        let attempt = *attempt;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        *submitting = true;
+        let params = self.params(serde_json::json!({ "apiKey": key }));
+        let target = self.target_device.clone();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SAVE_CODEX_API_KEY, params)
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<AgentAccountsSnapshot>(value)
+                        .map_err(|err| err.to_string())
+                });
+            this.update(cx, |page, cx| {
+                let Some(flow) = page.login.as_mut().filter(|f| f.attempt == attempt) else {
+                    return;
+                };
+                match result {
+                    Ok(snapshot) => {
+                        cx.default_global::<AccountsSnapshotCache>()
+                            .0
+                            .insert(target, snapshot.clone());
+                        page.snapshot = Loadable::Ready(snapshot);
+                        page.login = None;
+                    }
+                    Err(err) => {
+                        flow.step = LoginStep::ApiKey {
                             submitting: false,
                             error: Some(format!("{err}").into()),
                         };
@@ -1060,10 +1177,15 @@ impl AccountsPage {
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         let login_id = match self.login.take() {
-            // A failed login is already over engine-side.
+            // A failed login is already over engine-side. An API key entry
+            // never started one — but a remote ApiKey start did hand out a
+            // login id, so cancel it best-effort all the same.
             Some(LoginFlow {
                 login_id: Some(login_id),
-                step: LoginStep::Browser { .. } | LoginStep::PasteCode { .. },
+                step:
+                    LoginStep::Browser { .. }
+                    | LoginStep::PasteCode { .. }
+                    | LoginStep::ApiKey { .. },
                 ..
             }) => Some(login_id),
             _ => None,
@@ -1556,6 +1678,18 @@ impl AccountsPage {
                 )
                 .when_some(error.clone(), |el, message| el.child(error_line(message)))
                 .into_any_element(),
+            LoginStep::ApiKey { error, .. } => div()
+                .mt(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    popover::dialog_field(self.code_input.clone().into_any_element())
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(13.0)),
+                )
+                .when_some(error.clone(), |el, message| el.child(error_line(message)))
+                .into_any_element(),
             LoginStep::Failed { message } => div()
                 .mt(px(16.0))
                 .child(error_line(message.clone()))
@@ -1591,6 +1725,27 @@ impl AccountsPage {
                         )
                         .when(submitting, |el| el.opacity(0.5))
                         .on_click(cx.listener(|this, _, _, cx| this.submit_code(cx))),
+                    )
+            }
+            LoginStep::ApiKey { submitting, .. } => {
+                let submitting = *submitting;
+                buttons
+                    .child(
+                        action("login-cancel", widgets::ActionTone::Quiet, "Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                    )
+                    .child(
+                        action(
+                            "login-submit-key",
+                            widgets::ActionTone::Solid,
+                            if submitting {
+                                "Saving…"
+                            } else {
+                                "Save key"
+                            },
+                        )
+                        .when(submitting, |el| el.opacity(0.5))
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_api_key(cx))),
                     )
             }
             LoginStep::Failed { .. } => buttons
@@ -2316,7 +2471,6 @@ mod tests {
     fn every_sign_in_provider_shares_one_accounts_flow() {
         for harness in [
             HarnessId::ClaudeCode,
-            HarnessId::Codex,
             HarnessId::Cursor,
             HarnessId::Antigravity,
             HarnessId::Grok,
@@ -2357,6 +2511,23 @@ mod tests {
 
     #[test]
     fn per_provider_agents_offer_one_sign_in_per_provider() {
+        let codex = login_options(HarnessId::Codex);
+        let providers: Vec<_> = codex.iter().map(|o| o.provider.unwrap()).collect();
+        assert_eq!(providers, ["oauth", "api-key"]);
+        assert_eq!(
+            add_option_label(HarnessId::Codex, codex[1], true),
+            "Connect API key"
+        );
+        assert_eq!(
+            add_option_label(HarnessId::Codex, codex[1], false),
+            "Add API key account"
+        );
+        assert!(login_copy(HarnessId::Codex, Some("api-key")).contains("API key"));
+        let api_flow = LoginFlow {
+            provider: Some("api-key"),
+            ..waiting(HarnessId::Codex, 1)
+        };
+        assert_eq!(api_flow.title(), "Add an API key for Codex");
         let opencode = login_options(HarnessId::Opencode);
         let labels: Vec<_> = opencode.iter().map(|o| o.label).collect();
         assert_eq!(labels, ["ChatGPT", "GitHub Copilot"]);

@@ -17,6 +17,13 @@ use crate::constants::MSG_INLINE_MAX;
 /// summary, so 160 is generous.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
+/// Byte cap for WriteFile content and EditFile old/new strings persisted into
+/// the doc (shown in the expanded chip). Well under
+/// [`MSG_INLINE_MAX`](crate::constants::MSG_INLINE_MAX)
+/// so even several large writes in one entry stay clear of continuation
+/// splitting; over-cap text keeps its head with a byte-count marker.
+pub const TOOL_TEXT_MAX_BYTES: usize = 32 * 1024;
+
 /// The doc-resident form of a tool output (docs/chat2-sync.md A1; the R2
 /// sidecar is PARKED as of 2026-08-10, so this IS the whole record in the
 /// doc — the full text survives only in the host's local run journal):
@@ -271,6 +278,34 @@ impl MessagePart {
     }
 }
 
+/// Push one visible error part, coalescing consecutive duplicates.
+///
+/// Harness start failures publish `Error` + `Done{error}` with the same
+/// message, and rate-limit retries re-emit the identical payload — without
+/// this every event minted its own `ErrorChip` row (3x "Rate limit
+/// exceeded…" spam). Identical back-to-back messages collapse to one.
+fn push_error_part(out: &mut Vec<MessagePart>, message: &str) {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(MessagePart::Error { message: prev, .. }) = out.last() {
+        if prev.trim() == trimmed {
+            return;
+        }
+        let prev_first = prev.lines().next().unwrap_or(prev).trim();
+        let next_first = trimmed.lines().next().unwrap_or(trimmed).trim();
+        if !prev_first.is_empty() && prev_first == next_first {
+            return;
+        }
+    }
+    let id = format!("e{}", out.len());
+    out.push(MessagePart::Error {
+        id,
+        message: trimmed.to_owned(),
+    });
+}
+
 /// Fold one agent event into a parts accumulator, in place.
 ///
 /// In place because the fold runs once per streamed event: rebuilding the
@@ -424,19 +459,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             }
         }
         AgentEvent::Error { message } => {
-            let id = format!("e{}", out.len());
-            out.push(MessagePart::Error {
-                id,
-                message: message.clone(),
-            });
+            push_error_part(out, message);
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
-                let id = format!("e{}", out.len());
-                out.push(MessagePart::Error {
-                    id,
-                    message: message.clone(),
-                });
+                push_error_part(out, message);
             }
         }
         // Subagent-attributed CONTENT belongs to the subagent's own doc (the
@@ -562,20 +589,29 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
 /// Keeps: command / path / pattern / url / query / todo items / server+tool names,
-/// and a subagent spawn's model/type (see [`spawn_badge`] — a couple of short
-/// identifiers the chip names the child by).
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// WriteFile content and EditFile old/new strings (capped — the expanded chip
+/// shows what was written), and a subagent spawn's model/type (see
+/// [`spawn_badge`] — a couple of short identifiers the chip names the child by).
+/// Drops: WebFetch prompt, Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
-        ToolCall::WriteFile { path, .. } => ToolCall::WriteFile {
+        // Write content rides into the doc so the expanded chip shows what
+        // was written (explicit product call), capped so one huge write
+        // can't bloat the synced doc — see [`TOOL_TEXT_MAX_BYTES`].
+        // Full text stays in the host's run journal either way.
+        ToolCall::WriteFile { path, content } => ToolCall::WriteFile {
             path: path.clone(),
-            content: None,
+            content: content.as_deref().map(cap_tool_text),
         },
-        ToolCall::EditFile { path, .. } => ToolCall::EditFile {
+        ToolCall::EditFile {
+            path,
+            old_string,
+            new_string,
+        } => ToolCall::EditFile {
             path: path.clone(),
-            old_string: None,
-            new_string: None,
+            old_string: old_string.as_deref().map(cap_tool_text),
+            new_string: new_string.as_deref().map(cap_tool_text),
         },
         ToolCall::WebFetch { url, .. } => ToolCall::WebFetch {
             url: url.clone(),
@@ -619,6 +655,21 @@ fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
         })
         .collect();
     (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
+}
+
+/// Cap persisted tool text at [`TOOL_TEXT_MAX_BYTES`] (char-boundary safe)
+/// with a byte-count marker. A fixpoint: capped output is exactly at cap, so
+/// re-sanitizing is a no-op.
+fn cap_tool_text(text: &str) -> String {
+    if text.len() <= TOOL_TEXT_MAX_BYTES {
+        return text.to_owned();
+    }
+    let marker = format!("\n… [truncated, {} bytes total]", text.len());
+    let mut end = TOOL_TEXT_MAX_BYTES.saturating_sub(marker.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &text[..end])
 }
 
 /// Deterministic continuation id: `"{root}#c{n}"`.
@@ -744,6 +795,41 @@ mod tests {
             &parts[2],
             MessagePart::Reasoning { id, text } if id == "r2" && text == "more"
         ));
+    }
+
+    #[test]
+    fn start_failure_error_and_done_share_one_chip() {
+        // Start failures publish `Error` + `Done{error}` with the same
+        // message; the fold must mint one chip, not two.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: "boom".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("boom".into()),
+                session_id: None,
+            },
+        );
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], MessagePart::Error { message, .. } if message == "boom"));
+        // A different message is a different failure, not a duplicate.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("other".into()),
+                session_id: None,
+            },
+        );
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
@@ -881,19 +967,65 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_heavy_inputs_and_is_idempotent() {
+    fn sanitize_keeps_write_content_and_is_idempotent() {
         let call = ToolCall::WriteFile {
             path: "/x".into(),
-            content: Some("secret".into()),
+            content: Some("hello".into()),
         };
         let clean = sanitize_tool_call(&call);
         assert_eq!(
             clean,
             ToolCall::WriteFile {
                 path: "/x".into(),
-                content: None
+                content: Some("hello".into())
             }
         );
+        assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_caps_huge_write_content_with_a_marker() {
+        let big = "x".repeat(TOOL_TEXT_MAX_BYTES + 100);
+        let call = ToolCall::WriteFile {
+            path: "/x".into(),
+            content: Some(big.clone()),
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::WriteFile { content, .. } = &clean else {
+            panic!("expected WriteFile, got {clean:?}");
+        };
+        let content = content.as_deref().expect("content kept");
+        assert!(content.len() <= TOOL_TEXT_MAX_BYTES);
+        assert!(content.ends_with(&format!("[truncated, {} bytes total]", big.len())));
+        assert!(content.starts_with(&big[..100]));
+        // Fixpoint: re-sanitizing capped content is a no-op.
+        assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_keeps_edit_strings_capped_and_idempotent() {
+        let call = ToolCall::EditFile {
+            path: "/x".into(),
+            old_string: Some("old".into()),
+            new_string: Some("new".into()),
+        };
+        let clean = sanitize_tool_call(&call);
+        assert_eq!(clean, call);
+        assert_eq!(sanitize_tool_call(&clean), clean);
+
+        let big = "y".repeat(TOOL_TEXT_MAX_BYTES + 10);
+        let call = ToolCall::EditFile {
+            path: "/x".into(),
+            old_string: Some(big.clone()),
+            new_string: None,
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::EditFile { old_string, .. } = &clean else {
+            panic!("expected EditFile, got {clean:?}");
+        };
+        let kept = old_string.as_deref().expect("old string kept");
+        assert!(kept.len() <= TOOL_TEXT_MAX_BYTES);
+        assert!(kept.ends_with(&format!("[truncated, {} bytes total]", big.len())));
         assert_eq!(sanitize_tool_call(&clean), clean);
     }
 

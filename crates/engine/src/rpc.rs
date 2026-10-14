@@ -478,6 +478,15 @@ struct CompleteAgentLoginParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SaveCodexApiKeyParams {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UploadChunkParams {
     upload_id: String,
     /// Base64 payload chunk.
@@ -1513,6 +1522,7 @@ fn forwardable(method: &str) -> bool {
             | methods::COMPLETE_AGENT_LOGIN
             | methods::POLL_AGENT_LOGIN
             | methods::CANCEL_AGENT_LOGIN
+            | methods::SAVE_CODEX_API_KEY
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -3652,6 +3662,20 @@ impl RpcService for EngineRpc {
                 let p: LoginIdParams = parse_params(params)?;
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SAVE_CODEX_API_KEY => {
+                let p: SaveCodexApiKeyParams = parse_params(params)?;
+                let key = p
+                    .api_key
+                    .or(p.key)
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| RpcError::BadParams("apiKey is required".into()))?;
+                let snapshot = self
+                    .agent_accounts
+                    .save_codex_api_key(&key)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&snapshot)
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;

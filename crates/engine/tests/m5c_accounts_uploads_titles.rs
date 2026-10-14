@@ -482,6 +482,62 @@ async fn codex_slot_swap_and_api_key_detection() {
 }
 
 #[tokio::test]
+async fn codex_api_key_save_validates_swaps_and_becomes_live() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+
+    for bad in ["", "sk-short", "not-a-key", "sk-abc def"] {
+        accounts
+            .save_codex_api_key(bad)
+            .await
+            .expect_err("rejects junk keys");
+    }
+
+    let snapshot = accounts
+        .save_codex_api_key("sk-test-12345678abcd")
+        .await
+        .expect("save key");
+    let key_account = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.harness == HarnessId::Codex && a.active)
+        .expect("key account live with no prior login");
+    assert_eq!(key_account.plan_label.as_deref(), Some("API key"));
+    assert_eq!(key_account.email.as_deref(), Some("API key ·…abcd"));
+    let auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.codex_home.join("auth.json")).expect("auth"),
+    )
+    .expect("auth json");
+    assert_eq!(auth["OPENAI_API_KEY"], "sk-test-12345678abcd");
+    let key_id = key_account.id.clone();
+
+    write_codex_login(&config, "carol@example.com", "acct-carol");
+    let snapshot = accounts.list(false).await.expect("list carol");
+    let carol = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.email.as_deref() == Some("carol@example.com"))
+        .expect("carol slot");
+    assert!(carol.active);
+
+    let snapshot = accounts
+        .activate(HarnessId::Codex, &key_id)
+        .await
+        .expect("activate key");
+    let key_account = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.id == key_id)
+        .expect("key slot");
+    assert!(key_account.active);
+    let auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.codex_home.join("auth.json")).expect("auth"),
+    )
+    .expect("auth json");
+    assert_eq!(auth["OPENAI_API_KEY"], "sk-test-12345678abcd");
+}
+
+#[tokio::test]
 async fn codex_team_seats_are_distinct_and_legacy_slots_are_migrated() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (accounts, config) = test_accounts(tmp.path());

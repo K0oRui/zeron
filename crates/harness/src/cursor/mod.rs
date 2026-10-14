@@ -304,6 +304,20 @@ impl Harness for CursorHarness {
     // listing (the cursor-agent TUI's slash commands are client-side only),
     // so the trait's empty default is the honest answer, not a gap.
 
+    async fn run_title(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        request.sandbox = zeron_proto::SandboxLevel::ReadOnly;
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         request: RunRequest,

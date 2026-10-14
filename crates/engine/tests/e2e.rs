@@ -588,7 +588,8 @@ async fn queued_run_command_executes_end_to_end() {
         }]
     );
     // Assistant entry: folded parts — merged text, then the resolved tool call with the
-    // render-parts privacy policy applied (WriteFile content stripped).
+    // render-parts privacy policy applied (WriteFile content kept for the
+    // expandable detail).
     let assistant = &all[1];
     assert_eq!(assistant.status, Some(MessageStatus::Complete));
     assert_eq!(assistant.parts.len(), 2);
@@ -609,7 +610,7 @@ async fn queued_run_command_executes_end_to_end() {
                 call,
                 &ToolCall::WriteFile {
                     path: "/tmp/x".into(),
-                    content: None
+                    content: Some("SECRET".into())
                 }
             );
         }

@@ -450,6 +450,20 @@ impl Harness for OpencodeHarness {
         result
     }
 
+    async fn run_title(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        request.sandbox = zeron_proto::SandboxLevel::ReadOnly;
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         mut request: RunRequest,
@@ -3200,17 +3214,18 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             });
             BusOutcome::Continue
         }
-        "question.asked" => {
-            if !event_session.is_some_and(|session| {
-                session == session_id
-                    || children.get(session).is_some_and(|child| !child.done)
-                    || unbound_children.contains_key(session)
-            }) {
+        "question.asked" | "question.v2.asked" => {
+            let Some(owner) = event_session.filter(|session| {
+                *session == session_id
+                    || children.get(*session).is_some_and(|child| !child.done)
+                    || unbound_children.contains_key(*session)
+            }) else {
                 return BusOutcome::Continue;
-            }
+            };
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
+            let owner = owner.to_owned();
             let questions = map_questions(props);
             if questions.is_empty() {
                 return BusOutcome::Continue;
@@ -3233,6 +3248,26 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let request_id = id.to_owned();
             let tx = event_tx.clone();
             let protocol_cell = server.protocol.clone();
+            // 1.x answers at the global question route; 2.x scopes the
+            // reply to the owning session
+            // (`POST /api/session/:sessionID/question/:requestID/reply`,
+            // same `{answers}` body). A 2.x server that still mounts the
+            // legacy route falls back to it rather than hanging the tool.
+            let protocol = server.protocol().await;
+            let (reply_path, reject_path, fallback_reply, fallback_reject) = match protocol {
+                Protocol::V1 => (
+                    format!("/question/{request_id}/reply"),
+                    format!("/question/{request_id}/reject"),
+                    None,
+                    None,
+                ),
+                Protocol::V2 => (
+                    format!("/api/session/{owner}/question/{request_id}/reply"),
+                    format!("/api/session/{owner}/question/{request_id}/reject"),
+                    Some(format!("/question/{request_id}/reply")),
+                    Some(format!("/question/{request_id}/reject")),
+                ),
+            };
             tokio::spawn(async move {
                 let server = Server {
                     child: None,
@@ -3255,22 +3290,37 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                                     .unwrap_or_default()
                             })
                             .collect();
-                        server
-                            .post_json(
-                                &format!("/question/{request_id}/reply"),
-                                dir_owned.as_deref(),
-                                &json!({ "answers": ordered }),
-                            )
+                        let body = json!({ "answers": ordered });
+                        match server
+                            .post_json(&reply_path, dir_owned.as_deref(), &body)
                             .await
+                        {
+                            Ok(value) => Ok(value),
+                            Err(first) => match fallback_reply {
+                                Some(fallback) => {
+                                    server
+                                        .post_json(&fallback, dir_owned.as_deref(), &body)
+                                        .await
+                                }
+                                None => Err(first),
+                            },
+                        }
                     }
                     Err(_) => {
-                        server
-                            .post_json(
-                                &format!("/question/{request_id}/reject"),
-                                dir_owned.as_deref(),
-                                &Value::Null,
-                            )
+                        match server
+                            .post_json(&reject_path, dir_owned.as_deref(), &Value::Null)
                             .await
+                        {
+                            Ok(value) => Ok(value),
+                            Err(first) => match fallback_reject {
+                                Some(fallback) => {
+                                    server
+                                        .post_json(&fallback, dir_owned.as_deref(), &Value::Null)
+                                        .await
+                                }
+                                None => Err(first),
+                            },
+                        }
                     }
                 };
                 if let Err(e) = reply {
@@ -3284,6 +3334,123 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         request_id: request_id.clone(),
                     }))
                     .await;
+            });
+            BusOutcome::Continue
+        }
+        "form.created" => {
+            // 2.x forms only exist on the v2 wire (verified against live
+            // 2.0.16: no question routes or question events at all — forms
+            // are the question mechanism there).
+            if server.protocol().await != Protocol::V2 {
+                return BusOutcome::Continue;
+            }
+            // The `sessionID` here is the form's owner. The `"global"`
+            // sentinel (session-less MCP elicitation) never matches an
+            // owner below and stays out — answering those is out of scope.
+            let Some(owner) = event_session.filter(|session| {
+                *session == session_id
+                    || children.get(*session).is_some_and(|child| !child.done)
+                    || unbound_children.contains_key(*session)
+            }) else {
+                return BusOutcome::Continue;
+            };
+            let Some(id) = props.get("id").and_then(Value::as_str) else {
+                return BusOutcome::Continue;
+            };
+            let owner = owner.to_owned();
+            let request_id = id.to_owned();
+            let reply_request_id = request_id.clone();
+            let title = props
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Question");
+            let fields: Vec<Value> = props
+                .get("fields")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let questions = map_form_questions(title, &fields);
+            let base = server.base.clone();
+            let auth = server.auth.clone();
+            let dir_owned = dir.map(str::to_owned);
+            let tx = event_tx.clone();
+            let reply = move |answer: serde_json::Map<String, Value>| {
+                let base = base.clone();
+                let auth = auth.clone();
+                let dir_owned = dir_owned.clone();
+                let owner = owner.clone();
+                let request_id = reply_request_id.clone();
+                async move {
+                    let server = Server {
+                        child: None,
+                        base,
+                        auth,
+                        client: http_client(),
+                        stderr_tail: crate::StderrTail::default(),
+                        protocol: tokio::sync::OnceCell::new(),
+                        version: tokio::sync::OnceCell::new(),
+                    };
+                    // The v2 API versions the protocol cell lazily; seed it
+                    // so directory scoping takes the v2 path.
+                    server.protocol.set(Protocol::V2).ok();
+                    let path = format!("/api/session/{owner}/form/{request_id}/reply");
+                    let result = if answer.is_empty() {
+                        // Turn-end drain or empty submit: nothing the server
+                        // would accept — resolve locally instead.
+                        Ok(Value::Null)
+                    } else {
+                        server
+                            .post_json(&path, dir_owned.as_deref(), &json!({ "answer": answer }))
+                            .await
+                    };
+                    if let Err(e) = result {
+                        tracing::debug!(
+                            target: "zeron_harness::opencode",
+                            "form reply failed: {e}"
+                        );
+                    }
+                    let _ = tx
+                        .send(Ok(AgentEvent::InputResolved {
+                            request_id: request_id.clone(),
+                        }))
+                        .await;
+                }
+            };
+            if questions.is_empty() {
+                let defaults = form_hidden_defaults(&fields);
+                if defaults.is_empty() {
+                    tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "ignoring unanswerable form {request_id}"
+                    );
+                    return BusOutcome::Continue;
+                }
+                // All-hidden form: answer the defaults without prompting —
+                // the tool call would otherwise wait forever.
+                tokio::spawn(reply(defaults));
+                return BusOutcome::Continue;
+            }
+            if !send(
+                event_tx,
+                AgentEvent::InputRequested {
+                    request_id: request_id.clone(),
+                    questions: questions.clone(),
+                },
+            )
+            .await
+            {
+                return BusOutcome::ConsumerGone;
+            }
+            let rx = (request_input)(questions.clone());
+            tokio::spawn(async move {
+                // A dropped resolver (turn end) lands here as the empty
+                // answer set, which `reply` resolves locally.
+                let answers = rx.await.unwrap_or_default();
+                let mut answer = form_answer_values(&fields, &answers);
+                for (key, value) in form_hidden_defaults(&fields) {
+                    answer.entry(key).or_insert(value);
+                }
+                reply(answer).await;
             });
             BusOutcome::Continue
         }
@@ -3728,6 +3895,204 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
         .unwrap_or_default()
 }
 
+/// A 2.x form field mapped onto the input panel: one panel question per
+/// interactive (non-hidden) field, keyed by the field key so answers map
+/// back onto the form's answer object. Hidden fields never reach the panel;
+/// their defaults ride the reply (the server applies them anyway).
+fn map_form_questions(form_title: &str, fields: &[Value]) -> Vec<UserInputQuestion> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            let key = field.get("key").and_then(Value::as_str)?;
+            if field.get("hidden").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            let kind = field.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind.is_empty() {
+                return None;
+            }
+            let title = field.get("title").and_then(Value::as_str);
+            let description = field.get("description").and_then(Value::as_str);
+            let header = title.unwrap_or(form_title).to_owned();
+            let question = match (title, description) {
+                (Some(t), Some(d)) if t != d => format!("{t}\n\n{d}"),
+                (_, Some(d)) => d.to_owned(),
+                (Some(t), None) => t.to_owned(),
+                (None, None) => key.to_owned(),
+            };
+            let labels = form_field_labels(field);
+            let (options, multi_select) = match kind {
+                // A single "Acknowledge" pick answers `true`; anything typed
+                // counts as acknowledgement too (see `form_answer_values`).
+                "external" => (vec!["Acknowledge".to_owned()], false),
+                "multiselect" => (labels, true),
+                "boolean" => (vec!["true".to_owned(), "false".to_owned()], false),
+                _ => (labels, false),
+            };
+            Some(UserInputQuestion {
+                id: key.to_owned(),
+                header,
+                question,
+                options,
+                prefill: None,
+                multiline: false,
+                multi_select,
+            })
+        })
+        .collect()
+}
+
+/// Display labels for a form field's options (`label`, falling back to the
+/// reply-critical `value` when a label is absent).
+fn form_field_labels(field: &Value) -> Vec<String> {
+    field
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    o.get("label")
+                        .and_then(Value::as_str)
+                        .or_else(|| o.get("value").and_then(Value::as_str))
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Defaults of hidden fields, answered without prompting (the server would
+/// apply them anyway; answering explicitly also covers all-hidden forms,
+// whose tool call would otherwise wait forever).
+fn form_hidden_defaults(fields: &[Value]) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for field in fields {
+        if field.get("hidden").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        if let (Some(key), Some(default)) = (
+            field.get("key").and_then(Value::as_str),
+            field.get("default"),
+        ) && !default.is_null()
+        {
+            out.insert(key.to_owned(), default.clone());
+        }
+    }
+    out
+}
+
+/// Translate panel answers (labels / typed text, keyed by field key) into a
+/// form answer object (`{key: value}`). Labels resolve through the field's
+/// options to their reply-critical values; unparseable values are omitted
+/// (the server validates and reports the rest).
+fn form_answer_values(
+    fields: &[Value],
+    answers: &[UserInputAnswer],
+) -> serde_json::Map<String, Value> {
+    let mut by_key: HashMap<&str, &Value> = HashMap::new();
+    for field in fields {
+        if let Some(key) = field.get("key").and_then(Value::as_str) {
+            by_key.insert(key, field);
+        }
+    }
+    let mut out = form_hidden_defaults(fields);
+    for answer in answers {
+        let Some(field) = by_key.get(answer.question_id.as_str()) else {
+            continue;
+        };
+        if field.get("hidden").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let kind = field.get("type").and_then(Value::as_str).unwrap_or("");
+        let value = match kind {
+            "external" => {
+                // Any pick or typed text acknowledges; silence omits.
+                (!answer.labels.is_empty()).then_some(Value::Bool(true))
+            }
+            "multiselect" => {
+                let picked: Vec<String> = answer
+                    .labels
+                    .iter()
+                    .filter_map(|label| form_option_value(field, label))
+                    .collect();
+                // Custom text the user typed verbatim counts when the field
+                // allows it; otherwise only known options ride.
+                let picked = if picked.is_empty()
+                    && field.get("custom").and_then(Value::as_bool) == Some(true)
+                {
+                    answer.labels.clone()
+                } else {
+                    picked
+                };
+                (!picked.is_empty())
+                    .then(|| Value::Array(picked.into_iter().map(Value::String).collect()))
+            }
+            "boolean" => answer.labels.first().and_then(|label| {
+                match label.trim().to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" => Some(Value::Bool(true)),
+                    "false" | "no" | "0" => Some(Value::Bool(false)),
+                    _ => None,
+                }
+            }),
+            "number" => answer
+                .labels
+                .first()
+                .and_then(|label| label.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite())
+                .map(|n| {
+                    serde_json::Number::from_f64(n)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null)
+                }),
+            "integer" => answer
+                .labels
+                .first()
+                .and_then(|label| label.trim().parse::<i64>().ok())
+                .map(|n| Value::Number(n.into())),
+            _ => {
+                // String (open, custom, or closed options) and anything
+                // unrecognized: closed options resolve labels to values,
+                // free text rides verbatim.
+                let closed = field
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .is_some_and(|opts| !opts.is_empty())
+                    && field.get("custom").and_then(Value::as_bool) != Some(true);
+                if closed {
+                    answer
+                        .labels
+                        .iter()
+                        .find_map(|label| form_option_value(field, label))
+                        .map(Value::String)
+                } else {
+                    answer.labels.first().cloned().map(Value::String)
+                }
+            }
+        };
+        if let Some(value) = value
+            && !value.is_null()
+        {
+            out.insert(answer.question_id.clone(), value);
+        }
+    }
+    out
+}
+
+/// Resolve one picked/typed label to the field's reply value: by display
+/// label first, then verbatim (covers values the panel shows raw).
+fn form_option_value(field: &Value, label: &str) -> Option<String> {
+    field
+        .get("options")
+        .and_then(Value::as_array)
+        .iter()
+        .flat_map(|opts| opts.iter())
+        .find_map(|o| {
+            let value = o.get("value").and_then(Value::as_str)?;
+            let shown = o.get("label").and_then(Value::as_str).unwrap_or(value);
+            (shown == label || value == label).then(|| value.to_owned())
+        })
+}
+
 /// Cap for tool outputs entering the event stream (journal keeps the rest).
 const OUTPUT_CAP: usize = 4096;
 
@@ -3752,8 +4117,10 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
             .map(str::to_owned)
     };
     match name {
-        "bash" => ToolCall::Exec {
-            command: s(&["command"]).unwrap_or_default(),
+        // v2 renamed `bash` to `shell` (same `{command}` input — the
+        // migration shim lists no arg rename for it).
+        "bash" | "shell" => ToolCall::Exec {
+            command: s(&["command", "script", "cmd"]).unwrap_or_default(),
         },
         "read" => ToolCall::ReadFile {
             path: s(&["filePath", "file_path", "path"]).unwrap_or_default(),
@@ -3767,7 +4134,7 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
             old_string: s(&["oldString", "old_string"]),
             new_string: s(&["newString", "new_string"]),
         },
-        "patch" => ToolCall::ApplyPatch {
+        "patch" | "apply_patch" => ToolCall::ApplyPatch {
             path: s(&["filePath", "file_path", "path"]),
         },
         "grep" => ToolCall::Search {
@@ -3804,8 +4171,53 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
         // The genus-gated spawn naming every driver shares.
         "task" | "subagent" => ToolCall::Unknown {
             name: s(&["description"])
+                .or_else(|| s(&["title"]))
                 .map(|d| format!("Agent: {d}"))
                 .unwrap_or_else(|| "Agent".into()),
+            input: (!input.is_null()).then(|| input.clone()),
+        },
+        // A skill load names the skill (`id` on v2, `name` on v1) so the
+        // chip says what was loaded instead of a bare tool name.
+        "skill" => ToolCall::Unknown {
+            name: s(&["id", "name", "skill"])
+                .map(|skill| format!("Skill: {skill}"))
+                .unwrap_or_else(|| "Skill".into()),
+            input: (!input.is_null()).then(|| input.clone()),
+        },
+        // The agent asking the user: name the chip after the first question
+        // (capped single line) — the QuestionPanel carries the full detail
+        // while the question is live.
+        "question" => ToolCall::Unknown {
+            name: input
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|list| list.first())
+                .and_then(|q| {
+                    q.get("question")
+                        .or_else(|| q.get("header"))
+                        .and_then(Value::as_str)
+                })
+                .map(|q| {
+                    let flat: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
+                    const CAP: usize = 80;
+                    if flat.len() <= CAP {
+                        format!("Question: {flat}")
+                    } else {
+                        let mut end = CAP;
+                        while end > 0 && !flat.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("Question: {}…", flat[..end].trim_end())
+                    }
+                })
+                .unwrap_or_else(|| "Question".into()),
+            input: (!input.is_null()).then(|| input.clone()),
+        },
+        // Experimental LSP tool: name the operation when known.
+        "lsp" => ToolCall::Unknown {
+            name: s(&["operation", "op", "method", "action"])
+                .map(|op| format!("LSP: {op}"))
+                .unwrap_or_else(|| "LSP".into()),
             input: (!input.is_null()).then(|| input.clone()),
         },
         _ => ToolCall::Unknown {
@@ -3872,6 +4284,31 @@ fn normalize_v2_frame_with_session_models(
 ) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
+    // Interactive forms (the 2.x question mechanism — verified against a
+    // live 2.0.16 server, which has no question routes or question events
+    // at all): `form.created` carries the session nested in `data.form`,
+    // so it is handled ahead of the top-level session gate below and
+    // flattened to the `{type, properties}` shape the session loop owns.
+    if kind == "form.created" {
+        let form = data.get("form").unwrap_or(&Value::Null);
+        let id = form.get("id").and_then(Value::as_str).unwrap_or_default();
+        let session = form
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || session.is_empty() {
+            return Vec::new();
+        }
+        return vec![json!({
+            "type": "form.created",
+            "properties": {
+                "id": id,
+                "sessionID": session,
+                "title": form.get("title").cloned().unwrap_or(Value::Null),
+                "fields": form.get("fields").cloned().unwrap_or(Value::Null),
+            }
+        })];
+    }
     if data
         .get("sessionID")
         .and_then(Value::as_str)
@@ -4123,6 +4560,18 @@ fn normalize_v2_frame_with_session_models(
             }
             vec![json!({
                 "type": "permission.asked",
+                "properties": data
+            })]
+        }
+        // Agent questions: 1.x emits `question.asked`; 2.x emits
+        // `question.v2.asked` with the same Request shape (`id`, `sessionID`,
+        // `questions`). Normalize both to the 1.x name the session loop owns.
+        "question.asked" | "question.v2.asked" => {
+            if data.get("id").and_then(Value::as_str).is_none() {
+                return Vec::new();
+            }
+            vec![json!({
+                "type": "question.asked",
                 "properties": data
             })]
         }

@@ -501,7 +501,7 @@ pub const MARQUEE_HOME_END: f32 = 0.88;
 
 /// Fraction (0..1) of the overflow to reveal at repeating-animation delta
 /// `t` (0..1): hold left, ease right, hold right, ease back, hold left.
-/// Pure ΓÇö unit-testable without a window.
+/// Pure — unit-testable without a window.
 ///
 /// The cycle is deliberately FIXED length rather than scaled to the overflow:
 /// gpui maps `elapsed / duration` to the delta, so any duration change
@@ -526,7 +526,7 @@ pub fn marquee_progress(t: f32) -> f32 {
 /// Phase [0,1) of the fixed marquee cycle started at `start`, sampled at
 /// `now`. Callers drive the offset from wall time and pump frames through
 /// the shared 30fps [`pulse_lease`] clock instead of a per-element
-/// `with_animation` display-frame callback. Pure ΓÇö unit-testable.
+/// `with_animation` display-frame callback. Pure — unit-testable.
 pub fn marquee_phase(start: Instant, now: Instant) -> f32 {
     let cycle_secs = MARQUEE_CYCLE_MS as f32 / 1000.0;
     (now.saturating_duration_since(start).as_secs_f32() / cycle_secs) % 1.0
@@ -537,7 +537,7 @@ pub fn marquee_phase(start: Instant, now: Instant) -> f32 {
 /// only rows with measured overflow keep pumping; fitting titles go quiet.
 pub const MARQUEE_WARMUP_MS: u64 = 500;
 
-/// Whether a marquee row needs frames right now. Pure ΓÇö unit-testable.
+/// Whether a marquee row needs frames right now. Pure — unit-testable.
 pub fn marquee_should_pump(
     travel_px: Option<f32>,
     cycle_start: Option<Instant>,
@@ -557,7 +557,7 @@ pub fn marquee_should_pump(
 /// ms from phase `delta` until the text next settles home
 /// ([`MARQUEE_HOME_END`]): 0 when already home. Lets an interrupted marquee
 /// finish exactly the rest of its pass instead of snapping or running a
-/// whole extra cycle. Pure ΓÇö unit-testable without a window.
+/// whole extra cycle. Pure — unit-testable without a window.
 pub fn marquee_ms_to_home(delta: f32) -> u64 {
     let delta = delta.clamp(0.0, 1.0);
     if delta >= MARQUEE_HOME_END {
@@ -567,6 +567,7 @@ pub fn marquee_ms_to_home(delta: f32) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
 // Resize-edge feedback
 // ---------------------------------------------------------------------------
 

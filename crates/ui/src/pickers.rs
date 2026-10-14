@@ -898,7 +898,7 @@ impl Pickers {
         Self::build(state, None, cx)
     }
 
-    /// The model picker bound to thread naming: only title-capable agents,
+    /// The model picker bound to thread naming: any enabled agent,
     /// no traits tray, and picks surface as [`TitleModelPicked`].
     pub fn new_for_titles(
         state: Entity<AppState>,
@@ -1159,11 +1159,11 @@ impl Pickers {
     }
 
     /// The harnesses this picker offers: runnable ones for the composer,
-    /// narrowed to title-capable agents when bound to thread naming.
+    /// and every enabled agent except Mock when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
         let mut offered = offered_harnesses(list);
         if self.title.is_some() {
-            offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
+            offered.retain(|d| d.id != HarnessId::Mock);
         }
         offered
     }

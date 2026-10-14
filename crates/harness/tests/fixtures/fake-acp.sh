@@ -27,10 +27,16 @@ has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
 has "$line" '"name":"zeron"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
-emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
+emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"authMethods\":[{\"id\":\"cached_token\"},{\"id\":\"xai.api_key\"}],\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
 
-# ---- session new / load ----------------------------------------------------
+# Grok now authenticates after initialize (cached_token / xai.api_key +
+# headless meta). Accept it when present, then continue to session new/load.
 read -r line || exit 1
+if has "$line" '"method":"authenticate"'; then
+  emit "{\"id\":$(rid "$line"),\"result\":{}}"
+  read -r line || exit 1
+fi
+# ---- session new / load ----------------------------------------------------
 SID="s-1"
 MODEL_API=0
 if has "$line" '"sessionId":"existing-grok-session"'; then

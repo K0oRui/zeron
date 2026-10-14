@@ -1309,6 +1309,9 @@ pub enum AgentLoginMode {
     /// A loopback callback completes the sign-in in the browser (every
     /// provider's default); poll until done.
     Browser,
+    /// The user pastes a raw provider API key (Codex `OPENAI_API_KEY`).
+    /// No browser flow runs; the key is saved via `SaveCodexApiKey`.
+    ApiKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

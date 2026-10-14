@@ -287,6 +287,12 @@ async fn read_loop(
             continue;
         }
         let Ok(mut msg) = serde_json::from_str::<Value>(line) else {
+            // A sign-in page printed with unfamiliar wording (a newer
+            // server): offer the line to the sign-in observer, which keeps
+            // only urls. Normal runs pass no observer.
+            if let Some(observer) = &observer {
+                observer(line);
+            }
             tracing::debug!(target: "zeron_harness::rpc", "non-JSON stdout line (skipped)");
             continue;
         };
@@ -468,5 +474,56 @@ mod tests {
         ] {
             assert_eq!(response_error(&error), error.to_string());
         }
+    }
+
+    /// A sign-in page printed with unfamiliar wording (a newer server)
+    /// still reaches the sign-in observer — only the exact legacy prefix
+    /// used to.
+    #[tokio::test]
+    async fn stdout_noise_with_a_url_reaches_the_sign_in_observer() {
+        use crate::process::{Command, Stdio};
+        if std::env::var_os("ZERON_JSONRPC_NOISE_CHILD").is_some() {
+            println!("To finish signing in, visit https://example.com/auth?x=1");
+            return;
+        }
+        let mut cmd = Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            "jsonrpc::tests::stdout_noise_with_a_url_reaches_the_sign_in_observer",
+            "--nocapture",
+        ]);
+        cmd.env("ZERON_JSONRPC_NOISE_CHILD", "1");
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let mut child = cmd.spawn().expect("noise child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorder = seen.clone();
+        let (_client, mut incoming) = RpcClient::with_stdout_observer(
+            stdin,
+            stdout,
+            Some(Box::new(move |line| {
+                recorder.lock().expect("seen lock").push(line.to_string())
+            })),
+        );
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(msg) = incoming.recv().await {
+                if matches!(msg, Incoming::Eof) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(eof.is_ok(), "noise child runs to EOF");
+        let seen = seen.lock().expect("seen lock");
+        // The child's own test-harness chatter shares stdout; the sign-in
+        // line must be among the observed noise lines.
+        assert_eq!(
+            seen.iter()
+                .filter(|l| l.contains("https://example.com/auth?x=1"))
+                .count(),
+            1,
+            "{seen:?}"
+        );
     }
 }
