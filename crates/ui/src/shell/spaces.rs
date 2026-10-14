@@ -929,6 +929,105 @@ mod pinned_session_tests {
         );
     }
 
+    #[gpui::test]
+    fn active_sessions_page_behind_show_more(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        struct PagedHost(Entity<Shell>);
+        impl Render for PagedHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(280.0))
+                        .h(px(800.0))
+                        .child(shell.render_chat_sidebar(&Theme::default(), cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            PagedHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.chats = (0..100)
+                        .map(|ix| {
+                            let mut chat = pin_test_chat(&format!("chat-{ix:03}"));
+                            chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                            chat.last_message_at = Some(chat.created_at);
+                            chat
+                        })
+                        .collect();
+                });
+                shell
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+
+        // `debug_bounds` takes a static selector, so leak the row names once.
+        let names: Vec<&'static str> = (0..100)
+            .map(|ix| Box::leak(format!("chat-chat-{ix:03}").into_boxed_str()) as &'static str)
+            .collect();
+        // Only the first window renders; the tail hides behind Show more.
+        let shown = names
+            .iter()
+            .filter(|name| cx.debug_bounds(name).is_some())
+            .count();
+        assert_eq!(shown, 60);
+        assert!(cx.debug_bounds("sessions-more").is_some());
+        assert_eq!(shell.read_with(cx, |shell, _| shell.sessions_shown), 0);
+
+        // Selecting past the window grows it to include the selection.
+        let deep =
+            shell.update(cx, |shell, cx| shell.sidebar_visible_order(cx).last().cloned())
+                .unwrap();
+        assert_eq!(deep, "chat-099");
+        shell.update(cx, |shell, cx| {
+            shell
+                .state
+                .update(cx, |state, cx| state.select_chat(Some(deep.clone()), cx));
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let shown = names
+            .iter()
+            .filter(|name| cx.debug_bounds(name).is_some())
+            .count();
+        assert_eq!(shown, 100);
+        assert!(cx.debug_bounds("chat-chat-099").is_some());
+        assert!(cx.debug_bounds("sessions-more").is_none());
+        assert!(shell.read_with(cx, |shell, _| shell.sessions_shown) >= 100);
+    }
+
     #[test]
     fn inline_session_slide_retargets_and_returns_without_a_ghost() {
         use super::*;
@@ -1812,6 +1911,7 @@ struct ActiveChatRow {
     branch: Option<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
+    remote: bool,
 }
 
 pub(super) fn compare_sidebar_chats(
@@ -1929,6 +2029,11 @@ const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
+/// Active Sessions paging: element count per frame is what lags, so only the
+/// first window renders. Pins are exempt (manual, usually few). Matches the
+/// archived shelf's "Show more" pattern.
+const ACTIVE_INITIAL: usize = 60;
+const ACTIVE_PAGE: usize = 40;
 
 /// Put this machine's device group first without disturbing the recency-based
 /// order of any remote groups. A targeted promotion is more truthful than a
@@ -4057,6 +4162,95 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Order recency-sorted sidebar chats into the flat top-to-bottom id
+    /// list: pins first, then custom sections, then device/project grouping
+    /// with local-device promotion, then the collapsed-disclosure filters.
+    /// Pure and shared: [`Self::sidebar_visible_order`] and
+    /// [`Self::render_active_rows`] both read it, so jump chips, cycling,
+    /// and the drawn rows use one order instead of each cloning and
+    /// sorting the whole chat list per render.
+    /// `chats_sorted` must already be in [`compare_sidebar_chats`] order.
+    fn order_sidebar_ids(
+        chats_sorted: &[(ChatIndicator, zeron_proto::Chat)],
+        pinned_order: &[String],
+        custom_sections: &[zeron_proto::SidebarSection],
+        organization: SidebarOrganization,
+        sessions_open: bool,
+        pinned_open: bool,
+        local_device_id: Option<&str>,
+    ) -> Vec<String> {
+        let (pinned_chats, chats): (Vec<&(_, _)>, Vec<&(_, _)>) = chats_sorted
+            .iter()
+            .partition(|(_, chat)| pinned_order.contains(&chat.id));
+        let mut custom_order = Vec::new();
+        for section in custom_sections {
+            if !section.collapsed {
+                custom_order.extend(
+                    chats
+                        .iter()
+                        .filter(|(_, chat)| section.session_ids.contains(&chat.id))
+                        .map(|(_, chat)| chat.id.clone()),
+                );
+            }
+        }
+        let chats: Vec<&(_, _)> = chats
+            .into_iter()
+            .filter(|(_, chat)| {
+                !custom_sections
+                    .iter()
+                    .any(|section| section.session_ids.contains(&chat.id))
+            })
+            .collect();
+        let ordered = if organization != SidebarOrganization::InOneList {
+            let mut groups: Vec<(Option<(String, String)>, Vec<&zeron_proto::Chat>)> = Vec::new();
+            for (_, chat) in chats {
+                let key = Some((
+                    if organization == SidebarOrganization::ByProject {
+                        chat.space_id
+                            .clone()
+                            .unwrap_or_else(|| format!("home:{}", chat.device_id))
+                    } else {
+                        chat.device_id.clone()
+                    },
+                    String::new(),
+                ));
+                if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
+                    existing.push(chat);
+                } else {
+                    groups.push((key, vec![chat]));
+                }
+            }
+            if organization == SidebarOrganization::ByDevice {
+                promote_local_device_group(&mut groups, local_device_id);
+            }
+            groups
+                .into_iter()
+                .flat_map(|(_, rows)| rows)
+                .map(|chat| chat.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            chats
+                .into_iter()
+                .map(|(_, chat)| chat.id.clone())
+                .collect()
+        };
+        let ordered = pinned_chats
+            .into_iter()
+            .map(|(_, chat)| chat.id.clone())
+            .chain(custom_order.iter().cloned())
+            .chain(ordered)
+            .collect::<Vec<_>>();
+        let mut visible = project_pinned_first(&ordered, pinned_order);
+        if !sessions_open && organization == SidebarOrganization::InOneList {
+            visible.retain(|id| pinned_order.contains(id) || custom_order.contains(id));
+        }
+        if !pinned_open {
+            let pins: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
+            visible.retain(|id| !pins.contains(id.as_str()));
+        }
+        visible
+    }
+
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
     /// draws them: pins first, then the user's sort, device grouping,
     /// and local-device promotion. Jump shortcuts and session cycling read
@@ -4075,83 +4269,28 @@ impl Shell {
         let pinned_order = frozen_pinned
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
-        let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
-            .into_iter()
-            .map(|(_, chat)| chat.clone())
-            .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
-        let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
-            .into_iter()
-            .partition(|chat| pinned_order.contains(&chat.id));
         let custom_sections = self.active_sidebar_sections(cx);
-        let mut custom_order = Vec::new();
-        for section in &custom_sections {
-            if !section.collapsed {
-                custom_order.extend(
-                    chats
-                        .iter()
-                        .filter(|chat| section.session_ids.contains(&chat.id))
-                        .map(|chat| chat.id.clone()),
-                );
-            }
-        }
-        let chats: Vec<_> = chats
-            .into_iter()
-            .filter(|chat| {
-                !custom_sections
-                    .iter()
-                    .any(|section| section.session_ids.contains(&chat.id))
-            })
-            .collect();
-        let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
-            let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
-            for chat in chats {
-                let key = Some((
-                    if self.settings.sidebar_organization == SidebarOrganization::ByProject {
-                        chat.space_id
-                            .clone()
-                            .unwrap_or_else(|| format!("home:{}", chat.device_id))
-                    } else {
-                        chat.device_id.clone()
-                    },
-                    String::new(),
-                ));
-                if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
-                    existing.push(chat);
-                } else {
-                    groups.push((key, vec![chat]));
-                }
-            }
-            if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-                promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-            }
-            groups
+        let (chats_sorted, local_device_id) = {
+            let state = self.state.read(cx);
+            let mut chats: Vec<(ChatIndicator, zeron_proto::Chat)> = state
+                .sidebar_chats(Utc::now(), filter.as_deref())
                 .into_iter()
-                .flat_map(|(_, rows)| rows)
-                .map(|chat| chat.id)
-                .collect::<Vec<_>>()
-        } else {
-            chats.into_iter().map(|chat| chat.id).collect()
+                .map(|(status, chat)| (status, chat.clone()))
+                .collect();
+            chats.sort_by(|left, right| {
+                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+            });
+            (chats, state.local_device_id.clone())
         };
-        let ordered = pinned_chats
-            .into_iter()
-            .map(|chat| chat.id)
-            .chain(custom_order.iter().cloned())
-            .chain(ordered)
-            .collect::<Vec<_>>();
-        let mut visible = project_pinned_first(&ordered, pinned_order);
-        if !self.sessions_open
-            && self.settings.sidebar_organization == SidebarOrganization::InOneList
-        {
-            visible.retain(|id| pinned_order.contains(id) || custom_order.contains(id));
-        }
-        if !self.pinned_open {
-            let pins: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
-            visible.retain(|id| !pins.contains(id.as_str()));
-        }
-        visible
+        Self::order_sidebar_ids(
+            &chats_sorted,
+            pinned_order,
+            &custom_sections,
+            self.settings.sidebar_organization,
+            self.sessions_open,
+            self.pinned_open,
+            local_device_id.as_deref(),
+        )
     }
 
     /// Shared metadata and visibility settings for active and archived sessions.
@@ -4199,6 +4338,7 @@ impl Shell {
             )),
             SidebarOrganization::InOneList => None,
         };
+        let remote = state.local_device_id.as_deref() != Some(chat.device_id.as_str());
         ActiveChatRow {
             status,
             chat: chat.clone(),
@@ -4206,6 +4346,7 @@ impl Shell {
             branch,
             change_request,
             group,
+            remote,
         }
     }
 
@@ -4225,7 +4366,12 @@ impl Shell {
                 drag.filter == filter && profile_key.as_deref() == Some(&drag.profile_key)
             })
             .map(|drag| drag.visible_ids.clone());
-        let mut rows: Vec<ActiveChatRow> = {
+        let pinned_order = frozen_pinned
+            .as_ref()
+            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
+        let custom_sections = self.active_sidebar_sections(cx);
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = {
             let state = self.state.read(cx);
             let mut chats: Vec<_> = state
                 .sidebar_chats(now, filter.as_deref())
@@ -4236,13 +4382,36 @@ impl Shell {
                 compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
             });
             chats
+        };
+        // Jump chips read the same order the rows draw, built from the same
+        // fetch — one clone and sort per render, not one per list plus one
+        // for the slots.
+        let visible_slots: std::collections::HashMap<_, _> = Self::order_sidebar_ids(
+            &chats_sorted,
+            pinned_order,
+            &custom_sections,
+            self.settings.sidebar_organization,
+            self.sessions_open,
+            self.pinned_open,
+            local_device_id.as_deref(),
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| (id, index))
+        .collect();
+        let mut rows: Vec<ActiveChatRow> = {
+            let state = self.state.read(cx);
+            chats_sorted
                 .into_iter()
-                .map(|(status, chat)| self.sidebar_chat_data(status, chat, state))
+                .map(|(status, chat)| self.sidebar_chat_data(status, chat, &state))
                 .collect()
         };
-        let pinned_order = frozen_pinned
-            .as_ref()
-            .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
+        // Marquee state is measured per paint; forget rows that left the
+        // list so the map tracks the visible set.
+        let visible: HashSet<&str> = rows.iter().map(|row| row.chat.id.as_str()).collect();
+        self.title_marquee
+            .borrow_mut()
+            .retain(|id, _| visible.contains(id.as_str()));
         let base_ids: Vec<String> = rows.iter().map(|row| row.chat.id.clone()).collect();
         let ordered_ids = project_pinned_first(&base_ids, pinned_order);
         let rank: std::collections::HashMap<&str, usize> = ordered_ids
@@ -4281,7 +4450,6 @@ impl Shell {
                 .collect::<Vec<_>>(),
         );
 
-        let custom_sections = self.active_sidebar_sections(cx);
         let custom_count = custom_sections.len();
         let mut custom_groups: Vec<_> = custom_sections
             .iter()
@@ -4311,7 +4479,6 @@ impl Shell {
             }
         }
         if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-            let local_device_id = self.state.read(cx).local_device_id.clone();
             promote_local_device_group(&mut regular_groups, local_device_id.as_deref());
         }
         let mut sections = Vec::with_capacity(regular_groups.len() + usize::from(pinned_count > 0));
@@ -4422,21 +4589,56 @@ impl Shell {
         // Re-checked at render so the chips drop the FRAME a popover opens,
         // not on the next modifier event — the jumps are suppressed under it.
         let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
+        // Cap the rendered window: element count per frame is the lag source.
+        // Pins always render; custom + regular share one budget, head-first so
+        // new activity (top-sorted) stays visible. The selected row forces the
+        // window open so keyboard nav never selects a hidden row.
+        let has_pinned_section = pinned_count > 0;
+        let total_non_pinned: usize = sections
+            .iter()
+            .skip(usize::from(has_pinned_section))
+            .map(|(_, rows)| rows.len())
+            .sum();
+        let budget = if total_non_pinned == 0 {
+            0
+        } else {
+            let mut budget = self
+                .sessions_shown
+                .max(ACTIVE_INITIAL)
+                .min(total_non_pinned);
+            let flat_position = sections
+                .iter()
+                .skip(usize::from(has_pinned_section))
+                .flat_map(|(_, rows)| rows.iter())
+                .position(|row| Some(row.chat.id.as_str()) == selected.as_deref());
+            if let Some(index) = flat_position
+                && index + 1 > budget
+            {
+                budget = index + 1;
+                self.sessions_shown = self.sessions_shown.max(budget);
+            }
+            budget
+        };
+        let hidden_non_pinned = total_non_pinned.saturating_sub(budget);
+        let mut remaining = budget;
         let keymap = self.settings.keymap.clone();
-        // Flat top-to-bottom slot across groups: the same order
-        // `sidebar_visible_order` hands the jump shortcuts and cycling, so a
-        // chip always names the key that opens its row.
-        let visible_slots: std::collections::HashMap<_, _> = self
-            .sidebar_visible_order(cx)
-            .into_iter()
-            .enumerate()
-            .map(|(index, id)| (id, index))
-            .collect();
         let mut slot = 0usize;
         let mut rendered = Vec::new();
         let mut moving_row = None;
         for (group, rows) in sections {
             let pinned_group = slot < pinned_count;
+            // Head-first window: hide the tail once the budget is spent.
+            // Pinned sections always render fully.
+            let mut rows = rows;
+            if !pinned_group {
+                if remaining == 0 {
+                    continue;
+                }
+                if rows.len() > remaining {
+                    rows.truncate(remaining);
+                }
+                remaining -= rows.len();
+            }
             let drag_group = if pinned_group {
                 "pinned".to_owned()
             } else {
@@ -4453,6 +4655,7 @@ impl Shell {
                     branch,
                     change_request,
                     group: _,
+                    remote,
                 } = row;
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
@@ -4526,6 +4729,7 @@ impl Shell {
                     is_selected,
                     false,
                     is_moving,
+                    remote,
                     if is_moving { None } else { drag },
                     jump_label,
                     None,
@@ -4700,6 +4904,43 @@ impl Shell {
                 .child(body)
                 .into_any_element();
             rendered.push((format!("g:{collapse_key}"), height, element));
+        }
+        if hidden_non_pinned > 0 {
+            let more_height = if self.settings.sidebar_compact {
+                super::sidebar_row_height(true, true, false, false)
+            } else {
+                36.0
+            };
+            let remaining = hidden_non_pinned.min(ACTIVE_PAGE);
+            let more = div()
+                .id("sessions-more")
+                .debug_selector(|| "sessions-more".into())
+                .h(px(more_height))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(Theme::SPACE_SM))
+                .rounded(px(6.0))
+                .text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted.opacity(0.55))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sessions_shown = this
+                        .sessions_shown
+                        .max(ACTIVE_INITIAL)
+                        .saturating_add(ACTIVE_PAGE);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::PLUS)
+                        .size(px(14.0))
+                        .flex_none(),
+                )
+                .child(SharedString::from(format!("Show {remaining} more")))
+                .into_any_element();
+            rendered.push(("more:active".to_string(), more_height, more));
         }
         SidebarSessionRows {
             custom_count,
@@ -4971,6 +5212,7 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
+                let remote = row.remote;
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
@@ -4988,6 +5230,7 @@ impl Shell {
                         is_selected,
                         true,
                         false,
+                        remote,
                         None,
                         None,
                         None,

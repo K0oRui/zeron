@@ -12,7 +12,7 @@
 //! dock. Double-clicking a handle resets that pane to its default width.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
@@ -906,10 +906,11 @@ const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 const SIDEBAR_FOOTER_BUTTON_SIZE: f32 = 28.0;
 const SIDEBAR_FOOTER_AVATAR_SIZE: f32 = 16.0;
 
-/// Keep the fade short so only the last few glyphs recede. Tracking clipped
-/// content lets the shared paint-time overflow gate leave fitting labels intact.
+/// Keep the fade short so only the last few glyphs recede. Static fade, no
+/// scroll handle: one handle per label per row meant hundreds of fresh
+/// handles and tracked scrollers on every sidebar frame. Fitting labels
+/// over-fade by up to one band, which matches the title's resting state.
 fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) -> impl IntoElement {
-    let overflow = gpui::ScrollHandle::new();
     crate::edge_fade::edge_faded(
         20.0,
         false,
@@ -920,12 +921,100 @@ fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) ->
             .when(fill, |el| el.flex_1())
             .min_w_0()
             .overflow_hidden()
-            .track_scroll(&overflow)
             .flex()
             .child(div().flex_none().whitespace_nowrap().child(label)),
     )
     .fade_right(true)
-    .fade_label_overflow(&overflow)
+}
+
+/// One sidebar title's marquee bookkeeping, keyed by chat id.
+#[derive(Default)]
+struct TitleMarqueeRow {
+    /// Persisted overflow handle: measured every paint, readable at render.
+    scroll: gpui::ScrollHandle,
+    /// Cycle start: set on the first active render, cleared on full stop, so
+    /// every fresh hover starts at home and the wall-clock phase never jumps.
+    cycle_start: Option<Instant>,
+    /// Overflow frozen at the first nonzero measurement of the cycle, so a
+    /// mid-scroll corner swap can't wobble the speed. Cleared on full stop.
+    travel_px: Option<f32>,
+    /// Grace deadline after unhover: frames keep coming through the shared
+    /// pulse lease until the text settles home, then it stops. Hovered rows
+    /// ignore this; expiry is lazy at render.
+    finish_until: Option<Instant>,
+}
+
+type MarqueeRows = std::cell::RefCell<std::collections::HashMap<String, TitleMarqueeRow>>;
+
+/// Truncated sidebar label that ping-pongs its content left-to-right while
+/// `marquee` is set (hovered row, or its finishing pass after unhover). The
+/// offset is driven through the row's persisted scroll handle — not a
+/// relative shift — so the shared paint-time fade gating follows it for
+/// free: right fade at home, both mid-pass, left fade at the far end.
+/// Offset stays 0 until the first paint measures real overflow, so fitting
+/// titles never move; the travel distance freezes at that first measurement
+/// so a mid-scroll corner swap can't wobble the speed.
+///
+/// The phase comes from wall time over a FIXED cycle, so hovering never
+/// resets or jumps the text. Frames arrive via the shared 30fps pulse lease
+/// (held by the caller while `marquee`), never a display-frame callback —
+/// nothing animates at 120Hz and nothing runs while idle. The per-frame
+/// write happens in a prepaint hook, change-guarded like any scroll drive;
+/// homing stays on the deferred task below. Reduced-motion callers pass
+/// `marquee` false and hold no lease.
+fn sidebar_marquee_label(
+    id: SharedString,
+    fill: bool,
+    marquee: bool,
+    rows: &MarqueeRows,
+    chat_id: &str,
+    label: impl IntoElement,
+) -> impl IntoElement {
+    let mut map = rows.borrow_mut();
+    let row = map.entry(chat_id.to_owned()).or_default();
+    let scroll = row.scroll.clone();
+    let content = div().flex_none().whitespace_nowrap().child(label);
+    let track = div()
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .when(fill, |el| el.flex_1())
+        .min_w_0()
+        .overflow_hidden()
+        .track_scroll(&scroll)
+        .flex();
+    let track = if marquee {
+        let start = *row.cycle_start.get_or_insert_with(Instant::now);
+        if row.travel_px.is_none() {
+            let measured = f32::from(scroll.max_offset().x).max(0.0);
+            if measured > 1.0 {
+                row.travel_px = Some(measured);
+            }
+        }
+        let travel = row.travel_px.unwrap_or(0.0);
+        let hook_scroll = scroll.clone();
+        let scrolled = content.on_children_prepainted(move |_, _, _| {
+            let now = Instant::now();
+            let shift = travel * motion::marquee_progress(motion::marquee_phase(start, now));
+            let next = gpui::point(px(-shift), px(0.0));
+            // Guarded: ticks arrive every 33ms regardless, so only dirty
+            // scroll layout when the offset actually moved.
+            if hook_scroll.offset() != next {
+                hook_scroll.set_offset(next);
+            }
+        });
+        track.child(scrolled)
+    } else {
+        // Fully stopped: drop the stale cycle too, so a later flyby can
+        // never mistake it for live movement. Homing stays deferred (see
+        // caller): no scroll mutation in this path.
+        row.cycle_start = None;
+        row.travel_px = None;
+        track.child(content)
+    };
+    crate::edge_fade::edge_faded(20.0, false, false, track)
+        .fade_left(marquee)
+        .fade_right(true)
+        .fade_label_overflow(&scroll)
 }
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
@@ -1691,6 +1780,11 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
+    /// Active Sessions paging (mirrors `archived_shown`): the sidebar builds
+    /// one element tree per rendered row each frame, so an unbounded active
+    /// list lags with hundreds of sessions. Only the first `sessions_shown`
+    /// non-pinned rows render, with a "Show more" tail. Pins always render.
+    pub(super) sessions_shown: usize,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
@@ -1811,6 +1905,10 @@ pub struct Shell {
         std::cell::RefCell<std::collections::HashMap<String, Entity<project_icon::ProjectIcon>>>,
     /// Hovered row whose status is replaced by the archive control.
     chat_status_hover: Option<String>,
+    /// Per-chat marquee bookkeeping for sidebar titles (persisted: a fresh
+    /// handle per render never survives to layout, so render-time reads see
+    /// nothing). Pruned to the visible list.
+    title_marquee: MarqueeRows,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// In-flight reorder for the pinned section only.
@@ -2150,6 +2248,7 @@ impl Shell {
             pinned_open: true,
             sessions_open: true,
             archived_shown: 0,
+            sessions_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -2227,6 +2326,7 @@ impl Shell {
             sidebar_pinned_heights: Vec::new(),
             project_icons: Default::default(),
             chat_status_hover: None,
+            title_marquee: Default::default(),
             sidebar_scroll: gpui::ScrollHandle::new(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
@@ -4777,11 +4877,49 @@ impl Shell {
     /// grouping view options permute the list, and the chip on a row must
     /// name the key that opens it.
     fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
-        let Some(chat_id) = self.sidebar_visible_order(cx).into_iter().nth(slot) else {
+        let order = self.sidebar_visible_order(cx);
+        let Some(chat_id) = order.iter().nth(slot).cloned() else {
             return;
         };
+        self.ensure_session_visible_in_order(&chat_id, &order, cx);
         // Same path a click on that row takes.
-        self.open_chat(chat_id, cx);
+        self.open_chat_visible(chat_id, cx);
+    }
+
+    /// Grow the active Sessions window so `chat_id` renders. Jump slots are
+    /// all inside the first window, but cycling can land past it — selecting
+    /// a hidden row would leave no visible selection.
+    fn ensure_session_visible(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let order = self.sidebar_visible_order(cx);
+        self.ensure_session_visible_in_order(chat_id, &order, cx);
+    }
+
+    /// [`Self::ensure_session_visible`] against an order the caller already
+    /// holds, so jumps and cycling never build the list twice per press.
+    fn ensure_session_visible_in_order(
+        &mut self,
+        chat_id: &str,
+        order: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = order.iter().position(|id| id == chat_id) else {
+            return;
+        };
+        // Pinned rows always render; only the non-pinned window needs room.
+        let pins = self.active_sidebar_pins(cx);
+        let pinned: std::collections::HashSet<&str> =
+            pins.iter().map(String::as_str).collect();
+        if pinned.contains(chat_id) {
+            return;
+        }
+        let pinned_count = order
+            .iter()
+            .filter(|id| pinned.contains(id.as_str()))
+            .count();
+        let non_pinned_index = index.saturating_sub(pinned_count);
+        if non_pinned_index + 1 > self.sessions_shown {
+            self.sessions_shown = (non_pinned_index + 1).max(self.sessions_shown);
+        }
     }
 
     /// Whether an overlay that owns the keyboard is up — the add-space
@@ -6442,6 +6580,77 @@ impl Shell {
     /// One session row: context + status on line one, harness + title on line
     /// two, and source metadata below. Working uses the live thread glyph in
     /// the status corner. Click selects; right-click opens the context menu.
+    /// Whether a title's marquee runs this frame: hovered rows do (hover-only
+    /// — selected rows stay static so nothing spins while idle); a recently
+    /// unhovered row keeps going until its finish deadline so the pass
+    /// settles home instead of snapping. Expired deadlines are dropped
+    /// lazily here.
+    fn title_marquee_active(&self, chat_id: &str, hovered: bool) -> bool {
+        if hovered {
+            return true;
+        }
+        let mut rows = self.title_marquee.borrow_mut();
+        match rows.get_mut(chat_id) {
+            Some(row) => match row.finish_until {
+                Some(until) if Instant::now() < until => true,
+                _ => {
+                    row.finish_until = None;
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Track hover flips for the finish-on-unhover grace: re-hovering clears
+    /// a pending finish (the wall clock never stopped, so it resumes
+    /// mid-pass with no jump). Unhovering arms exactly the time left until
+    /// the text next settles home — but only when it is actually displaced:
+    /// a flyby that never left home just stops, and so does an unhover that
+    /// lands in the home zone. Stale phases are impossible: the label clears
+    /// `cycle_start` on every stopped render. Sidebar rows only — the
+    /// palette keeps its static labels.
+    fn title_marquee_hover_changed(&mut self, chat_id: &str, hovered: bool, sidebar_row: bool) {
+        if !sidebar_row {
+            return;
+        }
+        let mut rows = self.title_marquee.borrow_mut();
+        if hovered {
+            if let Some(row) = rows.get_mut(chat_id) {
+                row.finish_until = None;
+            }
+            return;
+        }
+        let Some(row) = rows.get_mut(chat_id) else {
+            return;
+        };
+        let now = Instant::now();
+        let phase = row
+            .cycle_start
+            .map(|start| motion::marquee_phase(start, now));
+        // Frozen travel, not the live measurement: the pass finishes what
+        // it started even if the slot resized mid-scroll.
+        let travel = row.travel_px.unwrap_or(0.0);
+        match phase {
+            Some(p) if travel * motion::marquee_progress(p) > 0.5 => {
+                row.finish_until = Some(now + Duration::from_millis(motion::marquee_ms_to_home(p)));
+            }
+            _ => row.finish_until = None,
+        }
+    }
+
+    /// Whether this row needs frames right now. Pure decision in
+    /// [`motion::marquee_should_pump`]: warmup renders bootstrap the
+    /// measurement, afterwards only measured overflow keeps the lease.
+    fn title_marquee_pumping(&self, chat_id: &str) -> bool {
+        let rows = self.title_marquee.borrow();
+        let (travel, start) = match rows.get(chat_id) {
+            Some(row) => (row.travel_px, row.cycle_start),
+            None => (None, None),
+        };
+        motion::marquee_should_pump(travel, start, Instant::now())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
@@ -6456,6 +6665,7 @@ impl Shell {
         selected: bool,
         archived: bool,
         preview: bool,
+        remote: bool,
         drag: Option<SidebarSessionDrag>,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
@@ -6481,15 +6691,6 @@ impl Shell {
         };
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
-        let remote = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .is_some_and(|chat| {
-                self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
-            });
         let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
@@ -6811,6 +7012,8 @@ impl Shell {
                 el.on_hover({
                     let fade_hover = motion::hover_listener(fade_key.clone());
                     let hover_id = row_id.clone();
+                    let finish_id = id.clone();
+                    let finish_sidebar_row = search_query.is_none();
                     cx.listener(move |this, hovered: &bool, window, cx| {
                         fade_hover(hovered, window, cx);
                         if *hovered {
@@ -6822,6 +7025,7 @@ impl Shell {
                             this.chat_status_hover = None;
                             cx.notify();
                         }
+                        this.title_marquee_hover_changed(&finish_id, *hovered, finish_sidebar_row);
                     })
                 })
                 .cursor_pointer()
@@ -6903,14 +7107,71 @@ impl Shell {
                         },
                     )
                     .children(project_icon)
-                    .child(sidebar_faded_label(
-                        format!("chat-title-{content_id}").into(),
-                        true,
-                        div()
+                    .child({
+                        // Sidebar titles only (never palette previews): the
+                        // palette keeps its static faded labels and never
+                        // touches marquee state, so it cannot disturb a
+                        // running sidebar pass for the same chat.
+                        let label = div()
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
-                            .child(popover::search_highlight(title, search_query, theme)),
-                    ))
+                            .child(popover::search_highlight(title, search_query, theme));
+                        if search_query.is_some() {
+                            sidebar_faded_label(
+                                format!("chat-title-{content_id}").into(),
+                                true,
+                                label,
+                            )
+                            .into_any_element()
+                        } else {
+                            // Hover-only, never selected: nothing spins while
+                            // idle. Frames arrive via the shared 30fps pulse
+                            // lease, held only while scrolling — fitting
+                            // titles go quiet past warmup.
+                            let hovered =
+                                self.chat_status_hover.as_deref() == Some(row_id.as_str());
+                            let marquee = !self.reduced_motion
+                                && !preview
+                                && self.title_marquee_active(&content_id, hovered);
+                            if marquee && self.title_marquee_pumping(&content_id) {
+                                motion::pulse_lease(cx.entity_id(), cx);
+                            }
+                            if !marquee && !preview {
+                                // A deselect can strand a mid-pass offset on the
+                                // handle; home it on the foreground executor,
+                                // never during render (see above). Palette rows
+                                // share the handle but must not fight a running
+                                // sidebar animation, so only live rows reset.
+                                // One-shot per transition: the task lands before
+                                // the next frame, after which the offset reads
+                                // default and nothing more spawns.
+                                let stale: Option<gpui::ScrollHandle> = self
+                                    .title_marquee
+                                    .borrow()
+                                    .get(&content_id)
+                                    .filter(|row| {
+                                        row.finish_until.is_none()
+                                            && row.scroll.offset() != gpui::Point::default()
+                                    })
+                                    .map(|row| row.scroll.clone());
+                                if let Some(scroll) = stale {
+                                    cx.spawn(async move |_, _| {
+                                        scroll.set_offset(gpui::Point::default());
+                                    })
+                                    .detach();
+                                }
+                            }
+                            sidebar_marquee_label(
+                                format!("chat-title-{content_id}").into(),
+                                true,
+                                marquee,
+                                &self.title_marquee,
+                                &content_id,
+                                label,
+                            )
+                            .into_any_element()
+                        }
+                    })
                     .when(!compact && !show_label && remote, |el| {
                         el.child(
                             icon(icons::REMOTE_SERVER)

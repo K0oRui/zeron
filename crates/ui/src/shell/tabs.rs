@@ -95,7 +95,8 @@ impl Shell {
         let order = self.sidebar_visible_order(cx);
         let selected = self.state.read(cx).selected_chat.clone();
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
-            self.open_chat(target, cx);
+            self.ensure_session_visible_in_order(&target, &order, cx);
+            self.open_chat_visible(target, cx);
         }
     }
 
@@ -122,6 +123,13 @@ impl Shell {
 
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.ensure_session_visible(&chat_id, cx);
+        self.open_chat_visible(chat_id, cx);
+    }
+
+    /// [`Self::open_chat`] for callers that already grew the Sessions window
+    /// (jumps, cycling), so one press never builds the session order twice.
+    pub(crate) fn open_chat_visible(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
