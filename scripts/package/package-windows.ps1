@@ -3,7 +3,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (-not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
-$root = Split-Path $PSScriptRoot -Parent
+$root = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 
 function Find-InnoSetupCompiler {
     # Inno Setup 6 ships on GitHub's Windows runners; locally, install it with

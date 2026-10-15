@@ -858,7 +858,8 @@ mod tests {
             &[
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
-                ReasoningLevel::High
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh
             ]
         );
         // Cursor, Devin, Hermes and Pi mirror their specs the same way.

@@ -3892,26 +3892,24 @@ async fn run_session(session: Session) {
         // Current Grok requires an explicit `authenticate` after
         // `initialize` (docs: `xai.api_key` when XAI_API_KEY is set, else
         // the local `cached_token`). Without it `session/new` answers
-        // auth_required even for signed-in users.
+        // auth_required even for signed-in users. Servers that advertise
+        // no auth method (fixtures, minimal servers) skip it; a later
+        // auth_required still maps to not-signed-in.
         if harness == HarnessId::Grok {
             let has_api_key = std::env::var("XAI_API_KEY").is_ok_and(|v| !v.trim().is_empty());
-            match grok_auth_method(&init, has_api_key) {
-                Some(method) => {
-                    if let Err(e) = request_draining(
-                        &client,
-                        &mut incoming,
-                        "authenticate",
-                        json!({ "methodId": method, "_meta": { "headless": true } }),
-                    )
-                    .await
-                    {
-                        if is_auth_required(&e) {
-                            return Err(HarnessError::Protocol(not_signed_in(agent_name)));
-                        }
-                        return Err(e);
-                    }
+            if let Some(method) = grok_auth_method(&init, has_api_key)
+                && let Err(e) = request_draining(
+                    &client,
+                    &mut incoming,
+                    "authenticate",
+                    json!({ "methodId": method, "_meta": { "headless": true } }),
+                )
+                .await
+            {
+                if is_auth_required(&e) {
+                    return Err(HarnessError::Protocol(not_signed_in(agent_name)));
                 }
-                None => return Err(HarnessError::Protocol(not_signed_in(agent_name))),
+                return Err(e);
             }
         }
         let steer_ext = steering_supported(&init);

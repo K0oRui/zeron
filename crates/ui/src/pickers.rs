@@ -426,7 +426,7 @@ pub fn child_path(base: &str, name: &str) -> String {
     if base.ends_with(['/', '\\']) {
         format!("{base}{name}")
     } else if windows_browser_path(base).is_some() {
-        format!("{base}\\{name}")
+        format!("{}\\{name}", base.replace('/', "\\"))
     } else {
         format!("{base}/{name}")
     }
@@ -511,13 +511,9 @@ pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
         if rest.is_empty() {
             return Some(home.to_string());
         }
-        let rest = rest
-            .strip_prefix(['/', '\\'])?
-            .trim_end_matches(['/', '\\']);
+        let rest = rest.strip_prefix('/')?.trim_end_matches('/');
         return Some(if rest.is_empty() {
             home.to_string()
-        } else if home.contains('\\') {
-            zeron_doc::normalize_windows_path(&format!("{home}/{rest}"))
         } else {
             format!("{home}/{rest}")
         });
@@ -9534,7 +9530,7 @@ mod tests {
         assert_eq!(parent_path("C:\\"), None);
         assert_eq!(
             parent_path("\\\\srv\\share\\x"),
-            Some("\\\\srv\\share".to_string())
+            Some("\\\\srv\\share\\".to_string())
         );
         assert_eq!(parent_path("\\\\srv\\share"), None);
         let crumbs = breadcrumbs("C:\\UserFiles\\Projects");

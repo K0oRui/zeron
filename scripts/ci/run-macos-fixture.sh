@@ -30,7 +30,7 @@ run_with_timeout() {
 for attempt in $(seq 1 "$ATTEMPTS"); do
   rm -rf "$OUT"; mkdir -p "$OUT"
   echo "=== $(basename "$BINARY") attempt $attempt/$ATTEMPTS ==="
-  if run_with_timeout "$ATTEMPT_TIMEOUT" bash "$ROOT/scripts/run-macos-browser-fixture.sh" "$BINARY" "$OUT" && test -f "$OUT/result.txt"; then
+  if run_with_timeout "$ATTEMPT_TIMEOUT" bash "$ROOT/scripts/test/run-macos-browser-fixture.sh" "$BINARY" "$OUT" && test -f "$OUT/result.txt"; then
     echo "$(basename "$BINARY") passed on attempt $attempt"
     [ "$attempt" -gt 1 ] && echo "::warning::$(basename "$BINARY") needed $attempt attempts (flaky on this runner)"
     exit 0

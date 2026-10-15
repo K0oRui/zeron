@@ -197,7 +197,7 @@ def main():
                 result_file.unlink(missing_ok=True)
                 command = [str(Path(args.fixture).resolve()), str(captures)]
                 if os.uname().sysname == 'Darwin':
-                    command[:0] = ['bash', str(Path(__file__).resolve().parent / 'run-macos-browser-fixture.sh')]
+                    command[:0] = ['bash', str(Path(__file__).resolve().parent / 'test' / 'run-macos-browser-fixture.sh')]
                 subprocess.run(command, env=env, check=True, timeout=60)
                 assert json.loads(result_file.read_text()) == {
                     'profile': profile, 'url': origin + '/' + mode, 'status': 'pass'
@@ -233,7 +233,7 @@ def main():
                     captures = root / f'{profile}-cleanup'
                     result_file = captures / 'storage-result.json'
                     try:
-                        subprocess.run(['bash', str(Path(__file__).resolve().parent / 'run-macos-browser-fixture.sh'),
+                        subprocess.run(['bash', str(Path(__file__).resolve().parent / 'test' / 'run-macos-browser-fixture.sh'),
                                         str(Path(args.fixture).resolve()), str(captures)],
                                        env=env, check=True, timeout=60)
                         assert json.loads(result_file.read_text()) == {
