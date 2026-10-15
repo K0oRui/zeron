@@ -110,6 +110,7 @@ impl Preferences {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn current() -> Option<Shortcut> {
     preferences().lock().unwrap().active()
 }
@@ -194,6 +195,7 @@ mod tests {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn capture_allowed() -> bool {
     current().is_some()
 }

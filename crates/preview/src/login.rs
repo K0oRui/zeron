@@ -248,6 +248,7 @@ mod tests {
 
     /// A mux pair standing in for the P2P link: `requester` opens streams that
     /// the running device serves as `peer`.
+    #[cfg(unix)]
     fn link(routes: &CallbackRoutes, peer: &str, stop: &CancellationToken) -> Mux {
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
         let (ar, aw) = tokio::io::split(a);
@@ -295,6 +296,7 @@ mod tests {
             .map_or(true, |reply| reply.is_empty())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn forwards_the_callback_to_the_registered_port_for_the_starting_device() {
         let stop = CancellationToken::new();
@@ -312,6 +314,7 @@ mod tests {
         stop.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn another_device_or_an_unknown_login_is_refused() {
         let stop = CancellationToken::new();
@@ -343,6 +346,7 @@ mod tests {
         stop.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_route_and_the_forwarder_end_with_the_login() {
         let stop = CancellationToken::new();

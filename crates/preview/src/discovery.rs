@@ -2,10 +2,14 @@
 //! ownership has been established from the process's actual working directory
 //! and commands performing authentication have been excluded.
 use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -138,6 +142,7 @@ pub async fn is_http(address: SocketAddr) -> bool {
     .is_some()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn mark_descendants(listeners: &mut [Listener], parents: &HashMap<u32, u32>, owner: u32) {
     for listener in listeners {
         let mut pid = listener.pid;

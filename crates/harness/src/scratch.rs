@@ -48,6 +48,8 @@ impl ScratchDir {
                 std::process::id(),
                 NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
             ));
+            // `mut` only on Unix, where the mode below needs it.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {

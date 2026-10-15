@@ -21,6 +21,7 @@ mod linux;
 mod macos;
 
 mod shortcut;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use shortcut::capture_allowed;
 pub use shortcut::{set_recording, set_shortcut, validate_shortcut};
 
@@ -38,6 +39,7 @@ pub fn set_capture_sound_enabled(enabled: bool) {
 }
 
 /// Acknowledge saved pixels immediately; optional semantic enrichment may still be running.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn capture_ready() {
     if CAPTURE_SOUND_ENABLED.load(Ordering::Relaxed) {
         crate::sound::play_appshot();

@@ -137,9 +137,9 @@ function Invoke-ZeronPackage([switch]$SkipInstaller) {
         Write-Section 'Setup installer'
     }
     $packager = Join-Path $RepoRoot 'scripts/package/package-windows.ps1'
-    $pkgArgs = @('-ReleasesUrl', $ReleasesUrl)
-    if ($SkipInstaller) { $pkgArgs += '-SkipInstaller' }
-    Write-Host "  › package-windows.ps1 $($pkgArgs -join ' ')" -ForegroundColor Gray
+    $pkgArgs = @{ ReleasesUrl = $ReleasesUrl }
+    if ($SkipInstaller) { $pkgArgs['SkipInstaller'] = $true }
+    Write-Host "  › package-windows.ps1 -ReleasesUrl $($pkgArgs['ReleasesUrl'])$(if ($SkipInstaller) { ' -SkipInstaller' })" -ForegroundColor Gray
     Write-Host ''
     & $packager @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "packaging exited with code $LASTEXITCODE" }

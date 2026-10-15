@@ -2260,8 +2260,6 @@ pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
-pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
-    std::time::Duration::from_millis(120);
 /// Active Sessions paging: element count per frame is what lags, so only the
 /// first window renders. Pins are exempt (manual, usually few). Matches the
 /// archived shelf's "Show more" pattern.

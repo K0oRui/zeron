@@ -84,7 +84,9 @@ mod workspace_links;
 
 use std::path::PathBuf;
 
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use futures::FutureExt as _;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 pub use state::EngineBootConfig;

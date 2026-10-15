@@ -2211,9 +2211,9 @@ fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::rename(source, target)
 }
 
-fn sync_parent_directory(parent: &Path) {
+fn sync_parent_directory(_parent: &Path) {
     #[cfg(unix)]
-    if let Ok(directory) = std::fs::File::open(parent) {
+    if let Ok(directory) = std::fs::File::open(_parent) {
         let _ = directory.sync_all();
     }
 }

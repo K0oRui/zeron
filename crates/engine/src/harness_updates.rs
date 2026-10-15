@@ -129,8 +129,9 @@ struct CodexPackageManifest {
 
 /// Held for the complete standalone install so Zeron cannot race the Codex
 /// installer (which uses the same lock file) or another Zeron process.
+/// Named, not read: dropping it releases the lock.
 struct InstallFileLock {
-    file: File,
+    _file: File,
 }
 
 impl InstallFileLock {
@@ -164,7 +165,7 @@ impl InstallFileLock {
             }
         }
 
-        Ok(Self { file })
+        Ok(Self { _file: file })
     }
 }
 
@@ -174,7 +175,7 @@ impl Drop for InstallFileLock {
         {
             use std::os::fd::AsRawFd as _;
             unsafe {
-                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
             }
         }
     }

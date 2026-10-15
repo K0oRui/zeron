@@ -365,7 +365,7 @@ impl Mux {
                         !frame.data.is_empty()
                             && slot
                                 .receive_credit
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n
                                     .checked_sub(frame.data.len()))
                                 .is_ok(),
                         "preview receive window exceeded"
