@@ -1,5 +1,8 @@
 param(
-    [Parameter(Mandatory)][string]$ReleasesUrl
+    [Parameter(Mandatory)][string]$ReleasesUrl,
+    # Portable-only: stage and zip without building the Inno Setup
+    # installer (for machines without Inno Setup installed).
+    [switch]$SkipInstaller
 )
 $ErrorActionPreference = 'Stop'
 if (-not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
@@ -81,19 +84,25 @@ try {
     Copy-Item -LiteralPath 'crates/voice/NOTICE.md' -Destination (Join-Path $stage 'licenses/parakeet-v3.txt')
     Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
     Copy-Item -LiteralPath './target/release/zeron.exe' -Destination "$stage.exe"
-    # The per-user installer wraps the same staged directory (zeron-update.json
-    # included), so installed copies update in place like the portable zip.
-    $iscc = Find-InnoSetupCompiler
-    & $iscc /Qp "/DAppVersion=$version" "/DArch=$arch" `
-        "/DPackageDir=$([IO.Path]::GetFullPath($stage))" `
-        "/DOutputDir=$([IO.Path]::GetFullPath($out))" `
-        ([IO.Path]::GetFullPath((Join-Path $root 'dist/windows/zeron.iss')))
-    if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
-    $setup = Join-Path $out "zeron-$version-windows-$arch-setup.exe"
-    if (-not (Test-Path -LiteralPath $setup)) { throw "Installer not produced: $setup" }
+    if (-not $SkipInstaller) {
+        # The per-user installer wraps the same staged directory (zeron-update.json
+        # included), so installed copies update in place like the portable zip.
+        $iscc = Find-InnoSetupCompiler
+        & $iscc /Qp "/DAppVersion=$version" "/DArch=$arch" `
+            "/DPackageDir=$([IO.Path]::GetFullPath($stage))" `
+            "/DOutputDir=$([IO.Path]::GetFullPath($out))" `
+            ([IO.Path]::GetFullPath((Join-Path $root 'dist/windows/zeron.iss')))
+        if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+        $setup = Join-Path $out "zeron-$version-windows-$arch-setup.exe"
+        if (-not (Test-Path -LiteralPath $setup)) { throw "Installer not produced: $setup" }
+    }
     $file = Split-Path "$stage.exe" -Leaf
     $hash = (Get-FileHash -LiteralPath "$stage.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
     @{ version = $version; files = @{ $file = @{ sha256 = $hash } } } |
         ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $out 'manifest.json')
-    Write-Host "Packaged $stage.zip and $setup"
+    if ($SkipInstaller) {
+        Write-Host "Packaged $stage.zip (installer skipped)"
+    } else {
+        Write-Host "Packaged $stage.zip and $setup"
+    }
 } finally { Pop-Location }

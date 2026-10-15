@@ -6,11 +6,21 @@
 #   ./scripts/dev/build.ps1              # interactive menu (Debug / Release)
 #   ./scripts/dev/build.ps1 -Config Debug
 #   ./scripts/dev/build.ps1 -Config Release
+#   ./scripts/dev/build.ps1 -Portable     # Release build + portable zip
+#   ./scripts/dev/build.ps1 -Setup        # Release build + setup installer
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Config,
 
-    [switch]$Interactive
+    [switch]$Interactive,
+
+    # Package after building (both imply a Release build): portable zip
+    # only, or the per-user setup installer (needs Inno Setup 6).
+    [switch]$Portable,
+    [switch]$Setup,
+
+    # Update feed baked into the packaged output.
+    [string]$ReleasesUrl = 'https://github.com/K0oRui/zeron/releases/latest/download'
 )
 $ErrorActionPreference = 'Stop'
 if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) {
@@ -58,6 +68,14 @@ function Show-Menu {
     Write-Host '    [2] ' -NoNewline -ForegroundColor Cyan
     Write-Host 'Release' -ForegroundColor White
     Write-Host '        cargo build --release --locked -p zeron' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '    [3] ' -NoNewline -ForegroundColor Cyan
+    Write-Host 'Portable' -ForegroundColor White
+    Write-Host '        Release build + portable zip (no Inno Setup needed)' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '    [4] ' -NoNewline -ForegroundColor Cyan
+    Write-Host 'Setup' -ForegroundColor White
+    Write-Host '        Release build + setup installer (needs Inno Setup 6)' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '    [0] ' -NoNewline -ForegroundColor Cyan
     Write-Host 'Exit' -ForegroundColor White
@@ -112,6 +130,23 @@ function Invoke-ZeronBuild([string]$Selected) {
     Write-Host ''
 }
 
+function Invoke-ZeronPackage([switch]$SkipInstaller) {
+    if ($SkipInstaller) {
+        Write-Section 'Portable package'
+    } else {
+        Write-Section 'Setup installer'
+    }
+    $packager = Join-Path $RepoRoot 'scripts/package/package-windows.ps1'
+    $pkgArgs = @('-ReleasesUrl', $ReleasesUrl)
+    if ($SkipInstaller) { $pkgArgs += '-SkipInstaller' }
+    Write-Host "  › package-windows.ps1 $($pkgArgs -join ' ')" -ForegroundColor Gray
+    Write-Host ''
+    & $packager @pkgArgs
+    if ($LASTEXITCODE -ne 0) { throw "packaging exited with code $LASTEXITCODE" }
+    Write-Host '  ✓ Packaging succeeded' -ForegroundColor Green
+    Write-Host ''
+}
+
 # --- interactive menu when -Config was not passed explicitly ---
 $explicitConfig = $PSBoundParameters.ContainsKey('Config')
 $wantMenu = $Interactive -or (-not $explicitConfig)
@@ -135,14 +170,39 @@ if ($wantMenu) {
                 try { Invoke-ZeronBuild 'Release' }
                 catch { Write-Host "  ✗ Build failed: $_" -ForegroundColor Red; Write-Host '' }
             }
+            '3' {
+                try { Invoke-ZeronBuild 'Release'; Invoke-ZeronPackage -SkipInstaller }
+                catch { Write-Host "  ✗ Packaging failed: $_" -ForegroundColor Red; Write-Host '' }
+            }
+            '4' {
+                try { Invoke-ZeronBuild 'Release'; Invoke-ZeronPackage }
+                catch { Write-Host "  ✗ Packaging failed: $_" -ForegroundColor Red; Write-Host '' }
+            }
             '0' { return }
             'q' { return }
             default {
-                Write-Host "  ✗ Unknown choice '$answer' — pick 1, 2, or 0." -ForegroundColor Red
+                Write-Host "  ✗ Unknown choice '$answer' — pick 1, 2, 3, 4, or 0." -ForegroundColor Red
                 Write-Host ''
             }
         }
         Read-Host '  Press Enter to continue' | Out-Null
+    }
+    return
+}
+
+if ($Portable -or $Setup) {
+    if (-not $explicitConfig) { $Config = 'Release' }
+    try {
+        Invoke-ZeronBuild $Config
+        if ($Portable -and -not $Setup) {
+            Invoke-ZeronPackage -SkipInstaller
+        } else {
+            Invoke-ZeronPackage
+        }
+    } catch {
+        Write-Host "  ✗ Packaging failed: $_" -ForegroundColor Red
+        Write-Host ''
+        exit 1
     }
     return
 }
