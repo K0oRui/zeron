@@ -28,7 +28,8 @@ for line in sys.stdin:
     if state.get('broken'):
         print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -32603, 'message': 'offline'}}), flush=True)
         continue
-    result = {} if req['method'] == 'initialize' else {'sessionId': 'test', 'models': {'currentModelId': items[0]['id'], 'availableModels': [dict(item, modelId=item['id']) for item in items]}}
+    result = {'authMethods': [{'id': 'cached_token'}]} if req['method'] == 'initialize' else {'sessionId': 'test', 'models': {'currentModelId': items[0]['id'], 'availableModels': [dict(item, modelId=item['id']) for item in items]}}
+    if req['method'] == 'authenticate': result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
 "#).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();

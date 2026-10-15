@@ -1,10 +1,10 @@
 # Pixel regression for the real pinned GPUI Windows renderer. Requires a desktop.
 # Captures only this synthetic fixture's client HWND, never the entire screen.
-param([string]$Exe = (Join-Path $PSScriptRoot '../target/release/examples/windows-render-fixture.exe'))
+param([string]$Exe = (Join-Path $PSScriptRoot '../../target/release/examples/windows-render-fixture.exe'))
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'This probe requires Windows' }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
-$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('../target/windows-render-' + [guid]::NewGuid().ToString('N'))))
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('../../target/windows-render-' + [guid]::NewGuid().ToString('N'))))
 New-Item -ItemType Directory -Path $root | Out-Null
 Add-Type -AssemblyName System.Drawing
 $image = Join-Path $root 'quadrants.png'

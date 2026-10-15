@@ -1,14 +1,14 @@
 # Native GUI regression: close the real window, require a clean process exit,
 # then reopen the same isolated profile. No real account/provider data is used.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '../target/release/zeron.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '../../target/release/zeron.exe'),
     [int]$Runs = 2
 )
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'This probe requires Windows and an interactive desktop' }
 if ($Runs -lt 1) { throw 'Runs must be positive' }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
-$root = Join-Path $PSScriptRoot ('../target/windows-lifecycle-' + [guid]::NewGuid().ToString('N'))
+$root = Join-Path $PSScriptRoot ('../../target/windows-lifecycle-' + [guid]::NewGuid().ToString('N'))
 $root = [IO.Path]::GetFullPath($root)
 New-Item -ItemType Directory -Path $root | Out-Null
 

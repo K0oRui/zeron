@@ -668,6 +668,7 @@ fn descriptor_surface_matches_registry_expectations() {
             zeron_proto::ReasoningLevel::Low,
             zeron_proto::ReasoningLevel::Medium,
             zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
         ]
     );
 }

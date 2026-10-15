@@ -44,6 +44,8 @@ for line in sys.stdin:
         response = {'error':{'code':429,'message':state.get('error', 'rate limit')}}
     else:
         result = {}
+        if method == 'initialize': result = {'authMethods':[{'id':'cached_token'}]}
+        if method == 'authenticate': result = {}
         if method == 'model/list': result = {'data':[] if state.get('empty') else [{'model':state['id'],'hidden':False,'isDefault':True}], 'nextCursor':None}
         if method == 'session/new': result = {'sessionId':'fixture','models':{'availableModels':[{'modelId':state['id'],'name':state['id']}]}}
         response = {'result':result}

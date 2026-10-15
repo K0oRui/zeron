@@ -1,6 +1,6 @@
 # Check the actual executable: startup must not allocate a console, and CLI
 # help/errors must still reach redirected streams before normal initialization.
-param([string]$Exe = (Join-Path $PSScriptRoot '../target/release/zeron.exe'))
+param([string]$Exe = (Join-Path $PSScriptRoot '../../target/release/zeron.exe'))
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 $bytes = [IO.File]::ReadAllBytes($Exe)
