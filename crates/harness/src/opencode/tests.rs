@@ -1302,13 +1302,91 @@ fn questions_map_to_input_panel_shape() {
             "multiple": true,
         }],
     });
-    let questions = map_questions(&props);
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0].id, "q0");
-    assert_eq!(questions[0].header, "Color");
-    assert_eq!(questions[0].question, "Which color?");
-    assert_eq!(questions[0].options, vec!["Red", "Blue"]);
-    assert!(questions[0].multi_select);
+    let pairs = map_questions(&props);
+    assert_eq!(pairs.len(), 1);
+    let (key, question) = &pairs[0];
+    // A key-less 1.x question falls back to the positional form key.
+    assert_eq!(key, "q0");
+    // Panel ids are minted per question, never taken from the wire.
+    assert_ne!(question.id, "q0");
+    assert_ne!(question.id, map_questions(&props)[0].1.id);
+    assert_eq!(question.header, "Color");
+    assert_eq!(question.question, "Which color?");
+    assert_eq!(question.options, vec!["Red", "Blue"]);
+    assert!(question.multi_select);
+}
+
+/// A live 2.0.24 `form.created` frame (the `question` tool's transport)
+/// folds into the same bus payload the 1.x question path consumes.
+#[test]
+fn v2_question_forms_fold_into_the_input_panel_shape() {
+    let mut tools = HashMap::new();
+    let out = normalize_v2_frame(
+        json!({"id":"evt_form","type":"form.created","data":{"form":{
+        "id":"frm_116e46801001",
+        "sessionID":"ses_1",
+        "title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_1","id":"call_1"}},
+        "fields":[
+            {"key":"q0","title":"Color","description":"Which color?","type":"string",
+             "options":[{"value":"Red","label":"Red","description":"warm"},
+                        {"value":"Blue","label":"Blue","description":"cool"}],
+             "custom":true},
+            {"key":"q1","title":"Toppings","description":"Pick some","type":"multiselect",
+             "options":[{"value":"A","label":"A"},{"value":"B","label":"B"}],"custom":true}
+        ]}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"question.asked","properties":{
+        "id":"frm_116e46801001","sessionID":"ses_1","form":true,
+        "questions":[
+            {"key":"q0","header":"Color","question":"Which color?","multiple":false,
+             "options":[{"label":"Red"},{"label":"Blue"}]},
+            {"key":"q1","header":"Toppings","question":"Pick some","multiple":true,
+             "options":[{"label":"A"},{"label":"B"}]}
+        ]}})]
+    );
+    // Forms from other features (no question metadata) never reach the panel.
+    assert!(
+        normalize_v2_frame(
+            json!({"id":"evt_other","type":"form.created","data":{"form":{
+                "id":"frm_2","sessionID":"ses_1","title":"MCP",
+                "fields":[{"key":"url","title":"URL","type":"string"}]}}}),
+            &mut tools,
+        )
+        .is_empty()
+    );
+}
+
+/// Form answers key by field: one label for a single-select field, the label
+/// array for a multiselect.
+#[test]
+fn form_answers_key_by_field_with_multiselect_arrays() {
+    let pairs = map_questions(&json!({"questions":[
+        {"key":"q0","question":"Which color?","header":"Color","options":[],"multiple":false},
+        {"key":"q1","question":"Pick some","header":"Toppings","options":[],"multiple":true}
+    ]}));
+    let answers = vec![
+        UserInputAnswer {
+            question_id: pairs[0].1.id.clone(),
+            labels: vec!["Red".into()],
+        },
+        UserInputAnswer {
+            question_id: pairs[1].1.id.clone(),
+            labels: vec!["A".into(), "B".into()],
+        },
+    ];
+    assert_eq!(
+        form_answer_body(&pairs, &answers),
+        json!({"answer":{"q0":"Red","q1":["A","B"]}})
+    );
+    // An unanswered single-select degrades to an empty string, never an array.
+    assert_eq!(
+        form_answer_body(&pairs, &[]),
+        json!({"answer":{"q0":"","q1":[]}})
+    );
 }
 
 #[test]
@@ -1636,64 +1714,6 @@ fn v2_frames_normalize_to_v1_payloads() {
         vec![json!({"type":"permission.asked","properties":{
             "id":"per_1","sessionID":"ses_1","action":"external_directory","resources":["/tmp/*"]}})]
     );
-    // Agent questions keep their 1.x name on 2.x too: `question.asked`
-    // passes through, and the `question.v2.asked` spelling normalizes to
-    // it so the session loop answers through one path.
-    for kind in ["question.asked", "question.v2.asked"] {
-        let out = normalize_v2_frame(
-            json!({"id":"evt_12","type":kind,"data":{
-                "id":"que_1","sessionID":"ses_1","questions":[{
-                    "question":"Continue?","header":"Choice",
-                    "options":[{"label":"No"},{"label":"Yes"}]}]}}),
-            &mut tools,
-        );
-        assert_eq!(
-            out,
-            vec![json!({"type":"question.asked","properties":{
-                "id":"que_1","sessionID":"ses_1","questions":[{
-                    "question":"Continue?","header":"Choice",
-                    "options":[{"label":"No"},{"label":"Yes"}]}]}})],
-            "kind {kind}"
-        );
-    }
-    // A question without an id carries no reply route: dropped.
-    assert!(
-        normalize_v2_frame(
-            json!({"id":"evt_13","type":"question.v2.asked","data":{"sessionID":"ses_1"}}),
-            &mut tools,
-        )
-        .is_empty()
-    );
-    // Interactive forms (the 2.x question mechanism): the session is nested
-    // in `data.form`, so it flattens to the session loop's properties shape.
-    let out = normalize_v2_frame(
-        json!({"id":"evt_14","type":"form.created","data":{"form":{
-            "id":"frm_1","sessionID":"ses_1","title":"Pick one",
-            "fields":[{"key":"choice","type":"string",
-                       "options":[{"value":"no","label":"No"}]}]}}}),
-        &mut tools,
-    );
-    assert_eq!(
-        out,
-        vec![json!({"type":"form.created","properties":{
-            "id":"frm_1","sessionID":"ses_1","title":"Pick one",
-            "fields":[{"key":"choice","type":"string",
-                       "options":[{"value":"no","label":"No"}]}]}})]
-    );
-    // A form without an id or owner carries no reply route: dropped.
-    for data in [
-        json!({"form":{"sessionID":"ses_1","fields":[]}}),
-        json!({"form":{"id":"frm_1","fields":[]}}),
-        json!({}),
-    ] {
-        assert!(
-            normalize_v2_frame(
-                json!({"id":"evt_15","type":"form.created","data":data}),
-                &mut tools,
-            )
-            .is_empty()
-        );
-    }
     // Boilerplate frames (catalog sync etc.) drop.
     assert!(
         normalize_v2_frame(
@@ -1862,256 +1882,45 @@ async fn permissions_do_not_auto_answer_agent_questions() {
     assert_eq!(body, json!({"answers": [["No"]]}));
 }
 
+/// 2.x (2.0.24+) answers question forms, keyed by field, on the session's
+/// form route — and the harness emits NO `InputRequested`/`InputResolved` of
+/// its own (the engine's input bridge owns that lifecycle; a twin under
+/// opencode's id folded an unanswerable duplicate chip into the doc).
 #[tokio::test]
-async fn v2_questions_reply_through_the_session_scoped_route() {
-    // Both 2.x event spellings reach the input bridge, and the answer
-    // rides the owning session's question route — never the bare global
-    // one — with the same `{answers}` body v1 uses.
-    for kind in ["question.asked", "question.v2.asked"] {
-        let mut wire = TurnWire::start_policy(false, true, false, Some(false)).await;
-        wire.request("/api/model").await;
-        wire.request("/prompt").await;
-        wire.v2(
-            kind,
-            json!({"id":"que_1","sessionID":"fixture","questions":[{
-                "header":"Choice","question":"Continue?",
-                "options":[{"label":"No"},{"label":"Yes"}]
-            }]}),
-        );
-        let mut saw_requested = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = wire.events.recv().await {
-                match event.unwrap() {
-                    AgentEvent::InputRequested {
-                        request_id,
-                        questions,
-                    } => {
-                        assert_eq!(request_id, "que_1", "kind {kind}");
-                        assert_eq!(questions.len(), 1);
-                        assert_eq!(questions[0].options, vec!["No", "Yes"]);
-                        saw_requested = true;
-                    }
-                    AgentEvent::InputResolved { request_id } => {
-                        assert_eq!(request_id, "que_1", "kind {kind}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("question resolves");
-        assert!(saw_requested, "kind {kind}: InputRequested never surfaced");
-        let body = wire.posted("/question/que_1/reply").await;
-        assert_eq!(body, json!({"answers": [["No"]]}), "kind {kind}");
-        let reply_path = {
-            let posts = wire.posts.lock().unwrap();
-            posts
-                .iter()
-                .find(|(p, _)| p.contains("/question/que_1/reply"))
-                .map(|(p, _)| p.clone())
-                .expect("question reply posted")
-        };
-        assert_eq!(
-            reply_path, "/api/session/fixture/question/que_1/reply",
-            "kind {kind}: v2 must answer session-scoped"
-        );
-
-        wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
-        wire.v2(
-            "session.execution.succeeded",
-            json!({"sessionID":"fixture"}),
-        );
-        assert_eq!(wire.done().await.0, DoneStatus::Completed);
-    }
-}
-
-#[test]
-fn form_fields_map_to_panel_questions() {
-    let fields = json!([
-        {"key": "choice", "type": "string", "title": "Pick one",
-         "description": "Choose wisely",
-         "options": [{"value": "no", "label": "No"}, {"value": "yes", "label": "Yes"}]},
-        {"key": "tags", "type": "multiselect", "title": "Tags",
-         "options": [{"value": "a", "label": "A"}]},
-        {"key": "note", "type": "string", "title": "Note"},
-        {"key": "flag", "type": "boolean", "title": "Flag"},
-        {"key": "count", "type": "integer", "title": "Count"},
-        {"key": "auth", "type": "external", "url": "https://example.com",
-         "title": "Auth", "description": "Sign in"},
-        {"key": "secret", "type": "string", "title": "Secret",
-         "hidden": true, "default": "s3cr3t"},
-        {"key": "skip", "type": "string", "title": "Skip", "hidden": true},
-        {"key": "broken"},
-    ]);
-    let fields = fields.as_array().unwrap().clone();
-    let questions = map_form_questions("Form title", &fields);
-    // Hidden and typeless fields never reach the panel.
-    assert_eq!(
-        questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
-        vec!["choice", "tags", "note", "flag", "count", "auth"]
-    );
-    let choice = &questions[0];
-    assert_eq!(choice.header, "Pick one");
-    assert_eq!(choice.question, "Pick one\n\nChoose wisely");
-    assert_eq!(choice.options, vec!["No", "Yes"]);
-    assert!(!choice.multi_select);
-    assert!(questions[1].multi_select);
-    assert!(questions[2].options.is_empty());
-    assert_eq!(questions[3].options, vec!["true", "false"]);
-    assert_eq!(questions[5].options, vec!["Acknowledge"]);
-    // A field without its own title falls back to the form title.
-    let untitled = map_form_questions("Form title", &[json!({"key": "q", "type": "string"})]);
-    assert_eq!(untitled[0].header, "Form title");
-}
-
-#[test]
-fn form_answers_translate_labels_to_values() {
-    let fields = json!([
-        {"key": "choice", "type": "string", "title": "Pick",
-         "options": [{"value": "no", "label": "No"}, {"value": "yes", "label": "Yes"}]},
-        {"key": "tags", "type": "multiselect",
-         "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]},
-        {"key": "custom_tags", "type": "multiselect", "custom": true,
-         "options": [{"value": "a", "label": "A"}]},
-        {"key": "note", "type": "string"},
-        {"key": "flag", "type": "boolean"},
-        {"key": "count", "type": "integer"},
-        {"key": "auth", "type": "external", "url": "https://example.com"},
-        {"key": "secret", "type": "string", "hidden": true, "default": "s3cr3t"},
-    ]);
-    let fields = fields.as_array().unwrap().clone();
-    let answer = |id: &str, labels: &[&str]| UserInputAnswer {
-        question_id: id.into(),
-        labels: labels.iter().map(|s| s.to_string()).collect(),
-    };
-    let out = form_answer_values(
-        &fields,
-        &[
-            answer("choice", &["Yes"]),
-            answer("tags", &["A", "B"]),
-            answer("custom_tags", &["from-typed"]),
-            answer("note", &["hello"]),
-            answer("flag", &["yes"]),
-            answer("count", &["42"]),
-            answer("auth", &["Acknowledge"]),
-            answer("unknown", &["x"]),
-        ],
-    );
-    assert_eq!(out["choice"], json!("yes"));
-    assert_eq!(out["tags"], json!(["a", "b"]));
-    assert_eq!(out["custom_tags"], json!(["from-typed"]));
-    assert_eq!(out["note"], json!("hello"));
-    assert_eq!(out["flag"], json!(true));
-    assert_eq!(out["count"], json!(42));
-    assert_eq!(out["auth"], json!(true));
-    // Hidden defaults ride along; unknown keys never do.
-    assert_eq!(out["secret"], json!("s3cr3t"));
-    assert!(!out.contains_key("unknown"));
-    // Unparseable scalars and closed-option misses are omitted, never sent raw.
-    let out = form_answer_values(
-        &fields,
-        &[
-            answer("choice", &["Maybe"]),
-            answer("flag", &["perhaps"]),
-            answer("count", &["lots"]),
-            answer("auth", &[]),
-        ],
-    );
-    assert!(!out.contains_key("choice"));
-    assert!(!out.contains_key("flag"));
-    assert!(!out.contains_key("count"));
-    assert!(!out.contains_key("auth"));
-    assert_eq!(out["secret"], json!("s3cr3t"));
-}
-
-#[tokio::test]
-async fn v2_forms_reply_through_the_form_route() {
-    let mut wire = TurnWire::start_policy(false, true, false, Some(false)).await;
+async fn v2_question_forms_answer_through_the_form_route() {
+    let mut wire = TurnWire::start_policy(false, true, false, Some(true)).await;
     wire.request("/api/model").await;
     wire.request("/prompt").await;
     wire.v2(
         "form.created",
-        json!({"form": {
-            "id": "frm_1", "sessionID": "fixture", "title": "Pick one",
-            "fields": [{
-                "key": "choice", "type": "string", "title": "Pick one",
-                "options": [{"value": "no", "label": "No"}, {"value": "yes", "label": "Yes"}],
-            }],
-        }}),
+        json!({"form":{
+        "id":"frm_1","sessionID":"fixture","title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_1","id":"call_1"}},
+        "fields":[
+            {"key":"q0","title":"Color","description":"Which color?","type":"string",
+             "options":[{"value":"Red","label":"Red","description":"warm"}],"custom":true},
+            {"key":"q1","title":"Toppings","description":"Pick some","type":"multiselect",
+             "options":[{"value":"A","label":"A"}],"custom":true}
+        ]}}),
     );
-    let mut saw_requested = false;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = wire.events.recv().await {
-            match event.unwrap() {
-                AgentEvent::InputRequested {
-                    request_id,
-                    questions,
-                } => {
-                    assert_eq!(request_id, "frm_1");
-                    assert_eq!(questions.len(), 1);
-                    assert_eq!(questions[0].options, vec!["No", "Yes"]);
-                    saw_requested = true;
-                }
-                AgentEvent::InputResolved { request_id } => {
-                    assert_eq!(request_id, "frm_1");
-                    break;
-                }
-                _ => {}
-            }
+    let body = wire.posted("/api/session/fixture/form/frm_1/reply").await;
+    assert_eq!(body, json!({"answer":{"q0":"Yes","q1":["Yes"]}}));
+    // Let the pre-fix twin (if any) land, then prove the stream carries none.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut twins = Vec::new();
+    while let Ok(event) = wire.events.try_recv() {
+        let event = event.unwrap();
+        if matches!(
+            event,
+            AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. }
+        ) {
+            twins.push(event);
         }
-    })
-    .await
-    .expect("form resolves");
-    assert!(saw_requested, "InputRequested never surfaced");
-    // The fixture answers "No"; the reply carries the option VALUE.
-    let body = wire.posted("/form/frm_1/reply").await;
-    assert_eq!(body, json!({"answer": {"choice": "no"}}));
-    let reply_path = {
-        let posts = wire.posts.lock().unwrap();
-        posts
-            .iter()
-            .find(|(p, _)| p.contains("/form/frm_1/reply"))
-            .map(|(p, _)| p.clone())
-            .expect("form reply posted")
-    };
-    assert_eq!(
-        reply_path, "/api/session/fixture/form/frm_1/reply",
-        "v2 must answer the session-scoped form route"
+    }
+    assert!(
+        twins.is_empty(),
+        "harness must not emit input lifecycle events itself: {twins:?}"
     );
-
-    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
-    wire.v2(
-        "session.execution.succeeded",
-        json!({"sessionID":"fixture"}),
-    );
-    assert_eq!(wire.done().await.0, DoneStatus::Completed);
-}
-
-#[tokio::test]
-async fn v2_all_hidden_forms_answer_defaults_without_prompting() {
-    let mut wire = TurnWire::start_policy(false, true, false, Some(false)).await;
-    wire.request("/api/model").await;
-    wire.request("/prompt").await;
-    wire.v2(
-        "form.created",
-        json!({"form": {
-            "id": "frm_hidden", "sessionID": "fixture", "title": "Defaults",
-            "fields": [
-                {"key": "mode", "type": "string", "hidden": true, "default": "fast"},
-            ],
-        }}),
-    );
-    // No panel: the defaults go out on their own.
-    let body = wire.posted("/form/frm_hidden/reply").await;
-    assert_eq!(body, json!({"answer": {"mode": "fast"}}));
-
-    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
-    wire.v2(
-        "session.execution.succeeded",
-        json!({"sessionID":"fixture"}),
-    );
-    assert_eq!(wire.done().await.0, DoneStatus::Completed);
 }
 
 #[test]
