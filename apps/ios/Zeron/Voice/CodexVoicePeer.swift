@@ -1,10 +1,7 @@
 import AVFoundation
 import UIKit
-#if canImport(WebRTC)
 import WebRTC
-#endif
 
-#if canImport(WebRTC)
 /// Native audio endpoint. Credentials and tools stay on the execution host.
 /// The ordered oai-events channel and gathered offer mirror the pinned helper.
 ///
@@ -231,19 +228,3 @@ extension CodexVoicePeer: RTCPeerConnectionDelegate, RTCDataChannelDelegate {
         // The host owns canonical transcripts and handoffs. Do not persist a second copy.
     }
 }
-#else
-/// Fallback when the WebRTC package is not wired in. Every operation reports
-/// unavailable so voice setup fails clearly instead of breaking the build.
-@MainActor
-final class CodexVoicePeer: NSObject {
-    enum Failure: Error { case closed, unavailable, permissionDenied, timeout }
-    var onFailure: (() -> Void)?
-    func prepare() async throws { throw Failure.unavailable }
-    func offer() async throws -> String { throw Failure.unavailable }
-    func apply(answer: String) async throws { throw Failure.unavailable }
-    func setMuted(_ muted: Bool) throws { throw Failure.unavailable }
-    func setNearEar(_ near: Bool) {}
-    func levels() async throws -> (UInt16, UInt16) { throw Failure.unavailable }
-    func close() {}
-}
-#endif
