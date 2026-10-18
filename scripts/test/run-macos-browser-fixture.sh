@@ -1,7 +1,7 @@
 #!/bin/bash
 # Use the release Info.plist: bare executables do not enforce the app's ATS policy.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BINARY="$1"
 shift
 BUNDLE="$(mktemp -d "${TMPDIR:-/tmp}/zeron-browser-fixture.XXXXXX")/Fixture.app"
