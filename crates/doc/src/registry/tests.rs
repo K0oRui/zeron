@@ -1552,6 +1552,7 @@ fn sidebar_sections_migration_is_replay_safe_and_preserves_newer_remote_intent()
             name: "Focus".into(),
             collapsed: true,
             session_ids: vec!["session".into()],
+            project_keys: vec![],
         }],
     };
     section_change(&mut a, import.clone());
@@ -1588,6 +1589,79 @@ fn sidebar_sections_migration_is_replay_safe_and_preserves_newer_remote_intent()
     section_change(&mut a, import);
     assert!(a.sidebar_preferences().unwrap().sections.is_empty());
     assert!(a.chat("session").unwrap().is_some());
+}
+
+#[test]
+fn sidebar_sections_place_projects_apart_from_sessions() {
+    use zeron_proto::SidebarSectionChange::*;
+    let mut a = RegistryDoc::new("a");
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let mut repo = space("sp-1", "dev-a", "/work/one");
+    repo.repository_id = Some("r1".into());
+    a.upsert_space(&repo).unwrap();
+    a.upsert_space(&space("sp-2", "dev-a", "/tmp/two")).unwrap();
+    a.upsert_chat(&chat("session", "dev-a")).unwrap();
+    section_change(
+        &mut a,
+        Create {
+            id: "focus".into(),
+            name: "Focus".into(),
+        },
+    );
+    let place = |doc: &mut RegistryDoc, key: &str| {
+        section_change(
+            doc,
+            AssignProject {
+                project_key: key.into(),
+                section_id: Some("focus".into()),
+                after: None,
+                before: None,
+            },
+        )
+    };
+    // A repository project and a checkout without one both key by project_key.
+    place(&mut a, "repo:r1");
+    place(&mut a, "sp-2");
+    section_change(
+        &mut a,
+        Assign {
+            session_id: "session".into(),
+            section_id: Some("focus".into()),
+            after: None,
+            before: None,
+        },
+    );
+    let section = |doc: &RegistryDoc| doc.sidebar_preferences().unwrap().sections[0].clone();
+    assert_eq!(section(&a).project_keys, ["repo:r1", "sp-2"]);
+    assert_eq!(section(&a).session_ids, ["session"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(section(&b).project_keys, ["repo:r1", "sp-2"]);
+    // An unknown project is refused, and moving one out clears its placement.
+    assert!(
+        b.change_sidebar_pin(&zeron_proto::SidebarPinChange::Section {
+            change: AssignProject {
+                project_key: "nope".into(),
+                section_id: Some("focus".into()),
+                after: None,
+                before: None,
+            },
+        })
+        .is_err()
+    );
+    section_change(
+        &mut b,
+        AssignProject {
+            project_key: "repo:r1".into(),
+            section_id: None,
+            after: None,
+            before: None,
+        },
+    );
+    assert_eq!(section(&b).project_keys, ["sp-2"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(section(&a).project_keys, ["sp-2"]);
 }
 
 #[test]

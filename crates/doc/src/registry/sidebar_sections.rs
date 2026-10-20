@@ -8,6 +8,36 @@ use zeron_proto::{
 
 const SECTIONS: &str = "sidebarSections";
 const LOCATIONS: &str = "sidebarLocations";
+/// One placement row per project, kept apart from session placements so a
+/// project key can never be read as a session id by an older client.
+const PROJECT_LOCATIONS: &str = "sidebarProjectLocations";
+
+/// The placement key a row was written with, when it orders its placement.
+fn placement_order_key(row: &RegistryRow) -> Option<String> {
+    row.fields
+        .get("orderKey")
+        .and_then(Value::as_str)
+        .filter(|key| valid_pin_order_key(key))
+        .map(str::to_owned)
+}
+
+/// Keyed placements first, in key order; keyless ones follow by id, where an
+/// append would have put them.
+fn placement_order(
+    a: &(String, Option<String>),
+    b: &(String, Option<String>),
+) -> std::cmp::Ordering {
+    match (&a.1, &b.1) {
+        (Some(x), Some(y)) => x.cmp(y).then(a.0.cmp(&b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(&b.0),
+    }
+}
+
+fn placed_ids(members: Vec<(String, Option<String>)>) -> Vec<String> {
+    members.into_iter().map(|(id, _)| id).collect()
+}
 
 impl RegistryDoc {
     pub(super) fn observe_sidebar_row(&mut self, kind: &str, id: &str) {
@@ -59,6 +89,29 @@ impl RegistryDoc {
         self.sidebar_location(id, Some(pin)) == "pinned"
     }
 
+    /// Whether this document knows `key` as a project: any space whose
+    /// [`zeron_proto::view::project_key`] is `key`.
+    fn live_sidebar_project(&self, key: &str) -> bool {
+        self.overlay_rows(KIND_SPACES).iter().any(|row| {
+            match row.fields.get("repositoryId").and_then(Value::as_str) {
+                Some(repository_id) => format!("repo:{repository_id}") == key,
+                None => row.id == key,
+            }
+        })
+    }
+
+    /// A project's section, from its own placement register.
+    fn sidebar_project_location(&self, key: &str) -> String {
+        self.overlay_row(PROJECT_LOCATIONS, key)
+            .and_then(|r| {
+                r.fields
+                    .get("location")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn write_sidebar_location(&mut self, id: &str, location: &str) {
         self.observe_sidebar_row(LOCATIONS, id);
         self.observe_sidebar_row(KIND_SIDEBAR_PINS, id);
@@ -105,11 +158,8 @@ impl RegistryDoc {
         self.ordered_sidebar_sections()
             .into_iter()
             .filter_map(|(row, _)| {
-                let session_ids = self
-                    .sidebar_section_members(&row.id)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
+                let session_ids = placed_ids(self.sidebar_section_members(&row.id));
+                let project_keys = placed_ids(self.sidebar_project_members(&row.id));
                 Some(SidebarSection {
                     name: row.fields.get("name")?.as_str()?.into(),
                     collapsed: row
@@ -119,9 +169,28 @@ impl RegistryDoc {
                         .unwrap_or(false),
                     id: row.id,
                     session_ids,
+                    project_keys,
                 })
             })
             .collect()
+    }
+
+    /// A section's projects in their placed order, each with its order key.
+    /// A placement for a project this document no longer knows is ignored.
+    fn sidebar_project_members(&self, section: &str) -> Vec<(String, Option<String>)> {
+        let mut members: Vec<_> = self
+            .overlay_rows(PROJECT_LOCATIONS)
+            .into_iter()
+            .filter(|r| {
+                self.live_sidebar_project(&r.id) && self.sidebar_project_location(&r.id) == section
+            })
+            .map(|r| {
+                let key = placement_order_key(&r);
+                (r.id, key)
+            })
+            .collect();
+        members.sort_by(placement_order);
+        members
     }
 
     /// A section's members in their placed order, each with its order key.
@@ -138,22 +207,12 @@ impl RegistryDoc {
             .map(|r| {
                 // A key only orders the placement it was written with: a later
                 // keyless move into another section must not inherit it.
-                let key = r
-                    .fields
-                    .get("orderKey")
-                    .and_then(Value::as_str)
-                    .filter(|key| valid_pin_order_key(key))
-                    .filter(|_| r.clocks.get("orderKey") >= r.clocks.get("location"))
-                    .map(str::to_owned);
+                let key = placement_order_key(&r)
+                    .filter(|_| r.clocks.get("orderKey") >= r.clocks.get("location"));
                 (r.id, key)
             })
             .collect();
-        members.sort_by(|a, b| match (&a.1, &b.1) {
-            (Some(x), Some(y)) => x.cmp(y).then(a.0.cmp(&b.0)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.0.cmp(&b.0),
-        });
+        members.sort_by(placement_order);
         members
     }
 
@@ -168,6 +227,18 @@ impl RegistryDoc {
     ) -> Result<(String, String), DocError> {
         let members = self.sidebar_section_members(section);
         self.place_among(LOCATIONS, members, session, after, before)
+    }
+
+    /// [`Self::place_in_sidebar_section`] against the project register.
+    fn place_in_sidebar_project(
+        &mut self,
+        section: &str,
+        key: &str,
+        after: &Option<String>,
+        before: &Option<String>,
+    ) -> Result<(String, String), DocError> {
+        let members = self.sidebar_project_members(section);
+        self.place_among(PROJECT_LOCATIONS, members, key, after, before)
     }
 
     /// Place `moving` among `kind` rows already in their placed order, between
@@ -225,7 +296,7 @@ impl RegistryDoc {
         Ok((key, hlc))
     }
 
-    /// [`Self::write_sidebar_location`] into a section, at a placed position.
+    /// [`Self::write_sidebar_placement`] into a section, at a placed position.
     /// One op, one clock: the key orders exactly this placement.
     fn write_sidebar_placement(
         &mut self,
@@ -244,6 +315,41 @@ impl RegistryDoc {
             set: Some(fields([
                 ("location", json!(section)),
                 ("orderKey", json!(key)),
+            ])),
+            hlc,
+            clocks: None,
+        }]);
+        Ok(())
+    }
+
+    /// A project's placement, from its own register.
+    fn write_sidebar_project_location(&mut self, key: &str, location: &str) {
+        self.observe_sidebar_row(PROJECT_LOCATIONS, key);
+        self.write(
+            PROJECT_LOCATIONS,
+            key,
+            OpKind::Upsert,
+            fields([("location", json!(location))]),
+        );
+    }
+
+    fn write_sidebar_project_placement(
+        &mut self,
+        project_key: &str,
+        section: &str,
+        after: &Option<String>,
+        before: &Option<String>,
+    ) -> Result<(), DocError> {
+        self.observe_sidebar_row(PROJECT_LOCATIONS, project_key);
+        let (order_key, hlc) =
+            self.place_in_sidebar_project(section, project_key, after, before)?;
+        self.enqueue_ops(vec![RowOp {
+            kind: PROJECT_LOCATIONS.into(),
+            id: project_key.into(),
+            op: OpKind::Upsert,
+            set: Some(fields([
+                ("location", json!(section)),
+                ("orderKey", json!(order_key)),
             ])),
             hlc,
             clocks: None,
@@ -293,6 +399,20 @@ impl RegistryDoc {
             {
                 return Err(DocError::Schema("Invalid section membership".into()));
             }
+            AssignProject {
+                project_key,
+                section_id,
+                after,
+                before,
+            } if !valid_id(project_key)
+                || section_id.as_ref().is_some_and(|id| !valid_section_id(id))
+                || [after, before]
+                    .into_iter()
+                    .flatten()
+                    .any(|anchor| !valid_id(anchor)) =>
+            {
+                return Err(DocError::Schema("Invalid section project".into()));
+            }
             Move { id, after, before }
                 if !valid_section_id(id)
                     || [after, before]
@@ -307,6 +427,7 @@ impl RegistryDoc {
                     !valid_section_id(&s.id)
                         || !valid_name(&s.name)
                         || s.session_ids.iter().any(|id| !valid_id(id))
+                        || s.project_keys.iter().any(|key| !valid_id(key))
                 }) =>
             {
                 return Err(DocError::Schema("Invalid section import".into()));
@@ -397,6 +518,34 @@ impl RegistryDoc {
                     })?;
                 }
             }
+            AssignProject {
+                project_key,
+                section_id,
+                after,
+                before,
+            } => {
+                if section_id
+                    .as_ref()
+                    .is_some_and(|id| !self.live_sidebar_section(id))
+                {
+                    return Err(DocError::Schema("Section no longer exists".into()));
+                }
+                if !self.live_sidebar_project(project_key) {
+                    return Err(DocError::Schema("Project no longer exists".into()));
+                }
+                match section_id {
+                    Some(id) => {
+                        self.write_sidebar_project_placement(project_key, id, after, before)?
+                    }
+                    None => self.write_sidebar_project_location(project_key, ""),
+                }
+                if let Some(id) = section_id {
+                    self.change_sidebar_section(&Collapse {
+                        id: id.clone(),
+                        collapsed: false,
+                    })?;
+                }
+            }
             Import { sections } => {
                 for section in sections {
                     // Replay and migration from another device must not undo a
@@ -415,6 +564,13 @@ impl RegistryDoc {
                         {
                             // Appending one by one keeps the imported order.
                             self.write_sidebar_placement(id, &section.id, &None, &None)?;
+                        }
+                    }
+                    for key in &section.project_keys {
+                        if self.overlay_row(PROJECT_LOCATIONS, key).is_none()
+                            && self.live_sidebar_project(key)
+                        {
+                            self.write_sidebar_project_placement(key, &section.id, &None, &None)?;
                         }
                     }
                     self.change_sidebar_section(&Collapse {

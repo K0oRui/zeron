@@ -1362,6 +1362,21 @@ struct SidebarSectionDragState {
     generation: u64,
 }
 
+/// Drag payload for moving a project between its group and a custom section.
+#[derive(Clone)]
+struct SidebarProjectDrag {
+    project_key: String,
+}
+
+/// A placed project's sessions, rendered as a nested group in its section.
+pub(super) struct SidebarSectionProject {
+    pub key: String,
+    pub label: String,
+    /// The first row's chat, for the group's project icon.
+    pub first_chat: Option<String>,
+    pub rows: Vec<SidebarKeyedRow>,
+}
+
 type SidebarKeyedRow = (String, f32, AnyElement);
 
 struct SidebarSessionRows {
@@ -9705,6 +9720,13 @@ impl Shell {
                     .on_drop::<SidebarSessionDrag>(cx.listener(
                         |this, _: &SidebarSessionDrag, _, cx| {
                             this.cancel_sidebar_session_transfer(cx);
+                        },
+                    ))
+                    // A project released outside every section returns to its
+                    // own group.
+                    .on_drop::<SidebarProjectDrag>(cx.listener(
+                        |this, payload: &SidebarProjectDrag, _, cx| {
+                            this.finish_sidebar_project_transfer(payload, None, cx);
                         },
                     ))
                     // A section reorder lands wherever it is released in the list.

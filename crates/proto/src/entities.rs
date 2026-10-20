@@ -44,6 +44,10 @@ pub struct SidebarSection {
     pub name: String,
     #[serde(default)]
     pub session_ids: Vec<String>,
+    /// Projects placed here by their [`crate::view::project_key`]. A project
+    /// claims the sessions of every checkout that shares its repository.
+    #[serde(default)]
+    pub project_keys: Vec<String>,
     #[serde(default)]
     pub collapsed: bool,
 }

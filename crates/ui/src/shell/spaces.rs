@@ -928,6 +928,51 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_sections_place_projects_ahead_of_loose_sessions(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                    })).unwrap()).collect();
+                    state.chats = [("a-new", "a"), ("b-new", "b"), ("a-old", "a")]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, (id, project))| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                            chat
+                        })
+                        .collect();
+                });
+                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
+                shell.settings.sidebar_sections_by_profile.insert(
+                    key,
+                    vec![crate::settings::SidebarSection {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        session_ids: vec![],
+                        // The placed order leads, not the projects' activity.
+                        project_keys: vec!["b".into(), "a".into()],
+                        collapsed: false,
+                    }],
+                );
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["b-new", "a-new", "a-old"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -4924,29 +4969,75 @@ impl Shell {
             .iter()
             .partition(|(_, chat)| pinned_order.contains(&chat.id));
         // Section order wins: custom sections list their sessions manually,
-        // so follow the section's own order, not recency.
+        // so follow the section's own order, not recency. A project placed in
+        // a section claims its sessions there, ahead of the loose rows.
+        fn section_of<'a>(
+            chat: &zeron_proto::Chat,
+            sections: &'a [zeron_proto::SidebarSection],
+            projects: &std::collections::HashMap<&str, &'a zeron_proto::SidebarSection>,
+            state: &AppState,
+        ) -> Option<&'a zeron_proto::SidebarSection> {
+            if let Some(section) = sections
+                .iter()
+                .find(|section| section.session_ids.contains(&chat.id))
+            {
+                return Some(section);
+            }
+            state.space_for_chat(chat).and_then(|space| {
+                projects
+                    .get(zeron_proto::view::project_key(space).as_str())
+                    .copied()
+            })
+        }
+        let project_owner: std::collections::HashMap<&str, &zeron_proto::SidebarSection> =
+            if organization == SidebarOrganization::ByProject {
+                custom_sections
+                    .iter()
+                    .flat_map(|section| {
+                        section
+                            .project_keys
+                            .iter()
+                            .map(move |key| (key.as_str(), section))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let mut custom_order = Vec::new();
         let listed: HashSet<&str> = chats
             .iter()
             .map(|(_, chat)| chat.id.as_str())
             .collect();
+        let mut placed: HashSet<&str> = HashSet::new();
         for section in custom_sections {
-            if !section.collapsed {
-                custom_order.extend(
-                    section
-                        .session_ids
-                        .iter()
-                        .filter(|id| listed.contains(id.as_str()))
-                        .cloned(),
-                );
+            if section.collapsed {
+                continue;
+            }
+            for key in &section.project_keys {
+                for (_, chat) in chats.iter().copied() {
+                    let belongs = section_of(chat, custom_sections, &project_owner, state)
+                        .is_some_and(|owner| owner.id == section.id)
+                        && state
+                            .space_for_chat(chat)
+                            .is_some_and(|space| zeron_proto::view::project_key(space) == *key);
+                    if belongs
+                        && listed.contains(chat.id.as_str())
+                        && placed.insert(chat.id.as_str())
+                    {
+                        custom_order.push(chat.id.clone());
+                    }
+                }
+            }
+            for id in &section.session_ids {
+                if listed.contains(id.as_str()) && placed.insert(id.as_str()) {
+                    custom_order.push(id.clone());
+                }
             }
         }
         let chats: Vec<&(_, _)> = chats
             .into_iter()
             .filter(|(_, chat)| {
-                !custom_sections
-                    .iter()
-                    .any(|section| section.session_ids.contains(&chat.id))
+                section_of(chat, custom_sections, &project_owner, state).is_none()
             })
             .collect();
         let ordered = if organization != SidebarOrganization::InOneList {
@@ -5083,13 +5174,36 @@ impl Shell {
     }
 
     /// A device/project group's key in `sidebar_collapsed_groups`.
-    fn sidebar_group_collapse_key(&self, group: &str) -> String {
+    pub(super) fn sidebar_group_collapse_key(&self, group: &str) -> String {
         let organization = match self.settings.sidebar_organization {
             SidebarOrganization::ByDevice => "device",
             SidebarOrganization::ByProject => "project",
             SidebarOrganization::InOneList => "list",
         };
         format!("{organization}:{group}")
+    }
+
+    /// The custom section a chat's row belongs to: its explicit placement, or
+    /// in `ByProject` mode the section that holds its project.
+    fn sidebar_section_for_chat(
+        &self,
+        chat: &zeron_proto::Chat,
+        cx: &App,
+    ) -> Option<crate::settings::SidebarSection> {
+        let sections = self.active_sidebar_sections(cx);
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.session_ids.contains(&chat.id))
+        {
+            return Some(section.clone());
+        }
+        if self.settings.sidebar_organization != SidebarOrganization::ByProject {
+            return None;
+        }
+        let key = zeron_proto::view::project_key(self.state.read(cx).space_for_chat(chat)?);
+        sections
+            .into_iter()
+            .find(|section| section.project_keys.contains(&key))
     }
 
     /// Open whatever hides `chat_id`'s sidebar row — the sidebar itself, the
@@ -5123,11 +5237,7 @@ impl Shell {
                     self.pinned_open = true;
                     self.queue_sidebar_reveal("pinned");
                 }
-            } else if let Some(section) = self
-                .active_sidebar_sections(cx)
-                .into_iter()
-                .find(|section| section.session_ids.contains(&chat.id))
-            {
+            } else if let Some(section) = self.sidebar_section_for_chat(chat, cx) {
                 if section.collapsed {
                     if !self.change_sidebar_section(
                         zeron_proto::SidebarSectionChange::Collapse {
@@ -5139,6 +5249,20 @@ impl Shell {
                         return false;
                     }
                     self.queue_sidebar_reveal(&format!("custom:{}", section.id));
+                }
+                // A project placed here may hide the row in its nested group.
+                let project_key = self
+                    .state
+                    .read(cx)
+                    .space_for_chat(chat)
+                    .map(zeron_proto::view::project_key);
+                if let Some(key) = project_key {
+                    if self.settings.sidebar_organization == SidebarOrganization::ByProject
+                        && section.project_keys.contains(&key)
+                    {
+                        let collapse_key = self.sidebar_group_collapse_key(&key);
+                        self.sidebar_collapsed_groups.remove(&collapse_key);
+                    }
                 }
             } else if let Some(group) = self.sidebar_group_key(self.state.read(cx), chat) {
                 let collapse_key = self.sidebar_group_collapse_key(&group);
@@ -5267,6 +5391,34 @@ impl Shell {
             .as_ref()
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let custom_sections = self.active_sidebar_sections(cx);
+        let by_project = self.settings.sidebar_organization == SidebarOrganization::ByProject;
+        let project_labels: std::collections::HashMap<String, String> = {
+            let state = self.state.read(cx);
+            state
+                .spaces
+                .iter()
+                .map(|space| {
+                    (
+                        zeron_proto::view::project_key(space),
+                        state.representative_space(space).display_name().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let section_of_project: std::collections::HashMap<String, usize> = if by_project {
+            custom_sections
+                .iter()
+                .enumerate()
+                .flat_map(|(index, section)| {
+                    section
+                        .project_keys
+                        .iter()
+                        .map(move |key| (key.clone(), index))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = {
             let state = self.state.read(cx);
@@ -5378,6 +5530,19 @@ impl Shell {
                 custom_groups[index].1.push(row);
                 continue;
             }
+            // A project placed in a section takes its sessions with it, out of
+            // the project's own group. Explicit session placements win.
+            if let Some(index) = by_project
+                .then(|| {
+                    row.group
+                        .as_ref()
+                        .and_then(|(key, _)| section_of_project.get(key).copied())
+                })
+                .flatten()
+            {
+                custom_groups[index].1.push(row);
+                continue;
+            }
             if let Some((_, existing)) = regular_groups
                 .iter_mut()
                 .find(|(group, _)| group == &row.group)
@@ -5388,12 +5553,27 @@ impl Shell {
             }
         }
         // Sections keep their placed order, as Pinned does, not activity order.
+        // Placed projects come first, in their own order, then loose sessions.
         for ((_, rows), section) in custom_groups.iter_mut().zip(&custom_sections) {
             rows.sort_by_key(|row| {
-                section
-                    .session_ids
-                    .iter()
-                    .position(|id| id == &row.chat.id)
+                let project = by_project
+                    .then(|| {
+                        row.group.as_ref().and_then(|(key, _)| {
+                            section.project_keys.iter().position(|placed| placed == key)
+                        })
+                    })
+                    .flatten();
+                match project {
+                    Some(index) => (0u8, index),
+                    None => (
+                        1,
+                        section
+                            .session_ids
+                            .iter()
+                            .position(|id| id == &row.chat.id)
+                            .unwrap_or(usize::MAX),
+                    ),
+                }
             });
         }
         if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
@@ -5575,7 +5755,22 @@ impl Shell {
                 .then(|| rows.first().map(|row| row.chat.id.clone()))
                 .flatten();
             let mut rendered_rows = Vec::with_capacity(rows.len());
+            // A custom section's placed projects render as nested groups ahead
+            // of its loose sessions.
+            let section_projects: Option<&Vec<String>> = by_project
+                .then(|| {
+                    group
+                        .as_ref()
+                        .and_then(|(key, _)| key.strip_prefix("section:"))
+                        .and_then(|id| custom_sections.iter().find(|section| section.id == id))
+                        .map(|section| &section.project_keys)
+                })
+                .flatten();
+            let mut project_rows: Vec<(String, Option<String>, Vec<SidebarKeyedRow>)> = Vec::new();
             for (group_index, row) in rows.into_iter().enumerate() {
+                let row_project = row.group.as_ref().map(|(key, _)| key.clone());
+                let in_project_block = section_projects
+                    .is_some_and(|keys| row_project.as_ref().is_some_and(|key| keys.contains(key)));
                 let ActiveChatRow {
                     status,
                     chat,
@@ -5660,7 +5855,7 @@ impl Shell {
                     remote,
                     if is_moving { None } else { drag },
                     jump_label,
-                    self.settings.sidebar_show_project_icon && !project_group,
+                    self.settings.sidebar_show_project_icon && !project_group && !in_project_block,
                     None,
                     theme,
                     cx,
@@ -5727,7 +5922,21 @@ impl Shell {
                         },
                     ))
                     .into_any_element();
-                rendered_rows.push((format!("c:{}", chat.id), slot_height, element));
+                let keyed_row = (format!("c:{}", chat.id), slot_height, element);
+                if in_project_block {
+                    let project_key = row_project.clone().unwrap_or_default();
+                    match project_rows
+                        .iter_mut()
+                        .find(|(key, _, _)| key == &project_key)
+                    {
+                        Some((_, _, rows)) => rows.push(keyed_row),
+                        None => {
+                            project_rows.push((project_key, Some(chat.id.clone()), vec![keyed_row]))
+                        }
+                    }
+                } else {
+                    rendered_rows.push(keyed_row);
+                }
             }
 
             let Some((key, label)) = group else {
@@ -5759,8 +5968,33 @@ impl Shell {
                                 profile_key,
                                 ids,
                             });
+                    let projects = section
+                        .project_keys
+                        .iter()
+                        .map(|project_key| {
+                            let (first_chat, rows) = match project_rows
+                                .iter_mut()
+                                .find(|(key, _, _)| key == project_key)
+                            {
+                                Some((_, first_chat, rows)) => {
+                                    (first_chat.clone(), std::mem::take(rows))
+                                }
+                                None => (None, Vec::new()),
+                            };
+                            SidebarSectionProject {
+                                key: project_key.clone(),
+                                label: project_labels
+                                    .get(project_key)
+                                    .cloned()
+                                    .unwrap_or_else(|| project_key.clone()),
+                                first_chat,
+                                rows,
+                            }
+                        })
+                        .collect();
                     rendered.push(self.render_custom_sidebar_section(
                         section.clone(),
+                        projects,
                         rendered_rows,
                         drag_group,
                         drag,
@@ -5877,7 +6111,25 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }));
+                }))
+                // A project drags into a custom section from its group header.
+                .when_some(
+                    (project_group && self.sidebar_section_projects_supported(cx)).then(|| {
+                        SidebarProjectDrag {
+                            project_key: key.clone(),
+                        }
+                    }),
+                    |el, payload| {
+                        let shell = cx.entity();
+                        el.on_drag(payload, move |_payload, _, _, cx| {
+                            shell.update(cx, |shell, cx| {
+                                shell.begin_sidebar_project_drag(cx);
+                            });
+                            cx.stop_propagation();
+                            cx.new(|_| DragGhost)
+                        })
+                    },
+                );
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,

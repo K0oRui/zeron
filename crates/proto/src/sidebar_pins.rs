@@ -161,6 +161,19 @@ pub enum SidebarSectionChange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<String>,
     },
+    /// Move a project into a section (or out of every section). The project
+    /// key is [`crate::view::project_key`]; its sessions follow on render.
+    /// Engines without [`crate::capabilities::SIDEBAR_SECTION_PROJECTS_V1`]
+    /// reject it outright.
+    #[serde(rename_all = "camelCase")]
+    AssignProject {
+        project_key: String,
+        section_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
     Import {
         sections: Vec<crate::SidebarSection>,
     },
@@ -199,6 +212,7 @@ impl SidebarSectionChange {
                         id: id.clone(),
                         name: name.clone(),
                         session_ids: vec![],
+                        project_keys: vec![],
                         collapsed: false,
                     });
                 }
@@ -225,6 +239,21 @@ impl SidebarSectionChange {
                     if section_id.as_ref() == Some(&s.id) {
                         let index = section_insert_index(&s.session_ids, after, before);
                         s.session_ids.insert(index, session_id.clone());
+                        s.collapsed = false;
+                    }
+                }
+            }
+            Self::AssignProject {
+                project_key,
+                section_id,
+                after,
+                before,
+            } => {
+                for s in sections {
+                    s.project_keys.retain(|key| key != project_key);
+                    if section_id.as_ref() == Some(&s.id) {
+                        let index = section_insert_index(&s.project_keys, after, before);
+                        s.project_keys.insert(index, project_key.clone());
                         s.collapsed = false;
                     }
                 }
@@ -297,6 +326,7 @@ mod tests {
             id: "s".into(),
             name: "S".into(),
             session_ids: vec!["a".into(), "b".into(), "c".into()],
+            project_keys: vec![],
             collapsed: true,
         }];
         SidebarSectionChange::Assign {
@@ -330,11 +360,66 @@ mod tests {
         );
     }
     #[test]
+    fn project_assign_places_keys_and_follows_the_session_rule() {
+        let section = |id: &str, projects: &[&str]| crate::SidebarSection {
+            id: id.into(),
+            name: id.into(),
+            session_ids: vec![],
+            project_keys: projects.iter().map(|k| (*k).to_string()).collect(),
+            collapsed: true,
+        };
+        let mut sections = vec![section("s", &["a", "b", "c"]), section("t", &[])];
+        SidebarSectionChange::AssignProject {
+            project_key: "c".into(),
+            section_id: Some("s".into()),
+            after: Some("a".into()),
+            before: Some("b".into()),
+        }
+        .project(&mut sections);
+        assert_eq!(sections[0].project_keys, ["a", "c", "b"]);
+        assert!(!sections[0].collapsed);
+        // Moving to another section leaves the first and uncollapses the target.
+        SidebarSectionChange::AssignProject {
+            project_key: "c".into(),
+            section_id: Some("t".into()),
+            after: None,
+            before: None,
+        }
+        .project(&mut sections);
+        assert_eq!(sections[0].project_keys, ["a", "b"]);
+        assert_eq!(sections[1].project_keys, ["c"]);
+        // No section removes it everywhere.
+        SidebarSectionChange::AssignProject {
+            project_key: "c".into(),
+            section_id: None,
+            after: None,
+            before: None,
+        }
+        .project(&mut sections);
+        assert!(
+            sections
+                .iter()
+                .all(|s| !s.project_keys.contains(&"c".to_string()))
+        );
+        let json = serde_json::to_value(SidebarSectionChange::AssignProject {
+            project_key: "repo:x".into(),
+            section_id: Some("t".into()),
+            after: None,
+            before: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"action": "assignProject", "projectKey": "repo:x", "sectionId": "t"})
+        );
+    }
+    #[test]
     fn section_move_reorders_sections_by_anchor() {
         let section = |id: &str| crate::SidebarSection {
             id: id.into(),
             name: id.into(),
             session_ids: vec![],
+            project_keys: vec![],
             collapsed: false,
         };
         let mut sections = vec![section("a"), section("b"), section("c")];

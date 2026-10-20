@@ -101,6 +101,28 @@ impl Shell {
                     }
                 }
             }
+            if let SidebarSectionChange::AssignProject {
+                project_key,
+                section_id,
+                ..
+            } = &change
+            {
+                if section_id
+                    .as_ref()
+                    .is_some_and(|id| !self.active_sidebar_sections(cx).iter().any(|s| &s.id == id))
+                {
+                    return false;
+                }
+                let known = self
+                    .state
+                    .read(cx)
+                    .spaces
+                    .iter()
+                    .any(|space| zeron_proto::view::project_key(space) == *project_key);
+                if !known {
+                    return false;
+                }
+            }
             change.project(
                 self.settings
                     .sidebar_sections_by_profile
@@ -112,7 +134,11 @@ impl Shell {
             true
         } else {
             if !self.state.read(cx).sidebar_preferences.can_edit() {
-                self.show_notice(crate::toast::ToastKind::Error, "Sidebar is still syncing. Try again shortly.", cx);
+                self.show_notice(
+                    crate::toast::ToastKind::Error,
+                    "Sidebar is still syncing. Try again shortly.",
+                    cx,
+                );
                 cx.notify();
                 return false;
             }
@@ -271,6 +297,7 @@ impl Shell {
     pub(super) fn render_custom_sidebar_section(
         &mut self,
         section: SidebarSection,
+        projects: Vec<SidebarSectionProject>,
         rows: Vec<SidebarKeyedRow>,
         drag_group: String,
         drag: Option<SidebarSectionDrag>,
@@ -279,15 +306,105 @@ impl Shell {
     ) -> SidebarKeyedRow {
         let id = section.id.clone();
         let open = !section.collapsed;
-        let empty = rows.is_empty();
         let extra = self.sidebar_transfer_extra_gap(&drag_group);
+        let session_count = rows.len()
+            + projects
+                .iter()
+                .map(|project| project.rows.len())
+                .sum::<usize>();
+        // Placed projects lead their sessions, each as a nested disclosure.
+        // Collapsing one keeps the section's own body at the rows that remain.
+        let mut children: Vec<SidebarKeyedRow> = Vec::new();
+        for project in projects {
+            let SidebarSectionProject {
+                key,
+                label,
+                first_chat,
+                rows: project_rows,
+            } = project;
+            let collapse_key = self.sidebar_group_collapse_key(&key);
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let motion_key = format!("group:{collapse_key}");
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
+            let count = project_rows.len();
+            let icon = first_chat.map(|chat_id| {
+                self.render_project_group_icon(&chat_id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, cx)
+            });
+            let toggle_key = collapse_key.clone();
+            let header = spaces::sidebar_disclosure_header(
+                theme,
+                icon,
+                label.into(),
+                collapsed.then_some(count),
+                None,
+                chevron,
+            )
+            .id(SharedString::from(format!("section-project-{id}-{key}")))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.sidebar_collapsed_groups.remove(&toggle_key) {
+                    this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                }
+                cx.notify();
+            }))
+            // A placed project drags back out, to its own group or another
+            // section, from this header as well as from its group header.
+            .when_some(
+                self.sidebar_section_projects_supported(cx)
+                    .then(|| SidebarProjectDrag {
+                        project_key: key.clone(),
+                    }),
+                |el, payload| {
+                    let shell = cx.entity();
+                    el.on_drag(payload, move |_payload, _, _, cx| {
+                        shell.update(cx, |shell, cx| {
+                            shell.begin_sidebar_project_drag(cx);
+                        });
+                        cx.stop_propagation();
+                        cx.new(|_| DragGhost)
+                    })
+                },
+            );
+            let body_height = if collapsed {
+                0.0
+            } else {
+                project_rows
+                    .iter()
+                    .map(|(_, height, _)| *height)
+                    .sum::<f32>()
+                    + SIDEBAR_LIST_GAP * project_rows.len().saturating_sub(1) as f32
+            };
+            let block = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .when(!collapsed, |el| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .pl(px(10.0))
+                            .gap(px(SIDEBAR_LIST_GAP))
+                            .children(project_rows.into_iter().map(|(_, _, row)| row)),
+                    )
+                })
+                .into_any_element();
+            children.push((
+                format!("sp:{key}"),
+                spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT + body_height,
+                block,
+            ));
+        }
+        children.extend(rows);
+        let empty = children.is_empty();
         let height = spaces::SIDEBAR_DISCLOSURE_BODY_INSET
             + extra
             + if empty {
                 40.0
             } else {
-                rows.iter().map(|(_, h, _)| h).sum::<f32>()
-                    + SIDEBAR_LIST_GAP * rows.len().saturating_sub(1) as f32
+                children.iter().map(|(_, h, _)| h).sum::<f32>()
+                    + SIDEBAR_LIST_GAP * children.len().saturating_sub(1) as f32
             };
         let motion_key = format!("custom:{id}");
         self.begin_queued_sidebar_reveal(&motion_key, open, height);
@@ -298,7 +415,6 @@ impl Shell {
         let show_menu = self.section_header_hover.as_ref() == Some(&id)
             || self.section_menu.as_ref().is_some_and(|(s, _)| s == &id);
         let chevron = self.sidebar_disclosure_chevron(&motion_key, open, theme);
-        let session_count = rows.len();
         let menu_button = show_menu.then(|| {
             div()
                 .id(SharedString::from(format!("section-menu-{menu_id}")))
@@ -368,6 +484,11 @@ impl Shell {
                 cx.new(|_| DragGhost)
             })
         });
+        let drop_hint = if self.settings.sidebar_organization == SidebarOrganization::ByProject {
+            "Drop sessions or projects here"
+        } else {
+            "Drop sessions here"
+        };
         let content = div()
             .w_full()
             .flex()
@@ -383,10 +504,10 @@ impl Shell {
                         .items_center()
                         .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.text_muted.opacity(0.5))
-                        .child("Drop sessions here"),
+                        .child(drop_hint),
                 )
             })
-            .children(rows.into_iter().map(|(_, _, row)| row))
+            .children(children.into_iter().map(|(_, _, row)| row))
             .when(extra > 0.0, |el| el.child(div().h(px(extra)).flex_none()));
         let body = self.render_sidebar_disclosure_body(
             &motion_key,
@@ -395,6 +516,7 @@ impl Shell {
             content.into_any_element(),
         );
         let drop_id = id.clone();
+        let project_drop_id = id.clone();
         let element = div()
             .id(SharedString::from(format!("custom-section-{id}")))
             .w_full()
@@ -430,6 +552,10 @@ impl Shell {
                 );
                 cx.stop_propagation();
             }))
+            .on_drop::<SidebarProjectDrag>(cx.listener(move |this, payload, _, cx| {
+                this.finish_sidebar_project_transfer(payload, Some(&project_drop_id), cx);
+                cx.stop_propagation();
+            }))
             .child(header)
             .child(body)
             .into_any_element();
@@ -453,6 +579,54 @@ impl Shell {
                         .engine_info()
                         .supports(zeron_proto::capabilities::SIDEBAR_SECTION_ORDER_V1)
                 }))
+    }
+
+    /// Projects join sections only where the engine persists them; local
+    /// workspaces keep the placement on this device.
+    pub(super) fn sidebar_section_projects_supported(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.workspace_scope == Some(WorkspaceScope::Local)
+            || (state.sidebar_preferences.can_edit()
+                && state.engine().is_some_and(|engine| {
+                    engine
+                        .engine_info()
+                        .supports(zeron_proto::capabilities::SIDEBAR_SECTION_PROJECTS_V1)
+                }))
+    }
+
+    pub(super) fn begin_sidebar_project_drag(&mut self, cx: &mut Context<Self>) {
+        self.cancel_sidebar_session_transfer(cx);
+        self.section_menu = None;
+    }
+
+    /// Move a project into `target`, or back to its own group when it is
+    /// `None`. Its sessions follow it wherever it lands.
+    pub(super) fn finish_sidebar_project_transfer(
+        &mut self,
+        payload: &SidebarProjectDrag,
+        target: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_section_projects_supported(cx) {
+            return;
+        }
+        if let Some(id) = target
+            && !self
+                .active_sidebar_sections(cx)
+                .iter()
+                .any(|section| section.id == id)
+        {
+            return;
+        }
+        self.change_sidebar_section(
+            SidebarSectionChange::AssignProject {
+                project_key: payload.project_key.clone(),
+                section_id: target.map(str::to_owned),
+                after: None,
+                before: None,
+            },
+            cx,
+        );
     }
 
     /// `grab` is where the header was pressed, from its origin: the drag only
@@ -976,12 +1150,14 @@ mod tests {
                     id: "a".into(),
                     name: "Focus".into(),
                     session_ids: vec![],
+                    project_keys: vec![],
                     collapsed: false,
                 },
                 SidebarSection {
                     id: "b".into(),
                     name: "Later".into(),
                     session_ids: vec![],
+                    project_keys: vec![],
                     collapsed: false,
                 },
             ],
@@ -1223,6 +1399,7 @@ mod tests {
                         id: "c".into(),
                         name: "Someday".into(),
                         session_ids: vec![],
+                        project_keys: vec![],
                         collapsed: false,
                     });
                 shell.debug_gate = Some(super::GatePhase::Ready);
@@ -1466,6 +1643,7 @@ mod tests {
                         id: "a".into(),
                         name: "Focus".into(),
                         session_ids: vec!["regular".into()],
+                        project_keys: vec![],
                         collapsed: false,
                     }],
                 );
