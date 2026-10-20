@@ -24,6 +24,41 @@ fn section_drop_index(top: f32, heights: &[f32], from: usize) -> usize {
     over
 }
 
+/// The section a released project would land in. Sections keep a gap between
+/// them; a pointer in that gap still targets the nearer edge so the highlight
+/// does not flicker as it crosses.
+fn sidebar_project_target(
+    bounds: &[gpui::Bounds<Pixels>],
+    pointer: Point<Pixels>,
+    section_count: usize,
+) -> Option<usize> {
+    let limit = bounds.len().min(section_count);
+    if let Some(ix) = bounds[..limit].iter().position(|b| b.contains(&pointer)) {
+        return Some(ix);
+    }
+    bounds[..limit]
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, bounds)| {
+            let (x, y) = (f32::from(pointer.x), f32::from(pointer.y));
+            let (left, right) = (f32::from(bounds.left()), f32::from(bounds.right()));
+            if x < left || x > right {
+                return None;
+            }
+            let (top, bottom) = (f32::from(bounds.top()), f32::from(bounds.bottom()));
+            let distance = if y < top {
+                top - y
+            } else if y > bottom {
+                y - bottom
+            } else {
+                0.0
+            };
+            (distance <= SIDEBAR_LIST_GAP).then_some((ix, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(ix, _)| ix)
+}
+
 pub(super) struct SectionDialog {
     profile: String,
     id: Option<String>,
@@ -306,6 +341,10 @@ impl Shell {
     ) -> SidebarKeyedRow {
         let id = section.id.clone();
         let open = !section.collapsed;
+        let project_target = self
+            .sidebar_project_drag
+            .as_ref()
+            .is_some_and(|drag| drag.target.as_deref() == Some(id.as_str()));
         let extra = self.sidebar_transfer_extra_gap(&drag_group);
         let session_count = rows.len()
             + projects
@@ -327,6 +366,7 @@ impl Shell {
             let motion_key = format!("group:{collapse_key}");
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let count = project_rows.len();
+            let drag_label = label.clone();
             let icon = first_chat.map(|chat_id| {
                 self.render_project_group_icon(&chat_id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, cx)
             });
@@ -352,12 +392,14 @@ impl Shell {
                 self.sidebar_section_projects_supported(cx)
                     .then(|| SidebarProjectDrag {
                         project_key: key.clone(),
+                        label: drag_label.into(),
+                        sessions: count,
                     }),
                 |el, payload| {
                     let shell = cx.entity();
-                    el.on_drag(payload, move |_payload, _, _, cx| {
+                    el.on_drag(payload, move |payload, grab, window, cx| {
                         shell.update(cx, |shell, cx| {
-                            shell.begin_sidebar_project_drag(cx);
+                            shell.begin_sidebar_project_drag(payload, grab, window, cx);
                         });
                         cx.stop_propagation();
                         cx.new(|_| DragGhost)
@@ -544,6 +586,11 @@ impl Shell {
                     }
                 },
             ))
+            .on_drag_move::<SidebarProjectDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                    this.track_sidebar_project_drag(event.event.position, cx);
+                },
+            ))
             .on_drop::<SidebarSessionDrag>(cx.listener(move |this, payload, _, cx| {
                 this.finish_sidebar_session_transfer(
                     payload,
@@ -556,6 +603,12 @@ impl Shell {
                 this.finish_sidebar_project_transfer(payload, Some(&project_drop_id), cx);
                 cx.stop_propagation();
             }))
+            .when(project_target, |el| {
+                el.rounded(px(8.0))
+                    .bg(theme.accent_wash.opacity(0.5))
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.3))
+            })
             .child(header)
             .child(body)
             .into_any_element();
@@ -594,9 +647,133 @@ impl Shell {
                 }))
     }
 
-    pub(super) fn begin_sidebar_project_drag(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn begin_sidebar_project_drag(
+        &mut self,
+        payload: &SidebarProjectDrag,
+        cursor_offset: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_sidebar_session_transfer(cx);
+        self.cancel_sidebar_section_drag(cx);
         self.section_menu = None;
+        self.sidebar_project_drag_generation = self.sidebar_project_drag_generation.wrapping_add(1);
+        self.sidebar_project_drag = Some(SidebarProjectDragState {
+            payload: payload.clone(),
+            pointer: window.mouse_position(),
+            cursor_offset,
+            target: None,
+            generation: self.sidebar_project_drag_generation,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn track_sidebar_project_drag(
+        &mut self,
+        pointer: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let target = {
+            let bounds = self.sidebar_section_bounds.borrow();
+            let sections = self.active_sidebar_sections(cx);
+            sidebar_project_target(&bounds, pointer, sections.len())
+                .and_then(|ix| sections.get(ix))
+                .map(|section| section.id.clone())
+        };
+        let Some(drag) = self.sidebar_project_drag.as_mut() else {
+            return;
+        };
+        drag.pointer = pointer;
+        drag.target = target;
+        cx.notify();
+    }
+
+    pub(super) fn end_sidebar_project_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_project_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The lifted project, frosted a level above the list like a lifted
+    /// section. It rides the pointer at the grab point from its header.
+    pub(super) fn render_lifted_sidebar_project(&self, theme: &Theme) -> Option<AnyElement> {
+        let drag = self.sidebar_project_drag.as_ref()?;
+        let list = self.sidebar_scroll.bounds();
+        let width = (f32::from(list.size.width) - 2.0 * Theme::SPACE_SM).max(160.0);
+        let lifted = drag.pointer - drag.cursor_offset;
+        let sessions = drag.payload.sessions;
+        let card = div()
+            .h(px(spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .child(
+                icon(icons::FOLDER_TREE)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(spaces::sidebar_header_glyph(theme)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text)
+                    .child(drag.payload.label.clone()),
+            )
+            .when(sessions > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(sessions.to_string())),
+                )
+            });
+        let frame = div()
+            .debug_selector(|| "sidebar-lifted-project".into())
+            .w(px(width))
+            .h(px(spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+            .rounded(px(8.0))
+            .child(crate::frost::frosted(
+                8.0,
+                crate::frost::MENU_BLUR,
+                div()
+                    .size_full()
+                    .rounded(px(8.0))
+                    .bg(crate::popover::surface_bg(theme))
+                    .shadow_md()
+                    .child(
+                        div()
+                            .size_full()
+                            .rounded(px(8.0))
+                            .bg(crate::theme::wash(0.06))
+                            .child(card),
+                    ),
+            ));
+        let frame = if self.reduced_motion {
+            frame.into_any_element()
+        } else {
+            frame
+                .with_animation(
+                    ("sidebar-project-lift", drag.generation),
+                    motion::MENU_IN.animation(),
+                    |el, t| el.opacity(t).relative().top(px((1.0 - t) * 6.0)),
+                )
+                .into_any_element()
+        };
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(lifted.x, lifted.y))
+                    .child(frame),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     /// Move a project into `target`, or back to its own group when it is
@@ -607,6 +784,7 @@ impl Shell {
         target: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        self.end_sidebar_project_drag(cx);
         if !self.sidebar_section_projects_supported(cx) {
             return;
         }
@@ -1454,6 +1632,47 @@ mod tests {
                 assert!(shell.sidebar_section_drag.is_none());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn project_drop_targets_the_section_under_the_pointer() {
+        let section = |top: f32, height: f32| {
+            gpui::Bounds::new(
+                gpui::point(px(8.0), px(top)),
+                gpui::size(px(200.0), px(height)),
+            )
+        };
+        let bounds = [section(10.0, 68.0), section(80.0, 40.0)];
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(20.0)), 2),
+            Some(0)
+        );
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(95.0)), 2),
+            Some(1)
+        );
+        // The gap between sections still resolves to the nearer edge.
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(78.5)), 2),
+            Some(0)
+        );
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(79.5)), 2),
+            Some(1)
+        );
+        // Outside the column, or past the measured sections, nothing lights up.
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(300.0), px(20.0)), 2),
+            None
+        );
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(200.0)), 2),
+            None
+        );
+        assert_eq!(
+            sidebar_project_target(&bounds, gpui::point(px(20.0), px(20.0)), 1),
+            Some(0)
+        );
     }
 
     #[test]

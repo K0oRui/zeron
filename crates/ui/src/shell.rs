@@ -1366,6 +1366,18 @@ struct SidebarSectionDragState {
 #[derive(Clone)]
 struct SidebarProjectDrag {
     project_key: String,
+    label: SharedString,
+    sessions: usize,
+}
+
+/// The lifted project card that follows the pointer, plus the section it
+/// would land in.
+struct SidebarProjectDragState {
+    payload: SidebarProjectDrag,
+    pointer: Point<Pixels>,
+    cursor_offset: Point<Pixels>,
+    target: Option<String>,
+    generation: u64,
 }
 
 /// A placed project's sessions, rendered as a nested group in its section.
@@ -2284,6 +2296,9 @@ pub struct Shell {
     sidebar_session_transfer: Option<SidebarSessionTransfer>,
     sidebar_session_return: Option<SidebarSessionReturn>,
     sidebar_section_drag: Option<SidebarSectionDragState>,
+    /// A project in flight, drawn as a lifted card over the list.
+    sidebar_project_drag: Option<SidebarProjectDragState>,
+    sidebar_project_drag_generation: u64,
     /// Each custom section's painted bounds, measured every frame.
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
@@ -2783,6 +2798,8 @@ impl Shell {
             sidebar_session_transfer: None,
             sidebar_session_return: None,
             sidebar_section_drag: None,
+            sidebar_project_drag: None,
+            sidebar_project_drag_generation: 0,
             sidebar_section_bounds: Default::default(),
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
@@ -9338,6 +9355,11 @@ impl Shell {
         {
             self.cancel_sidebar_section_drag(cx);
         }
+        if self.sidebar_project_drag.is_some()
+            && (!cx.has_active_drag() || !self.sidebar_section_projects_supported(cx))
+        {
+            self.end_sidebar_project_drag(cx);
+        }
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
@@ -9740,6 +9762,13 @@ impl Shell {
                             this.finish_sidebar_section_drag(payload, cx);
                         },
                     ))
+                    // A project follows the pointer and lights the section it
+                    // would join; released elsewhere it goes home.
+                    .on_drag_move::<SidebarProjectDrag>(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<SidebarProjectDrag>, _, cx| {
+                            this.track_sidebar_project_drag(event.event.position, cx);
+                        },
+                    ))
                     .px(px(Theme::SPACE_SM))
                     .flex()
                     .flex_col()
@@ -9749,7 +9778,8 @@ impl Shell {
                     .child(active_list)
                     .children(archived_section)
                     .children(moving_row)
-                    .children(lifted_section),
+                    .children(lifted_section)
+                    .children(self.render_lifted_sidebar_project(theme)),
             )),
         )
         .fade_overflow_y(&self.sidebar_scroll);

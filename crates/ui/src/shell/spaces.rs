@@ -973,6 +973,82 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_project_drag_lifts_and_highlights_a_section(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                    })).unwrap()).collect();
+                    state.chats = [("a-new", "a"), ("b-new", "b")]
+                        .into_iter()
+                        .map(|(id, project)| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat
+                        })
+                        .collect();
+                });
+                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
+                shell.settings.sidebar_sections_by_profile.insert(
+                    key,
+                    vec![crate::settings::SidebarSection {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        session_ids: vec![],
+                        project_keys: vec![],
+                        collapsed: false,
+                    }],
+                );
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let from = cx.debug_bounds("sidebar-group-project:a").unwrap().center();
+        let to = cx.debug_bounds("section-header-focus").unwrap().center();
+        let nudge = gpui::point(px(0.0), px(6.0));
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + nudge, Some(MouseButton::Left), none);
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "project drag never started"));
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-lifted-project").is_some(),
+            "the project lifts while it drags"
+        );
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert_eq!(
+                    shell
+                        .sidebar_project_drag
+                        .as_ref()
+                        .and_then(|drag| drag.target.as_deref()),
+                    Some("focus")
+                );
+            })
+            .unwrap();
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, cx| {
+                let sections = shell.active_sidebar_sections(cx);
+                assert_eq!(sections[0].project_keys, ["a"]);
+                assert!(shell.sidebar_project_drag.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -6033,6 +6109,7 @@ impl Shell {
                     )
                 });
             let visible_label: SharedString = label.into();
+            let drag_label = visible_label.clone();
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
@@ -6098,6 +6175,10 @@ impl Shell {
                 )
                     .group(group_name)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .debug_selector({
+                    let key = collapse_key.clone();
+                    move || format!("sidebar-group-{key}")
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -6117,13 +6198,15 @@ impl Shell {
                     (project_group && self.sidebar_section_projects_supported(cx)).then(|| {
                         SidebarProjectDrag {
                             project_key: key.clone(),
+                            label: drag_label,
+                            sessions: row_count,
                         }
                     }),
                     |el, payload| {
                         let shell = cx.entity();
-                        el.on_drag(payload, move |_payload, _, _, cx| {
+                        el.on_drag(payload, move |payload, grab, window, cx| {
                             shell.update(cx, |shell, cx| {
-                                shell.begin_sidebar_project_drag(cx);
+                                shell.begin_sidebar_project_drag(payload, grab, window, cx);
                             });
                             cx.stop_propagation();
                             cx.new(|_| DragGhost)
