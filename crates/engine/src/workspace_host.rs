@@ -885,6 +885,26 @@ impl WorkspaceHost {
         }
     }
 
+    /// Set the sidebar freshness to the surviving message after a revert.
+    pub fn set_chat_last_message(&self, chat_id: &str, preview: &str, at: chrono::DateTime<Utc>) {
+        let result = self
+            .mutate(|doc| doc.set_chat_last_message(chat_id, preview, at))
+            .map_err(EngineError::from);
+        if let Err(err) = result {
+            tracing::warn!(chat = %chat_id, error = %err, "registry last-message write failed");
+        }
+    }
+
+    /// Clear the sidebar freshness after a revert removed every message.
+    pub fn clear_chat_last_message(&self, chat_id: &str) {
+        let result = self
+            .mutate(|doc| doc.clear_chat_last_message(chat_id))
+            .map_err(EngineError::from);
+        if let Err(err) = result {
+            tracing::warn!(chat = %chat_id, error = %err, "registry last-message clear failed");
+        }
+    }
+
     /// Resume continuity: stamp the chat row with the harness-native session id
     /// of its latest run and the cwd it was created under. An empty `session_id`
     /// tombstones the row ("do not resume" after a rejected resume). Best-effort:

@@ -592,6 +592,9 @@ pub struct ChatDocHandle {
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
+    /// A revert preview has stopped the runtime and owns the chat until the
+    /// user commits or cancels. Queue delivery and new turns must wait.
+    revert_pending: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
     /// User navigation only. Opens, watches, writes and reconnects never bump it.
@@ -810,6 +813,24 @@ impl ChatDocHandle {
             .count();
         steered.push(id.to_string());
         Ok(slot)
+    }
+
+    pub(crate) fn revert_pending(&self) -> bool {
+        self.revert_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_revert_pending(&self, pending: bool) {
+        self.revert_pending.store(pending, Ordering::Release);
+    }
+
+    /// Clear transient queue/revert state after the transcript moved back.
+    pub(crate) fn reset_after_revert(&self) {
+        lock(&self.held_sends).clear();
+        lock(&self.steered_rows).clear();
+        self.queue_paused.store(false, Ordering::Release);
+        self.revert_pending.store(false, Ordering::Release);
+        self.publish_queue();
+        self.publish_messages_if_watched();
     }
 
     fn publish_queue(&self) {
@@ -1600,6 +1621,7 @@ impl DocHost {
             stopped_by: Mutex::new(None),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
+            revert_pending: AtomicBool::new(false),
             last_access: AtomicI64::new(now_ms()),
             last_focus: AtomicU64::new(0),
             sync_focus_served: AtomicU64::new(0),
@@ -4050,7 +4072,7 @@ impl DocHost {
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
-        if handle.queue_paused.load(Ordering::Acquire) {
+        if handle.queue_paused.load(Ordering::Acquire) || handle.revert_pending() {
             return;
         }
         loop {
@@ -4970,7 +4992,7 @@ impl DocHost {
     /// ours; a chat with no row is claimable (claim-on-first-command). Without a
     /// wired workspace host (bare-DocHost tests) every open chat is ours — M2's
     /// behavior, now the degenerate case.
-    fn is_host(&self, chat_id: &str) -> bool {
+    pub(crate) fn is_host(&self, chat_id: &str) -> bool {
         self.workspace().is_none_or(|ws| ws.is_host(chat_id))
     }
 
@@ -5650,6 +5672,20 @@ impl DocHost {
         // transcript when it is actually delivered. Never interrupt to hurry
         // steering.
         let prompt = self.resolve_prompt_attachments(prompt);
+        if handle.revert_pending() {
+            if prompt.trim().is_empty() {
+                return Ok((
+                    SessionCommandStatus::Rejected,
+                    Some("a revert is in progress".into()),
+                ));
+            }
+            let id = message_id.unwrap_or_else(new_id);
+            self.hold_until_turn_end(handle, &id, &prompt, issued_at, false, None)?;
+            return Ok((
+                SessionCommandStatus::Applied,
+                Some("held during revert".into()),
+            ));
+        }
         // A live turn without a mailbox can't take it either: the fresh
         // dispatch below would interrupt it.
         let unsteerable_turn =
@@ -5914,7 +5950,7 @@ impl DocHost {
         })
     }
 
-    fn save_snapshot(&self, handle: &ChatDocHandle) {
+    pub(crate) fn save_snapshot(&self, handle: &ChatDocHandle) {
         if handle.retired.load(Ordering::Relaxed) {
             // A chat2 seed replaced this lineage on disk; persisting this
             // handle's fat doc would clobber the thin one. But retired with

@@ -28,7 +28,9 @@ use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage, TurnControl};
+use zeron_harness::{
+    CancellationToken, Harness, RevertTarget, RunControls, SteerMessage, TurnControl,
+};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -228,6 +230,8 @@ struct Inner {
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Per-chat revert generation: a cancel invalidates an in-flight preview.
+    revert_generations: Mutex<HashMap<String, u64>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
@@ -245,6 +249,18 @@ pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn entry_prompt_text(entry: &SessionMessageEntry) -> String {
+    entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[derive(Clone)]
@@ -275,6 +291,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                revert_generations: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 scratch_root: OnceLock::new(),
@@ -445,6 +462,241 @@ impl SessionsEngine {
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
+    }
+
+    /// Resolve a revert to `message_id` and return the files the commit could
+    /// restore. The runtime stops here; the chat stays gated until commit or
+    /// cancel. Reading the provider's snapshots leaves no commit-armed stage
+    /// behind, so the worktree is untouched until the user confirms.
+    pub async fn revert_preview(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<String>, EngineError> {
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
+        if !host.is_host(chat_id) {
+            return Err(EngineError::Other(
+                "Revert must run on the chat's host device".into(),
+            ));
+        }
+        let handle = self.doc_handle(chat_id)?;
+        let generation = self.bump_revert_generation(chat_id);
+        let prepared =
+            self.revert_target(chat_id, &handle, message_id)
+                .and_then(|(request, target)| {
+                    let harness = self
+                        .inner
+                        .registry
+                        .resolve(request.harness.unwrap_or_else(|| host.harness_for(chat_id)))?;
+                    Ok((request, target, harness))
+                });
+        let (request, target, harness) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if self.revert_generation(chat_id) == generation {
+                    handle.set_revert_pending(false);
+                    host.drain_queue(&handle).await;
+                }
+                return Err(error);
+            }
+        };
+        handle.set_revert_pending(true);
+        let result = async {
+            self.terminate(chat_id).await?;
+            self.set_status(chat_id, SessionStatus::Idle, false);
+            harness
+                .revert_preview(request, target)
+                .await
+                .map_err(|error| EngineError::Other(error.to_string()))
+        }
+        .await;
+        if self.revert_generation(chat_id) != generation {
+            // A cancel already cleared the gate; a newer preview owns it now.
+            return Err(EngineError::Other("revert cancelled".into()));
+        }
+        if result.is_err() {
+            handle.set_revert_pending(false);
+            host.drain_queue(&handle).await;
+        }
+        result
+    }
+
+    /// Commit the previewed revert, truncate the doc at `message_id`, and drop
+    /// every later message, queued send, and journal frame.
+    pub async fn revert_commit(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        files: bool,
+    ) -> Result<usize, EngineError> {
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
+        let handle = self.doc_handle(chat_id)?;
+        if !handle.revert_pending() {
+            return Err(EngineError::Other("no revert preview is pending".into()));
+        }
+        let prepared =
+            self.revert_target(chat_id, &handle, message_id)
+                .and_then(|(request, target)| {
+                    let harness = self
+                        .inner
+                        .registry
+                        .resolve(request.harness.unwrap_or_else(|| host.harness_for(chat_id)))?;
+                    Ok((request, target, harness))
+                });
+        let (request, target, harness) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                handle.set_revert_pending(false);
+                host.drain_queue(&handle).await;
+                return Err(error);
+            }
+        };
+        let result = async {
+            harness
+                .revert_commit(request, target, files)
+                .await
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            let removed = handle
+                .doc()
+                .truncate_messages(message_id)
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            if removed == 0 {
+                return Err(EngineError::Other(
+                    "the boundary message disappeared before the revert landed".into(),
+                ));
+            }
+            handle
+                .doc()
+                .clear_queue()
+                .map_err(|error| EngineError::Other(error.to_string()))?;
+            self.inner.journal.discard(chat_id)?;
+            lock(&self.inner.last_requests).remove(chat_id);
+            self.refresh_chat_freshness(chat_id, &handle);
+            self.set_status(chat_id, SessionStatus::Idle, false);
+            host.save_snapshot(&handle);
+            handle.reset_after_revert();
+            Ok(removed)
+        }
+        .await;
+        if result.is_err() {
+            handle.set_revert_pending(false);
+            host.drain_queue(&handle).await;
+        }
+        result
+    }
+
+    /// Abandon a staged preview. Invalidates a preview still in flight.
+    pub async fn revert_cancel(&self, chat_id: &str) -> Result<(), EngineError> {
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
+        let handle = self.doc_handle(chat_id)?;
+        self.bump_revert_generation(chat_id);
+        handle.set_revert_pending(false);
+        host.drain_queue(&handle).await;
+        Ok(())
+    }
+
+    fn bump_revert_generation(&self, chat_id: &str) -> u64 {
+        let mut generations = lock(&self.inner.revert_generations);
+        let generation = generations.entry(chat_id.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        *generation
+    }
+
+    fn revert_generation(&self, chat_id: &str) -> u64 {
+        lock(&self.inner.revert_generations)
+            .get(chat_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn revert_target(
+        &self,
+        chat_id: &str,
+        handle: &ChatDocHandle,
+        message_id: &str,
+    ) -> Result<(RunRequest, RevertTarget), EngineError> {
+        let entries = handle
+            .doc()
+            .read_entries()
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let index = entries
+            .iter()
+            .position(|entry| entry.id == message_id)
+            .ok_or_else(|| EngineError::Other("message no longer exists".into()))?;
+        if entries[index].role != MessageRole::User {
+            return Err(EngineError::Other(
+                "Only user messages can start a revert".into(),
+            ));
+        }
+        let user_index = entries[..index]
+            .iter()
+            .filter(|entry| entry.role == MessageRole::User)
+            .count();
+        let text = entry_prompt_text(&entries[index]);
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
+        let mut request = self
+            .last_request(chat_id)
+            .or_else(|| host.request_from_chat_row(chat_id, &text))
+            .ok_or_else(|| EngineError::Other("no run configuration for this chat".into()))?;
+        let harness = request.harness.unwrap_or_else(|| host.harness_for(chat_id));
+        if harness != HarnessId::Opencode {
+            return Err(EngineError::Other(
+                "Chat revert is only available for OpenCode sessions".into(),
+            ));
+        }
+        request.harness = Some(harness);
+        request.prompt = text.clone();
+        if request.resume.as_deref().is_none_or(str::is_empty) {
+            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+        }
+        if request.resume.as_deref().is_none_or(str::is_empty) {
+            return Err(EngineError::Other(
+                "This chat has no OpenCode session to rewind".into(),
+            ));
+        }
+        Ok((
+            request,
+            RevertTarget {
+                message_id: message_id.to_string(),
+                user_index,
+                text,
+            },
+        ))
+    }
+
+    fn refresh_chat_freshness(&self, chat_id: &str, handle: &ChatDocHandle) {
+        let Some(host) = self.inner.doc_host() else {
+            return;
+        };
+        let Some(workspace) = host.workspace() else {
+            return;
+        };
+        let Ok(entries) = handle.doc().read_entries() else {
+            return;
+        };
+        let latest = entries.iter().rev().find_map(|entry| {
+            let text = entry_prompt_text(entry);
+            (!text.trim().is_empty()).then_some((text, entry.created_at))
+        });
+        let Some((text, created_at)) = latest else {
+            workspace.clear_chat_last_message(chat_id);
+            return;
+        };
+        let preview: String = text.chars().take(120).collect();
+        let at = chrono::DateTime::from_timestamp_millis(created_at).unwrap_or_else(Utc::now);
+        workspace.set_chat_last_message(chat_id, &preview, at);
     }
 
     /// Subscribe to a chat's live event stream: returns the journal replay after
@@ -798,6 +1050,7 @@ impl SessionsEngine {
             execution_lease: None,
             request_input,
             steering: steer_rx,
+            user_message_id: Some(user_id.clone()),
             interrupt: interrupt_token.clone(),
             turn: turn.clone(),
         };

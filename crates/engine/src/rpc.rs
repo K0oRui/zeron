@@ -1467,6 +1467,13 @@ fn forward_deadline(method: &str) -> std::time::Duration {
     if method == methods::NEGOTIATE_VOICE_V2 {
         return Duration::from_secs(95);
     }
+    if matches!(
+        method,
+        methods::REVERT_PREVIEW | methods::REVERT_COMMIT | methods::REVERT_CANCEL
+    ) {
+        // A cold OpenCode boot can take minutes before the revert resolves.
+        return Duration::from_secs(8 * 60);
+    }
     use std::time::Duration;
     match method {
         methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
@@ -1500,6 +1507,9 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::FORK_SIDE_CHAT
+            | methods::REVERT_PREVIEW
+            | methods::REVERT_COMMIT
+            | methods::REVERT_CANCEL
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -2167,6 +2177,46 @@ impl RpcService for EngineRpc {
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
+            }
+            methods::REVERT_PREVIEW => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RevertParams {
+                    chat_id: String,
+                    message_id: String,
+                }
+                let p: RevertParams = parse_params(params)?;
+                let files = self
+                    .sessions
+                    .revert_preview(&p.chat_id, &p.message_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "files": files }))
+            }
+            methods::REVERT_COMMIT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RevertCommitParams {
+                    chat_id: String,
+                    message_id: String,
+                    #[serde(default)]
+                    files: bool,
+                }
+                let p: RevertCommitParams = parse_params(params)?;
+                let removed = self
+                    .sessions
+                    .revert_commit(&p.chat_id, &p.message_id, p.files)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::REVERT_CANCEL => {
+                let p: ChatParams = parse_params(params)?;
+                self.sessions
+                    .revert_cancel(&p.chat_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::FOCUS_CHAT => {
                 let p: ChatParams = parse_params(params)?;

@@ -67,6 +67,13 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
+    /// Stop the chat and resolve a native revert at one user message.
+    /// `{ chatId, messageId }` → `{ files }`. Leaves the worktree untouched.
+    pub const REVERT_PREVIEW: &str = "RevertPreview";
+    /// Commit a previewed revert. `{ chatId, messageId, files }` → `{ removed }`.
+    pub const REVERT_COMMIT: &str = "RevertCommit";
+    /// Abandon a pending preview. `{ chatId }` → `{ ok }`.
+    pub const REVERT_CANCEL: &str = "RevertCancel";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.
