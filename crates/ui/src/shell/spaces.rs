@@ -1155,11 +1155,11 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
-    fn active_sessions_page_behind_show_more(cx: &mut gpui::TestAppContext) {
+    fn active_sessions_virtualize_rows_outside_the_viewport(cx: &mut gpui::TestAppContext) {
         use super::*;
 
-        struct PagedHost(Entity<Shell>);
-        impl Render for PagedHost {
+        struct SidebarHost(Entity<Shell>);
+        impl Render for SidebarHost {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 self.0.update(cx, |shell, cx| {
                     div()
@@ -1184,7 +1184,7 @@ mod pinned_session_tests {
             );
         });
         let (host, cx) = cx.add_window_view(|_, cx| {
-            PagedHost(cx.new(|cx| {
+            SidebarHost(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
                 let mut shell = Shell::new(
                     state,
@@ -1220,19 +1220,37 @@ mod pinned_session_tests {
         let names: Vec<&'static str> = (0..100)
             .map(|ix| Box::leak(format!("chat-chat-{ix:03}").into_boxed_str()) as &'static str)
             .collect();
-        // Only the first window renders; the tail hides behind Show more.
-        let shown = names
+        let slots: Vec<&'static str> = (0..100)
+            .map(|ix| {
+                Box::leak(format!("session-slot-chat-{ix:03}").into_boxed_str()) as &'static str
+            })
+            .collect();
+        // The first frame measures every row; the next one virtualizes.
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        // Every chat keeps a slot, so the list scrolls as one surface. Only
+        // the rows near the viewport build their content.
+        assert!(slots.iter().all(|slot| cx.debug_bounds(slot).is_some()));
+        let built = names
             .iter()
             .filter(|name| cx.debug_bounds(name).is_some())
             .count();
-        assert_eq!(shown, 60);
-        assert!(cx.debug_bounds("sessions-more").is_some());
-        assert_eq!(shell.read_with(cx, |shell, _| shell.sessions_shown), 0);
+        assert!(built > 0);
+        assert!(
+            built < names.len(),
+            "expected the tail to stay a placeholder"
+        );
+        assert!(cx.debug_bounds("sessions-more").is_none());
 
-        // Selecting past the window grows it to include the selection.
-        let deep =
-            shell.update(cx, |shell, cx| shell.sidebar_visible_order(cx).last().cloned())
-                .unwrap();
+        // A selection deep in the list still renders its row even though the
+        // viewport never scrolled to it.
+        let deep = shell
+            .update(cx, |shell, cx| {
+                shell.sidebar_visible_order(cx).last().cloned()
+            })
+            .unwrap();
         assert_eq!(deep, "chat-099");
         shell.update(cx, |shell, cx| {
             shell
@@ -1243,14 +1261,8 @@ mod pinned_session_tests {
             window.refresh();
             window.draw(cx).clear();
         });
-        let shown = names
-            .iter()
-            .filter(|name| cx.debug_bounds(name).is_some())
-            .count();
-        assert_eq!(shown, 100);
         assert!(cx.debug_bounds("chat-chat-099").is_some());
         assert!(cx.debug_bounds("sessions-more").is_none());
-        assert!(shell.read_with(cx, |shell, _| shell.sessions_shown) >= 100);
     }
 
     #[test]
@@ -2411,11 +2423,13 @@ pub(super) const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 pub(super) const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
-/// Active Sessions paging: element count per frame is what lags, so only the
-/// first window renders. Pins are exempt (manual, usually few). Matches the
-/// archived shelf's "Show more" pattern.
-const ACTIVE_INITIAL: usize = 60;
-const ACTIVE_PAGE: usize = 40;
+/// Content above and below the sidebar viewport whose rows stay fully built,
+/// so a fast scroll or rubber-band overshoot never paints an empty band.
+const SIDEBAR_VIRTUAL_OVERSCAN: f32 = 480.0;
+/// Rows measured on the very first frame. Everything past this starts as a
+/// placeholder, so a large restored list does not build every row to learn
+/// what the first viewport already told us.
+const SIDEBAR_FIRST_FRAME_ROWS: usize = 120;
 /// The Archived shelf shows this many rows, then "Show more" pages by
 /// [`ARCHIVED_PAGE_ROWS`].
 const ARCHIVED_INITIAL_ROWS: usize = 10;
@@ -3093,6 +3107,32 @@ impl Shell {
                     gap.current()
                 }
             })
+    }
+
+    /// Content-space y window the sidebar can paint this frame: the scroll
+    /// offset plus the viewport, widened by one overscan band on each side.
+    /// `None` before the first layout, when every row must render to measure.
+    pub(super) fn sidebar_virtual_range(&self) -> Option<(f32, f32)> {
+        let viewport = self.sidebar_scroll.bounds();
+        let height = f32::from(viewport.size.height);
+        if height <= 0.0 {
+            return None;
+        }
+        let top = -f32::from(self.sidebar_scroll.offset().y);
+        Some((
+            top - SIDEBAR_VIRTUAL_OVERSCAN,
+            top + height + SIDEBAR_VIRTUAL_OVERSCAN,
+        ))
+    }
+
+    /// True once a row has been painted outside the window. Rows with no
+    /// extent count as visible here; the caller caps how many unmeasured rows
+    /// the first frame builds.
+    pub(super) fn sidebar_row_off_screen(&self, id: &str, window: (f32, f32)) -> bool {
+        self.sidebar_row_extents
+            .borrow()
+            .get(id)
+            .is_some_and(|(top, bottom)| *bottom < window.0 || *top > window.1)
     }
 
     fn render_sidebar_gap_row(
@@ -5553,6 +5593,9 @@ impl Shell {
                 .unwrap_or(usize::MAX)
         });
         let active: HashSet<&str> = base_ids.iter().map(String::as_str).collect();
+        self.sidebar_row_extents
+            .borrow_mut()
+            .retain(|id, _| active.contains(id.as_str()));
         let pinned_count = pinned_order
             .iter()
             .filter(|id| active.contains(id.as_str()))
@@ -5763,56 +5806,22 @@ impl Shell {
         // Re-checked at render so the chips drop the FRAME a popover opens,
         // not on the next modifier event — the jumps are suppressed under it.
         let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
-        // Cap the rendered window: element count per frame is the lag source.
-        // Pins always render; custom + regular share one budget, head-first so
-        // new activity (top-sorted) stays visible. The selected row forces the
-        // window open so keyboard nav never selects a hidden row.
-        let has_pinned_section = pinned_count > 0;
-        let total_non_pinned: usize = sections
-            .iter()
-            .skip(usize::from(has_pinned_section))
-            .map(|(_, rows)| rows.len())
-            .sum();
-        let budget = if total_non_pinned == 0 {
-            0
-        } else {
-            let mut budget = self
-                .sessions_shown
-                .max(ACTIVE_INITIAL)
-                .min(total_non_pinned);
-            let flat_position = sections
-                .iter()
-                .skip(usize::from(has_pinned_section))
-                .flat_map(|(_, rows)| rows.iter())
-                .position(|row| Some(row.chat.id.as_str()) == selected.as_deref());
-            if let Some(index) = flat_position
-                && index + 1 > budget
-            {
-                budget = index + 1;
-                self.sessions_shown = self.sessions_shown.max(budget);
-            }
-            budget
-        };
-        let hidden_non_pinned = total_non_pinned.saturating_sub(budget);
-        let mut remaining = budget;
         let keymap = self.settings.keymap.clone();
         let mut slot = 0usize;
         let mut rendered = Vec::new();
         let mut moving_row = None;
+        // A scroll change reveals a band whose rows were placeholders last
+        // frame. Schedule one more frame so those rows build with real content
+        // instead of flashing empty after the scroll settles.
+        let virtual_window = self.sidebar_virtual_range();
+        if virtual_window != self.sidebar_virtual_window {
+            self.sidebar_virtual_window = virtual_window;
+            cx.notify();
+        }
+        let view = cx.entity_id();
         for (group, rows) in sections {
             let pinned_group = slot < pinned_count;
-            // Head-first window: hide the tail once the budget is spent.
-            // Pinned sections always render fully.
-            let mut rows = rows;
-            if !pinned_group {
-                if remaining == 0 {
-                    continue;
-                }
-                if rows.len() > remaining {
-                    rows.truncate(remaining);
-                }
-                remaining -= rows.len();
-            }
+            let rows = rows;
             let drag_group = if pinned_group {
                 "pinned".to_owned()
             } else {
@@ -5913,48 +5922,101 @@ impl Shell {
                     .filter(|drag| drag.payload.chat_id == chat.id)
                     .map_or(0.0, |drag| drag.collapsed_height);
                 let slot_height = height - removed;
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    change_request,
-                    harness,
-                    status,
-                    is_selected,
-                    false,
-                    is_moving,
-                    remote,
-                    if is_moving { None } else { drag },
-                    jump_label,
-                    self.settings.sidebar_show_project_icon && !project_group && !in_project_block,
-                    None,
-                    theme,
-                    cx,
-                );
-                // The source slot shrinks when its vacancy moves across sections.
-                // Its zero-height anchor still tracks the live activity position.
-                let element = if let Some(origin) = origin {
-                    moving_row = Some((element, height));
+                // The inline rename editor lives inside the row, so that row
+                // must stay mounted while it is open.
+                let is_renaming = self.chat_rename.as_ref().is_some_and(|rename| {
+                    rename.surface == ChatRenameSurface::Sidebar && rename.chat_id == chat.id
+                });
+                let unmeasured = !self
+                    .sidebar_row_extents
+                    .borrow()
+                    .contains_key(chat.id.as_str());
+                // Only visible rows build their content. Every row keeps a
+                // fixed-height placeholder in the tree, so layout, gap math
+                // and drag thresholds stay exactly as they were.
+                let off_screen = self.sidebar_session_transfer.is_none()
+                    && self.sidebar_session_return.is_none()
+                    && !is_selected
+                    && !is_renaming
+                    && origin.is_none()
+                    && ((unmeasured && slot > SIDEBAR_FIRST_FRAME_ROWS)
+                        || virtual_window.is_some_and(|window| {
+                            self.sidebar_row_off_screen(&chat.id, window)
+                        }));
+                let row_extents = self.sidebar_row_extents.clone();
+                let row_scroll = self.sidebar_scroll.clone();
+                let row_id = chat.id.clone();
+                let extent_height = slot_height.max(0.0);
+                let element = if off_screen {
                     div()
-                        .child(div().h(px(slot_height.max(0.0))))
-                        .on_children_prepainted(move |bounds, _, _| {
-                            if let Some(bounds) = bounds.first() {
-                                origin.set(bounds.origin);
-                            }
-                        })
+                        .h(px(slot_height.max(0.0)))
+                        .flex_none()
                         .into_any_element()
                 } else {
-                    self.render_sidebar_gap_row(element, &chat.id, &drag_group, group_index)
+                    let element = self.render_chat_row(
+                        chat.id.clone(),
+                        transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )
+                        .into(),
+                        time_ago,
+                        folder.into(),
+                        branch.map(SharedString::from),
+                        change_request,
+                        harness,
+                        status,
+                        is_selected,
+                        false,
+                        is_moving,
+                        remote,
+                        if is_moving { None } else { drag },
+                        jump_label,
+                        self.settings.sidebar_show_project_icon && !project_group && !in_project_block,
+                        None,
+                        theme,
+                        cx,
+                    );
+                    // The source slot shrinks when its vacancy moves across sections.
+                    // Its zero-height anchor still tracks the live activity position.
+                    if let Some(origin) = origin {
+                        moving_row = Some((element, height));
+                        div()
+                            .child(div().h(px(slot_height.max(0.0))))
+                            .on_children_prepainted(move |bounds, _, _| {
+                                if let Some(bounds) = bounds.first() {
+                                    origin.set(bounds.origin);
+                                }
+                            })
+                            .into_any_element()
+                    } else {
+                        self.render_sidebar_gap_row(element, &chat.id, &drag_group, group_index)
+                    }
                 };
                 // The hit region stays at the natural slot while its content slides;
                 // preview movement must not move its own insertion thresholds.
                 let target_group = drag_group.clone();
                 let element = div()
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        if let Some(bound) = bounds.first() {
+                            let top = f32::from(
+                                bound.top() - row_scroll.bounds().top() - row_scroll.offset().y,
+                            );
+                            let extent = (top, top + extent_height);
+                            let moved = row_extents.borrow().get(&row_id).is_none_or(
+                                |previous: &(f32, f32)| {
+                                    (previous.0 - extent.0).abs() > 0.5
+                                        || (previous.1 - extent.1).abs() > 0.5
+                                },
+                            );
+                            if moved {
+                                row_extents.borrow_mut().insert(row_id.clone(), extent);
+                                // A resized row can fall outside the window the
+                                // frame was built against. Ask for one more
+                                // frame with the fresh extents.
+                                cx.notify(view);
+                            }
+                        }
+                    })
                     .id(SharedString::from(format!("session-slot-{}", chat.id)))
                     .debug_selector({
                         let id = chat.id.clone();
@@ -6230,43 +6292,6 @@ impl Shell {
                 .child(body)
                 .into_any_element();
             rendered.push((format!("g:{collapse_key}"), height, element));
-        }
-        if hidden_non_pinned > 0 {
-            let more_height = if self.settings.sidebar_compact {
-                super::sidebar_row_height(true, true, false, false)
-            } else {
-                36.0
-            };
-            let remaining = hidden_non_pinned.min(ACTIVE_PAGE);
-            let more = div()
-                .id("sessions-more")
-                .debug_selector(|| "sessions-more".into())
-                .h(px(more_height))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.0))
-                .px(px(Theme::SPACE_SM))
-                .rounded(px(6.0))
-                .text_size(crate::typography::ui_rems(13.0))
-                .text_color(theme.text_muted.opacity(0.55))
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.sessions_shown = this
-                        .sessions_shown
-                        .max(ACTIVE_INITIAL)
-                        .saturating_add(ACTIVE_PAGE);
-                    cx.notify();
-                }))
-                .child(
-                    crate::icons::icon(crate::icons::PLUS)
-                        .size(px(14.0))
-                        .flex_none(),
-                )
-                .child(SharedString::from(format!("Show {remaining} more")))
-                .into_any_element();
-            rendered.push(("more:active".to_string(), more_height, more));
         }
         SidebarSessionRows {
             custom_count,

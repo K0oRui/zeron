@@ -2121,11 +2121,6 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
-    /// Active Sessions paging (mirrors `archived_shown`): the sidebar builds
-    /// one element tree per rendered row each frame, so an unbounded active
-    /// list lags with hundreds of sessions. Only the first `sessions_shown`
-    /// non-pinned rows render, with a "Show more" tail. Pins always render.
-    pub(super) sessions_shown: usize,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
@@ -2301,6 +2296,13 @@ pub struct Shell {
     sidebar_project_drag_generation: u64,
     /// Each custom section's painted bounds, measured every frame.
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
+    /// Painted content-space y extents of sidebar chat rows, keyed by chat id.
+    /// Rows outside the viewport keep a fixed-height placeholder in the tree;
+    /// the extents let the next frame know which ones can skip their content.
+    sidebar_row_extents:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, (f32, f32)>>>,
+    /// Last content-space window the sidebar virtualized rows against.
+    sidebar_virtual_window: Option<(f32, f32)>,
     /// Pending pin intents are scoped to the active profile and engine attachment.
     sidebar_pin_write: Option<sidebar_pins::PendingSidebarPins>,
     sidebar_pin_write_generation: u64,
@@ -2695,7 +2697,6 @@ impl Shell {
             pinned_open: true,
             sessions_open: true,
             archived_shown: 0,
-            sessions_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
@@ -2801,6 +2802,8 @@ impl Shell {
             sidebar_project_drag: None,
             sidebar_project_drag_generation: 0,
             sidebar_section_bounds: Default::default(),
+            sidebar_row_extents: Default::default(),
+            sidebar_virtual_window: None,
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
@@ -6389,45 +6392,8 @@ impl Shell {
         let Some(chat_id) = order.iter().nth(slot).cloned() else {
             return;
         };
-        self.ensure_session_visible_in_order(&chat_id, &order, cx);
         // Same path a click on that row takes.
         self.open_chat_visible(chat_id, cx);
-    }
-
-    /// Grow the active Sessions window so `chat_id` renders. Jump slots are
-    /// all inside the first window, but cycling can land past it — selecting
-    /// a hidden row would leave no visible selection.
-    fn ensure_session_visible(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        let order = self.sidebar_visible_order(cx);
-        self.ensure_session_visible_in_order(chat_id, &order, cx);
-    }
-
-    /// [`Self::ensure_session_visible`] against an order the caller already
-    /// holds, so jumps and cycling never build the list twice per press.
-    fn ensure_session_visible_in_order(
-        &mut self,
-        chat_id: &str,
-        order: &[String],
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = order.iter().position(|id| id == chat_id) else {
-            return;
-        };
-        // Pinned rows always render; only the non-pinned window needs room.
-        let pins = self.active_sidebar_pins(cx);
-        let pinned: std::collections::HashSet<&str> =
-            pins.iter().map(String::as_str).collect();
-        if pinned.contains(chat_id) {
-            return;
-        }
-        let pinned_count = order
-            .iter()
-            .filter(|id| pinned.contains(id.as_str()))
-            .count();
-        let non_pinned_index = index.saturating_sub(pinned_count);
-        if non_pinned_index + 1 > self.sessions_shown {
-            self.sessions_shown = (non_pinned_index + 1).max(self.sessions_shown);
-        }
     }
 
     /// Whether an overlay that owns the keyboard is up — the add-space
