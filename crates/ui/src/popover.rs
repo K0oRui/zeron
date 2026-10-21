@@ -378,7 +378,7 @@ pub fn completion_list(
     id: &'static str,
     scroll: &ScrollHandle,
     rows: impl IntoIterator<Item = AnyElement>,
-) -> crate::edge_fade::EdgeFaded {
+) -> impl IntoElement {
     faded_menu_list(
         scroll,
         menu_scroll_list(id, scroll)
@@ -391,11 +391,10 @@ pub fn completion_list(
 }
 
 /// All picker lists use the same paint-time, overflow-dependent edge fades.
-pub fn faded_menu_list(
-    scroll: &ScrollHandle,
-    list: impl IntoElement,
-) -> crate::edge_fade::EdgeFaded {
-    crate::edge_fade::edge_faded(12.0, true, true, list).fade_overflow_y(scroll)
+pub fn faded_menu_list(scroll: &ScrollHandle, list: impl IntoElement) -> impl IntoElement {
+    crate::smooth_scroll::smooth_scroll(
+        crate::edge_fade::edge_faded(12.0, true, true, list).fade_overflow_y(scroll),
+    )
 }
 
 /// Shared completion-row typography and shrink rules. Long skill names and

@@ -159,7 +159,9 @@ impl RenderOnce for DropdownRows {
             .flex_col()
             .gap(px(2.0))
             .children(self.rows);
-        crate::edge_fade::edge_faded(12.0, true, true, list).fade_overflow_y(&scroll)
+        crate::smooth_scroll::smooth_scroll(
+            crate::edge_fade::edge_faded(12.0, true, true, list).fade_overflow_y(&scroll),
+        )
     }
 }
 
@@ -1662,8 +1664,10 @@ impl RenderOnce for SettingsScroll {
                 (scroll.clone(), scroll)
             })
         });
-        crate::edge_fade::edge_faded(16.0, true, true, self.area.track_scroll(&scroll))
-            .fade_overflow_y(&scroll)
+        crate::smooth_scroll::smooth_scroll(
+            crate::edge_fade::edge_faded(16.0, true, true, self.area.track_scroll(&scroll))
+                .fade_overflow_y(&scroll),
+        )
     }
 }
 

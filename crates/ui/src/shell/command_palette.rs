@@ -1205,7 +1205,7 @@ impl Shell {
                     "Try a command, chat title, project, or device.",
                 ))
             });
-        let body = palette_results_fade(body, &scroll);
+        let body = crate::smooth_scroll::smooth_scroll(palette_results_fade(body, &scroll));
         let tabs = div()
             .flex_none()
             .px(px(12.0))

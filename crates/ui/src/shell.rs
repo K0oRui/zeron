@@ -8059,7 +8059,9 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .opacity(self.voice_stage_underlay_opacity(cx))
-                    .child(div().flex_1().min_h_0().child(outlet)),
+                    .child(crate::smooth_scroll::smooth_scroll(
+                        div().flex_1().min_h_0().child(outlet),
+                    )),
             )
             .child(
                 div()
@@ -9797,7 +9799,7 @@ impl Shell {
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             .child(filter_row)
-            .child(sidebar_lists)
+            .child(crate::smooth_scroll::smooth_scroll(sidebar_lists))
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.
