@@ -3462,6 +3462,8 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// Rewind this chat to a user message, removing it and everything after.
+    RevertTo { chat_id: String, message_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -7608,6 +7610,9 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        // Subagent transcripts are read-only views over another chat's doc.
+        let revert_message_id =
+            (is_user_row && self.chat_id.is_none()).then(|| row.entry_id.clone());
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -7646,12 +7651,43 @@ impl Transcript {
                         .text_color(theme.text_muted),
                     )
             });
+            let revert = revert_message_id.clone().map(|message_id| {
+                let fade_key = format!("revert-message-hover-{message_id}");
+                div()
+                    .id(SharedString::from(format!("revert-message-{message_id}")))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &fade_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    ))
+                    .on_hover(motion::hover_listener(fade_key))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(chat_id) = this.state.read(cx).selected_chat.clone() {
+                            cx.emit(TranscriptEvent::RevertTo {
+                                chat_id,
+                                message_id: message_id.to_string(),
+                            });
+                        }
+                    }))
+                    .tooltip(crate::settings::widgets::text_tooltip("Revert to here"))
+                    .child(
+                        crate::icons::icon(crate::icons::ALT_ARROW_LEFT)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            });
             let metadata = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let metadata = metadata.child(timestamp).children(copy).children(revert);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))

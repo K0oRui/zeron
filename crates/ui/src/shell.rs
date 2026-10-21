@@ -1812,6 +1812,28 @@ enum DiscardWorkingTreeFlow {
     Failed(SharedString),
 }
 
+#[derive(Debug, Clone)]
+enum ChatRevertFlow {
+    Loading {
+        chat_id: String,
+        message_id: String,
+        seq: u64,
+    },
+    Confirm {
+        chat_id: String,
+        message_id: String,
+        files: Vec<String>,
+    },
+    Working,
+    Failed(SharedString),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevertPreviewReply {
+    files: Vec<String>,
+}
+
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -2237,6 +2259,10 @@ pub struct Shell {
     /// RPC task is retained separately so rerenders do not cancel it.
     discard_working_tree: Option<DiscardWorkingTreeFlow>,
     discard_working_tree_task: Option<Task<()>>,
+    /// Chat-message revert: preview, confirmation, and the in-flight RPC.
+    chat_revert: Option<ChatRevertFlow>,
+    chat_revert_task: Option<Task<()>>,
+    chat_revert_seq: u64,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -2768,6 +2794,9 @@ impl Shell {
             delete_confirm: None,
             discard_working_tree: None,
             discard_working_tree_task: None,
+            chat_revert: None,
+            chat_revert_task: None,
+            chat_revert_seq: 0,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             sidebar_section_migration: None,
@@ -4483,7 +4512,172 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::RevertTo {
+                chat_id,
+                message_id,
+            } => {
+                self.begin_chat_revert(chat_id.clone(), message_id.clone(), cx);
+            }
         }
+    }
+
+    fn begin_chat_revert(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
+        if self.chat_revert.is_some() || self.chat_revert_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.chat_revert = Some(ChatRevertFlow::Failed("Engine is not connected.".into()));
+            cx.notify();
+            return;
+        };
+        let target = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+            .filter(|id| !id.is_empty());
+        self.chat_revert_seq = self.chat_revert_seq.wrapping_add(1);
+        let seq = self.chat_revert_seq;
+        self.chat_revert = Some(ChatRevertFlow::Loading {
+            chat_id: chat_id.clone(),
+            message_id: message_id.clone(),
+            seq,
+        });
+        self.chat_revert_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({
+                "chatId": chat_id,
+                "messageId": message_id,
+            });
+            if let Some(target) = target {
+                params["targetDeviceId"] = serde_json::Value::String(target);
+            }
+            let result = engine
+                .client()
+                .call_as::<RevertPreviewReply>(methods::REVERT_PREVIEW, params)
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.chat_revert_task = None;
+                let Some(ChatRevertFlow::Loading {
+                    chat_id,
+                    message_id,
+                    seq: current,
+                }) = shell.chat_revert.clone()
+                else {
+                    return;
+                };
+                if current != seq {
+                    return;
+                }
+                shell.chat_revert = match result {
+                    Ok(reply) => Some(ChatRevertFlow::Confirm {
+                        chat_id,
+                        message_id,
+                        files: reply.files,
+                    }),
+                    Err(error) => Some(ChatRevertFlow::Failed(format!("{error}").into())),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn confirm_chat_revert(&mut self, files: bool, cx: &mut Context<Self>) {
+        if self.chat_revert_task.is_some() {
+            return;
+        }
+        let Some(ChatRevertFlow::Confirm {
+            chat_id,
+            message_id,
+            ..
+        }) = self.chat_revert.clone()
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.chat_revert = Some(ChatRevertFlow::Failed("Engine is not connected.".into()));
+            cx.notify();
+            return;
+        };
+        let target = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+            .filter(|id| !id.is_empty());
+        self.chat_revert = Some(ChatRevertFlow::Working);
+        self.chat_revert_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({
+                "chatId": chat_id,
+                "messageId": message_id,
+                "files": files,
+            });
+            if let Some(target) = target {
+                params["targetDeviceId"] = serde_json::Value::String(target);
+            }
+            let result = engine
+                .client()
+                .call_as::<serde_json::Value>(methods::REVERT_COMMIT, params)
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.chat_revert_task = None;
+                shell.chat_revert = match result {
+                    Ok(_) => None,
+                    Err(error) => Some(ChatRevertFlow::Failed(format!("{error}").into())),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn cancel_chat_revert(&mut self, cx: &mut Context<Self>) {
+        let flow = self.chat_revert.take();
+        let Some(flow) = flow else {
+            return;
+        };
+        let chat_id = match &flow {
+            ChatRevertFlow::Confirm { chat_id, .. } => Some(chat_id.clone()),
+            ChatRevertFlow::Failed(_) => None,
+            ChatRevertFlow::Loading { .. } | ChatRevertFlow::Working => {
+                self.chat_revert = Some(flow);
+                return;
+            }
+        };
+        let Some(chat_id) = chat_id else {
+            cx.notify();
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            cx.notify();
+            return;
+        };
+        let target = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+            .filter(|id| !id.is_empty());
+        cx.spawn(async move |_this, _cx| {
+            let mut params = serde_json::json!({ "chatId": chat_id });
+            if let Some(target) = target {
+                params["targetDeviceId"] = serde_json::Value::String(target);
+            }
+            let _ = engine
+                .client()
+                .call_as::<serde_json::Value>(methods::REVERT_CANCEL, params)
+                .await;
+        })
+        .detach();
+        cx.notify();
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,
@@ -10901,6 +11095,15 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if let Some(flow) = self.chat_revert.clone() {
+            if !matches!(
+                flow,
+                ChatRevertFlow::Loading { .. } | ChatRevertFlow::Working
+            ) {
+                self.cancel_chat_revert(cx);
+            }
+            return true;
+        }
         if self.discard_working_tree.is_some() {
             self.discard_working_tree = None;
             cx.notify();
@@ -11297,6 +11500,131 @@ impl Shell {
                 viewport,
                 card,
             ));
+        }
+
+        if let Some(flow) = self.chat_revert.clone() {
+            let card = match flow {
+                ChatRevertFlow::Loading { .. } => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Revert to this message?"))
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .child(popover::dialog_body(&theme, "Checking for changed files…")),
+                    )
+                    .into_any_element(),
+                ChatRevertFlow::Working => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Reverting…"))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Removing this message and everything after it.",
+                    )))
+                    .into_any_element(),
+                ChatRevertFlow::Confirm {
+                    files,
+                    chat_id: _,
+                    message_id: _,
+                } => {
+                    let has_files = !files.is_empty();
+                    let body = if has_files {
+                        "This removes your message and everything after it. This chat changed these files after your message. This can’t be undone."
+                    } else {
+                        "This removes your message and everything after it. No workspace files changed. This can’t be undone."
+                    };
+                    let mut card = popover::dialog_card(&theme)
+                        .child(popover::dialog_title(&theme, "Revert to this message?"))
+                        .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)));
+                    if has_files {
+                        let mut list = div().mt(px(10.0)).flex().flex_col().gap(px(3.0));
+                        for file in files.iter().take(8) {
+                            let file = transcript::single_line(file);
+                            let label = if file.chars().count() > 72 {
+                                format!(
+                                    "…{}",
+                                    file.chars()
+                                        .skip(file.chars().count() - 70)
+                                        .collect::<String>()
+                                )
+                            } else {
+                                file
+                            };
+                            list = list.child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(label),
+                            );
+                        }
+                        if files.len() > 8 {
+                            list = list.child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(format!("and {} more", files.len() - 8)),
+                            );
+                        }
+                        card = card.child(list);
+                    }
+                    let actions = div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "chat-revert-cancel")
+                                .id("chat-revert-cancel")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_chat_revert(cx)),
+                                ),
+                        );
+                    let actions =
+                        if has_files {
+                            actions
+                                .child(
+                                    popover::btn_ghost(
+                                        &theme,
+                                        "Revert messages only",
+                                        "chat-revert-messages",
+                                    )
+                                    .id("chat-revert-messages")
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.confirm_chat_revert(false, cx),
+                                    )),
+                                )
+                                .child(
+                                    popover::btn_danger(&theme, "Revert messages and files")
+                                        .id("chat-revert-all")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_chat_revert(true, cx)
+                                        })),
+                                )
+                        } else {
+                            actions.child(
+                                popover::btn_danger(&theme, "Revert")
+                                    .id("chat-revert-confirm")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_chat_revert(false, cx)
+                                    })),
+                            )
+                        };
+                    card.child(actions).into_any_element()
+                }
+                ChatRevertFlow::Failed(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Couldn’t revert"))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("chat-revert-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chat_revert = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            };
+            overlays.push(popover::modal("chat-revert-dialog", viewport, card));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
