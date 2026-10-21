@@ -33,6 +33,7 @@ async fn managed_install_reaches_session_started() {
         execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
+        user_message_id: None,
         interrupt: interrupt.clone(),
         turn: Default::default(),
     };

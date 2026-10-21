@@ -274,6 +274,7 @@ impl TurnWire {
                     rx
                 }),
                 steering,
+                user_message_id: None,
                 interrupt: interrupt.clone(),
                 turn: Default::default(),
             },
@@ -339,6 +340,10 @@ impl TurnWire {
     }
 
     async fn posted(&self, suffix: &str) -> Value {
+        self.posted_nth(suffix, 0).await
+    }
+
+    async fn posted_nth(&self, suffix: &str, n: usize) -> Value {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some((_, body)) = self
@@ -346,7 +351,8 @@ impl TurnWire {
                     .lock()
                     .unwrap()
                     .iter()
-                    .find(|(path, _)| path.ends_with(suffix))
+                    .filter(|(path, _)| path.ends_with(suffix))
+                    .nth(n)
                 {
                     return body.clone();
                 }
@@ -1767,7 +1773,7 @@ fn v2_model_list_folds_into_provider_catalog() {
 
 #[test]
 fn prompt_body_v2_carries_text_and_files_only() {
-    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()]);
+    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()], None);
     assert_eq!(body["text"], "hello");
     assert_eq!(body["files"][0]["uri"], "file:///tmp/shot.png");
     assert_eq!(body["files"][0]["name"], "shot.png");
@@ -1776,6 +1782,74 @@ fn prompt_body_v2_carries_text_and_files_only() {
         "model rides the session on 2.x"
     );
     assert!(body.get("parts").is_none());
+    assert!(body.get("id").is_none(), "no id when the caller has none");
+
+    let body = prompt_body_v2("hello", &[], Some("zeron-user"));
+    assert_eq!(body["id"], "msg_zeron-user");
+}
+
+#[test]
+fn revert_plan_files_come_from_assistant_snapshots() {
+    let page = json!({
+        "data": [
+            {"type": "user", "snapshot": {"files": ["ignored"]}},
+            {"type": "assistant", "snapshot": {"files": ["src/b.rs", "src/a.rs"]}},
+            {"type": "assistant", "snapshot": {"files": ["src/b.rs"]}},
+            {"type": "assistant"},
+        ]
+    });
+    let mut files = Vec::new();
+    collect_snapshot_files(&page, &mut files);
+    files.sort();
+    files.dedup();
+    assert_eq!(files, vec!["src/a.rs", "src/b.rs"]);
+
+    let mut empty = Vec::new();
+    collect_snapshot_files(&json!({"data": []}), &mut empty);
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn revert_boundary_prefers_exact_text_then_the_user_ordinal() {
+    let users = vec![
+        ("msg_1".to_string(), "first prompt".to_string(), 10),
+        ("msg_2".to_string(), "second   prompt".to_string(), 20),
+    ];
+    let target = |text: &str, user_index| RevertTarget {
+        message_id: "zeron".into(),
+        user_index,
+        text: text.into(),
+    };
+    let pick = |text: &str, index| {
+        pick_revert_boundary(&users, &target(text, index)).map(|boundary| boundary.id)
+    };
+
+    // Whitespace collapses before comparison; the exact text beats a moved
+    // ordinal (old chats merged steers).
+    assert_eq!(pick("second prompt", 0).as_deref(), Some("msg_2"));
+    // The ordinal text is the next best evidence.
+    assert_eq!(pick("second", 1).as_deref(), Some("msg_2"));
+    // No text evidence falls back to the position.
+    assert_eq!(pick("gone", 0).as_deref(), Some("msg_1"));
+    // An attachment-only prompt still maps by position.
+    assert_eq!(pick("", 1).as_deref(), Some("msg_2"));
+    assert!(pick_revert_boundary(&[], &target("", 0)).is_none());
+
+    let boundary = pick_revert_boundary(&users, &target("second prompt", 0)).unwrap();
+    assert_eq!(boundary.created, 20);
+}
+
+#[test]
+fn revert_cursor_points_past_the_boundary() {
+    use base64::Engine as _;
+    let cursor = message_cursor("msg_1");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(value["id"], "msg_1");
+    assert_eq!(value["order"], "asc");
+    assert_eq!(value["direction"], "next");
 }
 
 #[tokio::test]
@@ -2237,7 +2311,7 @@ fn v2_command_bodies_follow_server_version() {
         let attachments = vec!["/workspace/image.png".into()];
         assert_eq!(
             command_body_v2(Some(&version), "test", "args", &attachments)["files"],
-            prompt_body_v2("args", &attachments)["files"]
+            prompt_body_v2("args", &attachments, None)["files"]
         );
     }
 }
@@ -2328,8 +2402,9 @@ async fn agent_selection_on_create_and_resume() {
                         p.ends_with("/session")
                     }
                 });
-                let expected = if v2 && agent == "build-id" {
-                    json!("build-id")
+                let selected = if agent == "build-id" { "build-id" } else { "" };
+                let expected = if v2 && (resume || !selected.is_empty()) {
+                    json!(selected)
                 } else {
                     Value::Null
                 };
@@ -2339,18 +2414,80 @@ async fn agent_selection_on_create_and_resume() {
                         .unwrap_or(Value::Null),
                     expected
                 );
-                if resume && v2 && agent == "build-id" {
+                if resume && v2 {
                     assert_eq!(
                         posts[0],
                         (
                             "/api/session/fixture/agent".into(),
-                            json!({"agent":"build-id"})
+                            json!({"agent": selected})
                         )
                     );
                 }
             }
         }
     }
+}
+
+#[tokio::test]
+async fn agent_change_on_steer_is_adopted_before_the_prompt() {
+    let mut wire = TurnWire::start_config(
+        false,
+        true,
+        true,
+        None,
+        "2.0.11",
+        json!({"keepSteering": true, "modelOptions": {"agent": "build-id"}}),
+        false,
+    )
+    .await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+
+    wire.steering
+        .as_ref()
+        .unwrap()
+        .send(crate::SteerMessage {
+            prompt: "second".into(),
+            message_id: None,
+            attachments: Vec::new(),
+            config: Some(Box::new(RunRequest {
+                mcp: None,
+                prompt: "second".into(),
+                harness: Some(HarnessId::Opencode),
+                model: Some("opencode/muse".into()),
+                reasoning: Some(ReasoningLevel::Low),
+                model_options: [("agent".into(), json!("plan-id"))].into_iter().collect(),
+                cwd: String::new(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                resume: Some("fixture".into()),
+                attachments: Vec::new(),
+                worktree: None,
+            })),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        wire.posted("/api/session/fixture/agent").await,
+        json!({"agent": "plan-id"})
+    );
+    assert_eq!(
+        wire.posted_nth("/api/session/fixture/prompt", 1).await["text"],
+        json!("second")
+    );
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
 }
 
 #[test]

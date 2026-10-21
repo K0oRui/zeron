@@ -35,6 +35,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
             realtime: None,
             execution_lease: None,
             steering: rx,
+            user_message_id: None,
             interrupt: token.clone(),
             request_input: Box::new(|_| {
                 let (tx, rx) = oneshot::channel();

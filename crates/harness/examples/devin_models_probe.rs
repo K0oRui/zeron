@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
             rx
         }),
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
     };

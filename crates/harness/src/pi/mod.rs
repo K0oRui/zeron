@@ -394,6 +394,7 @@ impl Harness for PiHarness {
                 execution_lease: _lease,
                 request_input,
                 mut steering,
+                user_message_id: _,
                 interrupt,
                 turn: _,
             } = controls;

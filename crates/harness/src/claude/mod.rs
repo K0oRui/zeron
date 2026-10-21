@@ -831,6 +831,7 @@ async fn run_session(session: Session) {
         execution_lease: _execution_lease,
         request_input,
         mut steering,
+        user_message_id: _,
         interrupt,
         turn,
     } = controls;

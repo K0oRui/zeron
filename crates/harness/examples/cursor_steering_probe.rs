@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
                 realtime: None,
                 execution_lease: None,
                 steering,
+                user_message_id: None,
                 interrupt: interrupt.clone(),
                 request_input: Box::new(|_| {
                     let (tx, rx) = oneshot::channel();

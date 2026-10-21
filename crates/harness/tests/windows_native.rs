@@ -234,6 +234,7 @@ async fn exercise(prompt: &str, resume: Option<&str>) {
             rx
         }),
         steering,
+        user_message_id: None,
         interrupt: interrupt.clone(),
         turn: Default::default(),
     };
@@ -329,6 +330,7 @@ async fn exercise_tree(prompt: &str, drop_stream: bool) {
             rx
         }),
         steering,
+        user_message_id: None,
         interrupt: interrupt.clone(),
         turn: Default::default(),
     };
@@ -491,6 +493,7 @@ async fn batch_overrides_launch_through_cmd() {
                 rx
             }),
             steering,
+            user_message_id: None,
             interrupt: CancellationToken::new(),
             turn: Default::default(),
         };

@@ -282,6 +282,7 @@ async fn collect_text(
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: interrupt.clone(),
         turn: Default::default(),
     };

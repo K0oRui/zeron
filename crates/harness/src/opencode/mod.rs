@@ -72,7 +72,7 @@ use zeron_proto::{
 };
 
 use crate::process::{Child, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RevertTarget, RunControls};
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -297,6 +297,34 @@ impl OpencodeHarness {
         Server::spawn(&exe, cwd, self.startup_timeout, mcp).await
     }
 
+    /// A short-lived server over the stored session, for a revert. Revive
+    /// endpoints exist on the 2.x wire only.
+    async fn revert_server(
+        &self,
+        request: &RunRequest,
+    ) -> Result<(String, Option<String>, Server), HarnessError> {
+        let session_id = request
+            .resume
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                HarnessError::Protocol(
+                    "This chat has no OpenCode session to rewind; it predates session tracking"
+                        .into(),
+                )
+            })?
+            .to_owned();
+        let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
+        let mut server = self.server(cwd.as_deref(), None).await?;
+        if server.protocol().await != Protocol::V2 {
+            server.shutdown(self.kill_grace).await;
+            return Err(HarnessError::Protocol(
+                "Chat revert requires OpenCode 2.x".into(),
+            ));
+        }
+        Ok((session_id, cwd, server))
+    }
+
     /// One short-lived server answers both discovery calls. Also primes the
     /// commands cache so concurrent picker/composer fetches share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -383,9 +411,10 @@ impl Harness for OpencodeHarness {
     fn stops_turn_in_place(&self) -> bool {
         true
     }
-    /// The model and effort ride each prompt (1.x) or are set on the
-    /// session (2.x), so a change applies from the next prompt without a new
-    /// server. Clearing one back to the default cannot be expressed that way.
+    /// The agent, model, and effort are set on the session (2.x), and model
+    /// and effort ride each prompt (1.x), so a change applies from the next
+    /// prompt without a new server. Clearing an agent uses the empty id; a
+    /// cleared model or effort cannot be expressed that way.
     fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
         live.cwd == next.cwd
             && (next.model.is_some() || live.model.is_none())
@@ -452,6 +481,59 @@ impl Harness for OpencodeHarness {
             .commands_wire(Some(directory))
             .await
             .map(|v| commands_from_wire(&v));
+        server.shutdown(self.kill_grace).await;
+        result
+    }
+
+    async fn revert_preview(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        let (session_id, dir, mut server) = self.revert_server(&request).await?;
+        let result = async {
+            let boundary = revert_boundary(&server, &session_id, dir.as_deref(), &target).await?;
+            // The stage endpoint only reports files after it restores them, so
+            // preview from the assistant snapshots in the message history. A
+            // stage would rewrite the worktree before the user confirms.
+            revert_plan_files(&server, &session_id, dir.as_deref(), &boundary).await
+        }
+        .await;
+        server.shutdown(self.kill_grace).await;
+        result
+    }
+
+    async fn revert_commit(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+        files: bool,
+    ) -> Result<(), HarnessError> {
+        let (session_id, dir, mut server) = self.revert_server(&request).await?;
+        let result = async {
+            let boundary = revert_boundary(&server, &session_id, dir.as_deref(), &target).await?;
+            server
+                .post_json(
+                    &format!("/api/session/{session_id}/revert/stage"),
+                    dir.as_deref(),
+                    &json!({ "messageID": boundary.id, "files": files }),
+                )
+                .await?;
+            if let Err(error) = server
+                .post_empty(
+                    &format!("/api/session/{session_id}/revert/commit"),
+                    dir.as_deref(),
+                )
+                .await
+            {
+                let _ = server
+                    .delete(&format!("/api/session/{session_id}/revert"), dir.as_deref())
+                    .await;
+                return Err(error);
+            }
+            Ok(())
+        }
+        .await;
         server.shutdown(self.kill_grace).await;
         result
     }
@@ -856,6 +938,48 @@ impl Server {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         Ok((status, text))
+    }
+
+    async fn post_empty(&self, path: &str, directory: Option<&str>) -> Result<(), HarnessError> {
+        let req = self
+            .request(reqwest::Method::POST, path)
+            .timeout(CALL_TIMEOUT);
+        let resp = self
+            .scoped(req, directory)
+            .await
+            .send()
+            .await
+            .map_err(|e| HarnessError::Protocol(format!("opencode POST {path}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HarnessError::Protocol(format!(
+                "opencode POST {path}: {status} {}",
+                truncate_body(&body)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str, directory: Option<&str>) -> Result<(), HarnessError> {
+        let req = self
+            .request(reqwest::Method::DELETE, path)
+            .timeout(CALL_TIMEOUT);
+        let resp = self
+            .scoped(req, directory)
+            .await
+            .send()
+            .await
+            .map_err(|e| HarnessError::Protocol(format!("opencode DELETE {path}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HarnessError::Protocol(format!(
+                "opencode DELETE {path}: {status} {}",
+                truncate_body(&body)
+            )));
+        }
+        Ok(())
     }
 
     /// Directory scope: the server's per-request instance selector. V1 takes
@@ -1521,6 +1645,7 @@ async fn run_session(session: Session) {
         execution_lease: _execution_lease,
         request_input,
         mut steering,
+        user_message_id,
         interrupt,
         turn: turn_control,
     } = controls;
@@ -1546,17 +1671,7 @@ async fn run_session(session: Session) {
                             .and_then(Value::as_str)
                             .unwrap_or(resume)
                             .to_owned();
-                        if server.protocol().await == Protocol::V2
-                            && let Some(agent) = agent
-                        {
-                            server
-                                .post_json(
-                                    &format!("/api/session/{id}/agent"),
-                                    dir,
-                                    &json!({"agent": agent}),
-                                )
-                                .await?;
-                        }
+                        set_agent(&server, &id, dir, agent.unwrap_or("")).await?;
                         id
                     }
                     Err(e) => {
@@ -1724,6 +1839,7 @@ async fn run_session(session: Session) {
             model: model.as_ref(),
             variant: variant.as_deref(),
             attachments: &request.attachments,
+            message_id: user_message_id.as_deref(),
         },
     )
     .await
@@ -1812,16 +1928,21 @@ async fn run_session(session: Session) {
                 turn_generation = turn_generation.wrapping_add(1);
                 let native_command_selected = first.native;
                 let config = first.config;
+                let message_id = first.message_id;
                 let mut attachments = first.attachments;
                 // Plain-text steers waiting together go out as one prompt,
                 // each confirmed by its own Steered boundary; a native
                 // command always travels alone, and a changed configuration
                 // starts a new prompt (the ones after it were sent with it).
+                // Messages carrying a Zeron id travel alone too: merging
+                // would leave one native message standing for several
+                // revert boundaries.
                 let mut texts = vec![first.text];
-                while !native_command_selected
-                    && queued_steers
-                        .front()
-                        .is_some_and(|next| !next.native && next.config.is_none())
+                while message_id.is_none()
+                    && !native_command_selected
+                    && queued_steers.front().is_some_and(|next| {
+                        !next.native && next.config.is_none() && next.message_id.is_none()
+                    })
                 {
                     let next = queued_steers.pop_front().expect("front checked");
                     texts.push(next.text);
@@ -1863,6 +1984,7 @@ async fn run_session(session: Session) {
                             model: model.as_ref(),
                             variant: variant.as_deref(),
                             attachments: &attachments,
+                            message_id: message_id.as_deref(),
                         },
                     )
                     .await,
@@ -2086,6 +2208,7 @@ async fn run_session(session: Session) {
                                 text: prompt,
                                 native: native_command_selected,
                                 attachments: steer.attachments,
+                                message_id: steer.message_id,
                                 config: steer.config,
                             });
                             maybe_preempt!();
@@ -2119,6 +2242,7 @@ async fn run_session(session: Session) {
                                         model: model.as_ref(),
                                         variant: variant.as_deref(),
                                         attachments: &steer.attachments,
+                                        message_id: steer.message_id.as_deref(),
                                     },
                                 )
                                 .await,
@@ -2342,6 +2466,26 @@ async fn run_session(session: Session) {
     server.shutdown(kill_grace).await;
 }
 
+/// Set the session's agent on 2.x. An empty id clears it back to the server
+/// default; the route accepts that spelling live (2.0.32).
+async fn set_agent(
+    server: &Server,
+    session_id: &str,
+    dir: Option<&str>,
+    agent: &str,
+) -> Result<(), HarnessError> {
+    if server.protocol().await == Protocol::V2 {
+        server
+            .post_json(
+                &format!("/api/session/{session_id}/agent"),
+                dir,
+                &json!({"agent": agent}),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn create_session(
     server: &Server,
     dir: Option<&str>,
@@ -2442,6 +2586,8 @@ struct QueuedSteer {
     /// It selects a native command (which always travels alone).
     native: bool,
     attachments: Vec<String>,
+    /// Zeron's user-message id, for an exact native revert boundary.
+    message_id: Option<String>,
     /// The configuration it was sent with, adopted before its prompt.
     config: Option<Box<RunRequest>>,
 }
@@ -2462,9 +2608,10 @@ fn model_selection(
     (model, variant)
 }
 
-/// Adopt `next`'s model and effort for the prompts that follow: 1.x carries
-/// them on each prompt, 2.x sets them on the session first. The catalog is
-/// fetched again here rather than held for the session's life.
+/// Adopt `next`'s agent, model, and effort for the prompts that follow: 1.x
+/// carries model and effort on each prompt, 2.x sets them on the session
+/// first. The catalog is fetched again here rather than held for the
+/// session's life.
 async fn adopt_config(
     server: &Server,
     session_id: &str,
@@ -2473,6 +2620,12 @@ async fn adopt_config(
 ) -> Result<(Option<(String, String)>, Option<String>), HarnessError> {
     let providers = server.provider_catalog(dir).await.unwrap_or_default();
     let (model, variant) = model_selection(&providers, next);
+    let agent = next
+        .model_options
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    set_agent(server, session_id, dir, agent).await?;
     if server.protocol().await == Protocol::V2
         && let Some((provider, model_id)) = &model
     {
@@ -2545,7 +2698,7 @@ fn prompt_body(
 /// 2.x prompt body: plain text plus `{uri, name}` file attachments. Model
 /// and variant do NOT ride here — they were set on the session at run
 /// start (`POST /api/session/{id}/model`).
-fn prompt_body_v2(prompt: &str, attachments: &[String]) -> Value {
+fn prompt_body_v2(prompt: &str, attachments: &[String], message_id: Option<&str>) -> Value {
     let files: Vec<Value> = attachments
         .iter()
         .map(|path| {
@@ -2558,7 +2711,256 @@ fn prompt_body_v2(prompt: &str, attachments: &[String]) -> Value {
             })
         })
         .collect();
-    json!({ "text": prompt, "files": files })
+    let mut body = json!({ "text": prompt, "files": files });
+    if let Some(id) = message_id {
+        body["id"] = Value::String(format!("msg_{id}"));
+    }
+    body
+}
+
+/// Resolve Zeron's boundary to the provider's user message. New prompts carry
+/// `msg_<zeron-id>`; older ones fall back to text and ordinal position.
+async fn revert_boundary(
+    server: &Server,
+    session_id: &str,
+    directory: Option<&str>,
+    target: &RevertTarget,
+) -> Result<RevertBoundary, HarnessError> {
+    let exact = format!("msg_{}", target.message_id);
+    if let Ok(message) = server
+        .get_json(
+            &format!("/api/session/{session_id}/message/{exact}"),
+            directory,
+        )
+        .await
+    {
+        return Ok(RevertBoundary {
+            id: exact,
+            created: message_created(&message),
+        });
+    }
+    let mut users = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(cursor) => {
+                format!("/api/session/{session_id}/message?type=user&limit=200&cursor={cursor}")
+            }
+            None => format!("/api/session/{session_id}/message?type=user&order=asc&limit=200"),
+        };
+        let page = server.get_json(&path, directory).await?;
+        for message in page
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = message.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            users.push((
+                id.to_owned(),
+                message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                message_created(message),
+            ));
+        }
+        match page.pointer("/cursor/next").and_then(Value::as_str) {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    pick_revert_boundary(&users, target).ok_or_else(|| {
+        HarnessError::Protocol("OpenCode has no matching user message for this revert".into())
+    })
+}
+
+fn message_created(message: &Value) -> i64 {
+    message
+        .pointer("/data/time/created")
+        .or_else(|| message.pointer("/time/created"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+}
+
+struct RevertBoundary {
+    id: String,
+    created: i64,
+}
+
+/// Text first, ordinal second. Old chats predate client-supplied ids and may
+/// have merged steers, so the exact text outranks the position.
+fn pick_revert_boundary(
+    users: &[(String, String, i64)],
+    target: &RevertTarget,
+) -> Option<RevertBoundary> {
+    let needle = normalize_revert_text(&target.text);
+    if !needle.is_empty() {
+        if let Some((id, _, created)) = users
+            .iter()
+            .find(|(_, text, _)| normalize_revert_text(text) == needle)
+        {
+            return Some(RevertBoundary {
+                id: id.clone(),
+                created: *created,
+            });
+        }
+        if let Some((id, text, created)) = users.get(target.user_index)
+            && normalize_revert_text(text).contains(&needle)
+        {
+            return Some(RevertBoundary {
+                id: id.clone(),
+                created: *created,
+            });
+        }
+        if let Some((id, _, created)) = users
+            .iter()
+            .find(|(_, text, _)| normalize_revert_text(text).contains(&needle))
+        {
+            return Some(RevertBoundary {
+                id: id.clone(),
+                created: *created,
+            });
+        }
+    }
+    users
+        .get(target.user_index)
+        .map(|(id, _, created)| RevertBoundary {
+            id: id.clone(),
+            created: *created,
+        })
+}
+
+fn normalize_revert_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Assistant snapshots after the boundary name the files a revert would
+/// restore. Reading them is free; staging would rewrite the worktree.
+async fn revert_plan_files(
+    server: &Server,
+    session_id: &str,
+    directory: Option<&str>,
+    boundary: &RevertBoundary,
+) -> Result<Vec<String>, HarnessError> {
+    match revert_plan_files_from_cursor(server, session_id, directory, boundary).await {
+        Ok(files) => Ok(files),
+        Err(_) => {
+            revert_plan_files_from_time(server, session_id, directory, boundary.created).await
+        }
+    }
+}
+
+async fn revert_plan_files_from_cursor(
+    server: &Server,
+    session_id: &str,
+    directory: Option<&str>,
+    boundary: &RevertBoundary,
+) -> Result<Vec<String>, HarnessError> {
+    let mut cursor = message_cursor(&boundary.id);
+    let mut files = Vec::new();
+    loop {
+        let page = server
+            .get_json(
+                &format!(
+                    "/api/session/{session_id}/message?type=assistant&limit=200&cursor={cursor}"
+                ),
+                directory,
+            )
+            .await?;
+        collect_snapshot_files(&page, &mut files);
+        match page.pointer("/cursor/next").and_then(Value::as_str) {
+            Some(next) => cursor = next.to_owned(),
+            None => break,
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+async fn revert_plan_files_from_time(
+    server: &Server,
+    session_id: &str,
+    directory: Option<&str>,
+    after: i64,
+) -> Result<Vec<String>, HarnessError> {
+    let mut cursor: Option<String> = None;
+    let mut files = Vec::new();
+    loop {
+        let path = match &cursor {
+            Some(cursor) => format!(
+                "/api/session/{session_id}/message?type=assistant&limit=200&cursor={cursor}"
+            ),
+            None => {
+                format!("/api/session/{session_id}/message?type=assistant&order=desc&limit=200")
+            }
+        };
+        let page = server.get_json(&path, directory).await?;
+        let mut reached = false;
+        for message in page
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if message_created(message) <= after {
+                reached = true;
+                continue;
+            }
+            collect_message_snapshot_files(message, &mut files);
+        }
+        if reached {
+            break;
+        }
+        match page.pointer("/cursor/next").and_then(Value::as_str) {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_snapshot_files(page: &Value, files: &mut Vec<String>) {
+    for message in page
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        collect_message_snapshot_files(message, files);
+    }
+}
+
+fn collect_message_snapshot_files(message: &Value, files: &mut Vec<String>) {
+    if message.get("type").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(snapshot_files) = message.pointer("/snapshot/files").and_then(Value::as_array) else {
+        return;
+    };
+    for file in snapshot_files {
+        if let Some(file) = file.as_str() {
+            files.push(file.to_owned());
+        }
+    }
+}
+
+/// OpenCode's v2 message cursor is base64url JSON. We synthesize the one that
+/// starts after the boundary so the preview reads only the reverted tail.
+fn message_cursor(message_id: &str) -> String {
+    use base64::Engine as _;
+    let payload = serde_json::json!({
+        "id": message_id,
+        "order": "asc",
+        "direction": "next",
+    });
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -2583,6 +2985,7 @@ struct TurnSpec<'a> {
     model: Option<&'a (String, String)>,
     variant: Option<&'a str>,
     attachments: &'a [String],
+    message_id: Option<&'a str>,
 }
 
 fn command_body_v2(
@@ -2597,7 +3000,7 @@ fn command_body_v2(
     {
         let mut body = json!({"name": name, "text": text});
         if !attachments.is_empty() {
-            body["files"] = prompt_body_v2(text, attachments)["files"].clone();
+            body["files"] = prompt_body_v2(text, attachments, None)["files"].clone();
         }
         body
     } else {
@@ -2627,6 +3030,7 @@ async fn post_prompt(
         model,
         variant,
         attachments,
+        message_id,
     } = spec;
     let protocol = server.protocol().await;
     if let Some((name, arguments)) =
@@ -2702,7 +3106,17 @@ async fn post_prompt(
         ),
         Protocol::V2 => (
             format!("/api/session/{session_id}/prompt"),
-            prompt_body_v2(prompt, attachments),
+            prompt_body_v2(
+                prompt,
+                attachments,
+                message_id.filter(|_| {
+                    server
+                        .version
+                        .get()
+                        .and_then(|v| v.number)
+                        .is_some_and(|v| v >= (2, 0, 11))
+                }),
+            ),
         ),
     };
     let server = Server {

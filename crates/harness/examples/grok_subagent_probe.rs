@@ -32,6 +32,7 @@ async fn main() {
             rx
         }),
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
     };

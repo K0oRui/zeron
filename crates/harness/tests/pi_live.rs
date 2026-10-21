@@ -71,6 +71,7 @@ async fn real_pi_mock_lifecycle() {
             realtime: None,
             execution_lease: None,
             steering,
+            user_message_id: None,
             interrupt: interrupt.clone(),
             request_input: Box::new(|questions| {
                 let (tx, rx) = oneshot::channel();
@@ -180,6 +181,7 @@ async fn real_pi_mock_lifecycle() {
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),
         turn: Default::default(),
@@ -253,6 +255,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| oneshot::channel().1),
         turn: Default::default(),

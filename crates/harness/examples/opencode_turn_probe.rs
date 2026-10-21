@@ -85,6 +85,7 @@ async fn main() {
                     rx
                 }),
                 steering,
+                user_message_id: None,
                 interrupt: interrupt.clone(),
                 turn: Default::default(),
             },

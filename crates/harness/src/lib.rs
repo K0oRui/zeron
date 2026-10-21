@@ -65,6 +65,16 @@ impl SteerMessage {
     }
 }
 
+/// A transcript boundary a harness can rewind to. `message_id` is Zeron's
+/// entry id; `user_index` counts user entries before it (for providers that
+/// predate client-supplied message ids); `text` is its prompt text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevertTarget {
+    pub message_id: String,
+    pub user_index: usize,
+    pub text: String,
+}
+
 /// Host ↔ runtime signals that span a persistent runtime's turns.
 ///
 /// Stopping a turn is not tearing down the runtime: a runtime holds work the
@@ -137,6 +147,10 @@ pub struct RunControls {
     >,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
+    /// Zeron's id for the user message that started this run, when one exists.
+    /// Drivers that can map it to a native message id use it for exact revert
+    /// boundaries.
+    pub user_message_id: Option<String>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
@@ -263,6 +277,30 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         Err(HarnessError::Protocol(
             "title generation is not supported by this harness".into(),
+        ))
+    }
+
+    /// Resolve a revert at `target` and report the files it would restore.
+    /// The caller must have torn down the live runtime first.
+    async fn revert_preview(
+        &self,
+        _request: RunRequest,
+        _target: RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        Err(HarnessError::Protocol(
+            "chat revert is not supported by this harness".into(),
+        ))
+    }
+
+    /// Commit the revert at `target`, optionally restoring file snapshots.
+    async fn revert_commit(
+        &self,
+        _request: RunRequest,
+        _target: RevertTarget,
+        _files: bool,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Protocol(
+            "chat revert is not supported by this harness".into(),
         ))
     }
 

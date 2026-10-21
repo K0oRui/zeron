@@ -130,6 +130,7 @@ fn controls(
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: token.clone(),
         turn: Default::default(),
     };
@@ -624,6 +625,7 @@ async fn approvals_round_trip_as_input_requests() {
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: token.clone(),
         turn: Default::default(),
     };

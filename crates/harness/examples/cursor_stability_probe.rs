@@ -23,6 +23,7 @@ async fn turn(
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
@@ -144,6 +145,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
@@ -257,6 +259,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: token.clone(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();
@@ -398,6 +401,7 @@ async fn history(harness: &CursorHarness, count: usize) {
         realtime: None,
         execution_lease: None,
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();

@@ -296,6 +296,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
             rx
         }),
         steering,
+        user_message_id: None,
         interrupt: token.clone(),
         turn: Default::default(),
     };

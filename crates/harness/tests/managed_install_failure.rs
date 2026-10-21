@@ -42,6 +42,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
     };

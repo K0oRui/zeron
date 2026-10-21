@@ -75,6 +75,7 @@ fn controls(
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: token.clone(),
         turn: Default::default(),
     };
@@ -309,6 +310,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: token.clone(),
         turn: Default::default(),
     };
