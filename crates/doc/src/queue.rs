@@ -290,6 +290,17 @@ impl SessionDoc {
         Ok(true)
     }
 
+    /// Drop every queued row. Returns how many were removed.
+    pub fn clear_queue(&self) -> Result<usize, DocError> {
+        let queue = self.doc().get_movable_list("queue");
+        let removed = queue.len();
+        if removed > 0 {
+            queue.delete(0, removed)?;
+            self.doc().commit();
+        }
+        Ok(removed)
+    }
+
     /// Remove a row and hand it back — the host's "send this one" path.
     /// `None` when it is already gone, which is the race we want: two devices
     /// popping the same row means exactly one of them gets it.
@@ -466,6 +477,18 @@ mod tests {
         doc.push_queued(&first).unwrap();
         doc.push_queued(&item("q2", "second")).unwrap();
         assert_eq!(doc.read_queue().unwrap(), vec![first, item("q2", "second")]);
+    }
+
+    #[test]
+    fn clear_queue_drops_every_held_send() {
+        let doc = doc();
+        for (id, text) in [("q1", "first"), ("q2", "second")] {
+            doc.push_queued(&item(id, text)).unwrap();
+        }
+
+        assert_eq!(doc.clear_queue().unwrap(), 2);
+        assert!(doc.read_queue().unwrap().is_empty());
+        assert_eq!(doc.clear_queue().unwrap(), 0);
     }
 
     #[test]

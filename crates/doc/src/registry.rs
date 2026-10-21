@@ -1488,6 +1488,23 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Clear the sidebar freshness after the last message was removed.
+    pub fn clear_chat_last_message(&mut self, chat_id: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("lastMessagePreview", Value::Null),
+                ("lastMessageAt", Value::Null),
+            ]),
+        );
+        Ok(true)
+    }
+
     /// Tombstone: delete the chat row (and its session-status row). The
     /// per-chat session doc remains — this removes the index entry only.
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {

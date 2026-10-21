@@ -466,6 +466,30 @@ impl SessionDoc {
             .collect())
     }
 
+    /// Remove `message_id` and every entry after it. Returns how many entries
+    /// were removed; 0 means the id was already gone (another device reverted).
+    pub fn truncate_messages(&self, message_id: &str) -> Result<usize, DocError> {
+        let messages = self.doc.get_list("messages");
+        let boundary = (0..messages.len()).find(|index| {
+            matches!(
+                messages.get(*index),
+                Some(loro::ValueOrContainer::Container(loro::Container::Map(map)))
+                    if matches!(
+                        map.get("id"),
+                        Some(loro::ValueOrContainer::Value(LoroValue::String(id)))
+                            if id.as_str() == message_id
+                    )
+            )
+        });
+        let Some(boundary) = boundary else {
+            return Ok(0);
+        };
+        let removed = messages.len().saturating_sub(boundary);
+        messages.delete(boundary, removed)?;
+        self.doc.commit();
+        Ok(removed)
+    }
+
     /// Read a bounded suffix directly from the containers, without expanding
     /// the full messages tree. For first paint only: the full watch must follow.
     /// Limits count parts rather than joined messages (one turn can have tens
@@ -1455,6 +1479,46 @@ mod tests {
         assert_eq!(entries[0].parts, vec![seam]);
     }
     use zeron_proto::{AgentEvent, ToolCall};
+
+    fn plain_entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            duration_ms: None,
+            id: id.into(),
+            role,
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: text.into(),
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn truncate_messages_drops_the_boundary_and_everything_after_it() {
+        let doc = SessionDoc::init("truncate").unwrap();
+        for (id, role) in [
+            ("u1", MessageRole::User),
+            ("a1", MessageRole::Assistant),
+            ("u2", MessageRole::User),
+            ("a2", MessageRole::Assistant),
+        ] {
+            doc.push_message(&plain_entry(id, role, id)).unwrap();
+        }
+
+        assert_eq!(doc.truncate_messages("u2").unwrap(), 2);
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+
+        // A second device already removed it: no-op, not an error.
+        assert_eq!(doc.truncate_messages("u2").unwrap(), 0);
+        assert_eq!(doc.read_entries().unwrap().len(), 2);
+    }
 
     #[test]
     fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
