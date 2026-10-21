@@ -3294,6 +3294,11 @@ pub struct Transcript {
     /// link-roots revision that resets `file_link_roots`.
     inline_code_links: crate::markdown::inline_code_links::InlineCodeLinkCache,
     rendered_rows: HashSet<SharedString>,
+    /// Visible y band per row, relative to the row's own top, for the tool
+    /// group chip window. Rows build inside the list's own layout borrow, so
+    /// they cannot ask the list for their bounds; `render` takes the snapshot
+    /// before the list element is constructed.
+    tool_group_bands: HashMap<usize, (f32, f32)>,
     /// Last UI typography generation reflected in `list` item measurements.
     /// Family and size changes can alter prose wrapping without changing row
     /// identity, so the virtual list must explicitly discard cached heights.
@@ -3673,6 +3678,7 @@ impl Transcript {
             file_link_roots: Default::default(),
             inline_code_links: Default::default(),
             rendered_rows: HashSet::new(),
+            tool_group_bands: HashMap::new(),
             typography_generation: crate::typography::generation(cx),
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
@@ -7323,15 +7329,7 @@ impl Transcript {
         // rests below the chrome it fades under. The right pane already pads
         // for the titlebar — an override instance's first row keeps only the
         // ordinary turn gap, or the content sits double-chrome low.
-        let top_gap = if ix == 0 {
-            if self.doc_override.is_some() {
-                Theme::SPACE_LG
-            } else {
-                Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
-            }
-        } else {
-            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
-        };
+        let top_gap = self.row_top_gap(ix);
         // The last row must clear the composer/status stack the transcript
         // scrolls under PLUS the fade band above it, or the timestamp strip
         // (the row's lowest content) renders half-faded (or hidden) when the
@@ -7576,6 +7574,7 @@ impl Transcript {
                 *auto_open,
                 *worked_secs,
                 *compact_shell,
+                self.tool_group_bands.get(&ix).copied(),
                 &theme,
                 cx,
             ),
@@ -7984,6 +7983,52 @@ impl Transcript {
         Some(Arc::new(crate::changes::DiffHighlights { old, new }))
     }
 
+    /// Vertical gap opening the row at `ix` (see [`top_gap_for`]).
+    fn row_top_gap(&self, ix: usize) -> f32 {
+        let Some(row) = self.rows.get(ix) else {
+            return Theme::SPACE_SM;
+        };
+        if ix == 0 {
+            if self.doc_override.is_some() {
+                Theme::SPACE_LG
+            } else {
+                Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
+            }
+        } else {
+            top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), row)
+        }
+    }
+
+    /// Snapshot the viewport band for every measured row near the scroll top,
+    /// relative to each row's own top. Rows build inside the list's own layout
+    /// borrow, so they cannot query it from `render_row`; take the readings
+    /// here, before the list element is constructed, and cache them.
+    fn refresh_tool_group_bands(&mut self) {
+        self.tool_group_bands.clear();
+        let viewport = self.list.viewport_bounds();
+        if viewport.size.height <= px(0.0) {
+            return;
+        }
+        // Generous slack: the band only decides which chips build, and the
+        // chips that do build cannot be allowed to pop in at the viewport edge.
+        const OVERSCAN: f32 = 480.0;
+        let band_top = f32::from(viewport.top()) - OVERSCAN;
+        let band_bottom = f32::from(viewport.bottom()) + OVERSCAN;
+        let mut ix = self.list.logical_scroll_top().item_ix;
+        while ix < self.rows.len() {
+            let Some(row_bounds) = self.list.bounds_for_item(ix) else {
+                break;
+            };
+            if f32::from(row_bounds.top()) > band_bottom {
+                break;
+            }
+            let top = f32::from(row_bounds.top()) + self.row_top_gap(ix);
+            self.tool_group_bands
+                .insert(ix, (band_top - top, band_bottom - top));
+            ix += 1;
+        }
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
@@ -7992,6 +8037,7 @@ impl Transcript {
         auto_open: bool,
         worked_secs: Option<i64>,
         compact_shell: bool,
+        visible_band: Option<(f32, f32)>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -8299,6 +8345,32 @@ impl Transcript {
         {
             motion_active = true;
         }
+        // Long expanded groups render only the chips the viewport can reach.
+        // Skipped bands keep their exact height as spacers, so the row's
+        // measured height and every fold/reveal offset stay unchanged. Skip
+        // the window while an entrance or fold tween is running.
+        let visible_chips = visible_band
+            .filter(|_| !motion_active)
+            .map(|(top, bottom)| {
+                let mut cursor = CHIPS_TOP_PAD
+                    + if collapses {
+                        TOOL_GROUP_HEADER_HEIGHT
+                    } else {
+                        0.0
+                    };
+                let mut first = tools.len();
+                let mut last = 0;
+                for (ix, height) in row_heights.iter().enumerate() {
+                    let chip_bottom = cursor + *height;
+                    if chip_bottom >= top && cursor <= bottom {
+                        first = first.min(ix);
+                        last = ix + 1;
+                    }
+                    cursor = chip_bottom + CHIP_GAP;
+                }
+                first..last.max(first)
+            })
+            .unwrap_or(0..tools.len());
         let revealed_height = CHIPS_TOP_PAD
             + row_heights
                 .iter()
@@ -8428,12 +8500,38 @@ impl Transcript {
                 .into_any_element();
         }
 
+        // Offscreen chips collapse into one spacer on each side. A single
+        // empty box still costs a layout pass; two boxes keep long groups
+        // proportional to the viewport instead of the tool count.
+        let top_spacer = (visible_chips.start > 0).then(|| {
+            let skipped = visible_chips.start;
+            let height = row_heights[..skipped].iter().sum::<f32>()
+                + CHIP_GAP * skipped.saturating_sub(1) as f32;
+            div()
+                .h(px(height))
+                .flex_none()
+                .into_any_element()
+        });
+        let bottom_spacer = (visible_chips.end < tools.len()).then(|| {
+            let skipped = tools.len() - visible_chips.end;
+            let height = row_heights[visible_chips.end..].iter().sum::<f32>()
+                + CHIP_GAP * skipped.saturating_sub(1) as f32;
+            div()
+                .h(px(height))
+                .flex_none()
+                .into_any_element()
+        });
+        let visible_tools = tools
+            .iter()
+            .enumerate()
+            .skip(visible_chips.start)
+            .take(visible_chips.len());
         let chips = div()
             .pt(px(CHIPS_TOP_PAD))
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
-            .children(tools.iter().enumerate().map(|(ix, tool)| {
+            .children(top_spacer.into_iter().chain(visible_tools.map(|(ix, tool)| {
                 let reveal = reveal_progress[ix];
                 let connector_reveal = connector_progress[ix];
                 let content_reveal = tool_connector_parts(connector_reveal, ix > 0).1;
@@ -8646,7 +8744,8 @@ impl Transcript {
                     }))
                     .into_any_element();
                 reveal_tool_row(row, row_height, reveal)
-            }));
+            }))
+            .chain(bottom_spacer));
 
         let chips = chips.into_any_element();
 
@@ -10403,6 +10502,7 @@ impl Render for Transcript {
                     .ok();
             });
         }
+        self.refresh_tool_group_bands();
         let rail = self.render_rail(cx);
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
@@ -10596,6 +10696,7 @@ mod tests {
                 *auto_open,
                 None,
                 false,
+                None,
                 &Theme::dark(),
                 cx,
             );
@@ -11206,6 +11307,7 @@ mod tests {
                     *auto_open,
                     None,
                     false,
+                    None,
                     &Theme::dark(),
                     cx,
                 );
@@ -11246,6 +11348,7 @@ mod tests {
                     *auto_open,
                     None,
                     false,
+                    None,
                     &Theme::dark(),
                     cx,
                 );
