@@ -2,7 +2,9 @@ name: cleanup
 
 # Keep the Actions tab and the cache storage usable: after any CI workflow
 # finishes, drop every run but the latest per workflow and every cache but
-# the most recently accessed one (10 GB repo limit).
+# the most recently accessed one (10 GB repo limit). Work is capped and stops
+# when the API quota runs low, so a backlog drains over a few runs instead of
+# failing this workflow.
 on:
   workflow_run:
     workflows: [
@@ -20,6 +22,8 @@ on:
       "Windows tests",
     ]
     types: [completed]
+  schedule:
+    - cron: '43 6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -40,23 +44,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REPO="${{ github.repository }}"
-          # GitHub answers 502/503 transiently under load; retry before giving
-          # up so one bad response does not fail the whole cleanup.
+          # Leave headroom for the CI that triggered this run.
+          remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo 0)
+          if [ "${remaining:-0}" -lt 200 ]; then
+            echo "::warning::API quota low ($remaining); leaving the rest for a later run"
+            exit 0
+          fi
+          # GitHub answers 502/503 transiently under load; retry before
+          # giving up. A run that survives only costs history.
           delete_run() {
-            for attempt in 1 2 3 4 5; do
+            for attempt in 1 2 3; do
               if gh api -X DELETE "$1" >/dev/null 2>&1; then return 0; fi
               sleep $((attempt * 2))
             done
             echo "::warning::could not delete $1"
           }
-          for workflow in $(gh api "/repos/$REPO/actions/workflows" --jq '.workflows[].id'); do
-            count=$(gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=1" --jq '.total_count')
-            [ "$count" -le 1 ] && continue
+          workflows=$(gh api "/repos/$REPO/actions/workflows" --jq '.workflows[].id' 2>/dev/null) || {
+            echo "::warning::could not list workflows; skipping run purge"
+            exit 0
+          }
+          for workflow in $workflows; do
+            count=$(gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=1" --jq '.total_count' 2>/dev/null) || continue
+            if [ "${count:-0}" -le 1 ]; then continue; fi
             # Keep the newest run overall; delete older runs only once they
-            # are completed. Deleting a queued or in-progress run answers
-            # 403 and aborts the whole step.
-            gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=100" --jq '.workflow_runs' \
+            # are completed. Deleting a queued or in-progress run answers 403.
+            gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=100" \
+              --jq '.workflow_runs' 2>/dev/null \
               | jq -r 'sort_by(.run_number) | reverse | .[1:] | map(select(.status == "completed")) | .[].id' \
+              | head -n 500 \
               | while read -r id; do
                   [ -z "$id" ] || delete_run "/repos/$REPO/actions/runs/$id"
                 done
@@ -67,17 +82,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REPO="${{ github.repository }}"
-          # Caches are deleted in parallel: a backlog can run to thousands,
-          # and a serial loop never drains it before the next run starts.
-          # A cache that survives the retries only costs storage, so warn
-          # instead of failing CI.
+          remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo 0)
+          if [ "${remaining:-0}" -lt 200 ]; then
+            echo "::warning::API quota low ($remaining); leaving the rest for a later run"
+            exit 0
+          fi
+          # Delete a bounded batch per run: a backlog of thousands drains over
+          # the next few completions instead of exhausting the quota. Deletes
+          # run in parallel because a serial loop cannot catch up.
           gh api --paginate "/repos/$REPO/actions/caches?per_page=100" \
-            --jq '.actions_caches[] | "\(.id) \(.last_accessed_at)"' \
+            --jq '.actions_caches[] | "\(.id) \(.last_accessed_at)"' 2>/dev/null \
             | sort -k2 -r \
             | tail -n +2 \
             | awk '{print $1}' \
+            | head -n 200 \
             | xargs -r -P 16 -I{} bash -c '
-                for attempt in 1 2 3; do
+                for attempt in 1 2; do
                   if gh api -X DELETE "$0" >/dev/null 2>&1; then exit 0; fi
                   sleep $((attempt * 2))
                 done
