@@ -153,10 +153,11 @@ impl Element for SmoothScroll {
             let window_handle = window.window_handle();
             let (first, left) =
                 glide_step(dy.clamp(-MAX_PENDING_PIXELS, MAX_PENDING_PIXELS), FRAME);
-            // The first slice lands before this wheel's update ends. Containers
-            // decide synchronously from the wheel they receive (the transcript
-            // releases its prompt hold, a list re-pins at the end) and a frame
-            // of delay lets their animation frames undo that input.
+            // The first slice goes out before this update ends: containers make
+            // decisions synchronously from the wheel they receive (the
+            // transcript releases a prompt hold and cancels a spring, a list
+            // re-pins at the end), and a frame of delay would let their
+            // animation frames undo that input first.
             cx.defer(move |cx| {
                 if !replay(cx, window_handle, bounds, first) || left == 0.0 {
                     return;

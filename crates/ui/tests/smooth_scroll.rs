@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::{
     Context, Modifiers, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, TestAppContext,
-    TouchPhase, Window, div, point, px, prelude::*,
+    TouchPhase, Window, div, point, prelude::*, px,
 };
 use zeron_ui::smooth_scroll::smooth_scroll;
 

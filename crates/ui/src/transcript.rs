@@ -14539,12 +14539,13 @@ mod tests {
                     assert!(transcript.read(cx).pinned);
                     draw(window, cx);
                     wheel(window, 300.0, cx);
-                    assert!(
-                        !transcript.read(cx).pinned,
-                        "upward input must cancel the spring synchronously"
-                    );
+                    // The eased wheel lands its first slice at the end of this
+                    // update, before any frame can run the spring.
                     cx.defer(move |cx| {
-                        assert!(!transcript.read(cx).pinned);
+                        assert!(
+                            !transcript.read(cx).pinned,
+                            "upward input must cancel the spring before the next frame"
+                        );
                         let before = transcript.read(cx).list.logical_scroll_top();
                         transcript.update(cx, |this, cx| {
                             let mut entries = this.state.read(cx).transcript.clone();
