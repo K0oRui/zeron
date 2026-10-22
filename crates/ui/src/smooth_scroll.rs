@@ -23,9 +23,9 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels, PlatformInput,
-    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
+    AnyElement, App, AppContext, AsyncApp, Bounds, DispatchPhase, Element, ElementId,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels,
+    PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
 };
 
 /// Replay cadence, one step per display frame. More frequent replays only redraw
@@ -66,7 +66,14 @@ pub fn smooth_scroll(child: impl IntoElement) -> SmoothScroll {
 fn glide_step(remaining: f32, elapsed: Duration) -> (f32, f32) {
     let step = remaining * (1.0 - (-elapsed.as_secs_f32() / TIME_CONSTANT).exp());
     let left = remaining - step;
-    (step, if left.abs() < MIN_REMAINDER { 0.0 } else { left })
+    (
+        step,
+        if left.abs() < MIN_REMAINDER {
+            0.0
+        } else {
+            left
+        },
+    )
 }
 
 pub struct SmoothScroll {
@@ -144,7 +151,8 @@ impl Element for SmoothScroll {
             }
             cx.stop_propagation();
             let window_handle = window.window_handle();
-            let (first, left) = glide_step(dy.clamp(-MAX_PENDING_PIXELS, MAX_PENDING_PIXELS), FRAME);
+            let (first, left) =
+                glide_step(dy.clamp(-MAX_PENDING_PIXELS, MAX_PENDING_PIXELS), FRAME);
             // The first slice lands before this wheel's update ends. Containers
             // decide synchronously from the wheel they receive (the transcript
             // releases its prompt hold, a list re-pins at the end) and a frame
