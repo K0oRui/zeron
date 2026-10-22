@@ -3,8 +3,8 @@
 //! A mouse wheel arrives as one large jump per notch (Windows sends lines,
 //! macOS mostly pixels), so the container snaps and the eye only sees the start
 //! and end. This wrapper takes the notch over and feeds the same travel back
-//! over the next few frames, shrinking every step geometrically: ~15% of a
-//! notch on the first frame, ~15% of what is left on the next, and so on.
+//! over the next few frames, shrinking every step geometrically: about 40% of
+//! a notch lands immediately, then 40% of what is left every 16ms.
 //! Precision-touchpad streams (small per-event pixel deltas) and sideways
 //! travel pass straight through untouched.
 //!
@@ -23,18 +23,19 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AsyncApp, Bounds, DispatchPhase, Element, ElementId, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels, PlatformInput, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, Window, point, px,
+    AnyElement, App, AppContext, AsyncApp, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
+    Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels, PlatformInput,
+    ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
 };
 
-/// Replay cadence. Faster than a 60Hz frame so the eased steps stay small
-/// enough to read as motion rather than a slowed-down snap.
-const FRAME: Duration = Duration::from_millis(8);
+/// Replay cadence, one step per display frame. More frequent replays only redraw
+/// the same frame twice and make every wheel notch re-run the scroll handlers
+/// twice as often.
+const FRAME: Duration = Duration::from_millis(16);
 
 /// Time constant of the exponential chase, in seconds. ~95% of a notch lands
-/// in 150ms.
-const TIME_CONSTANT: f32 = 0.05;
+/// in about 90ms; a longer tail reads as input lag when the wheel spins.
+const TIME_CONSTANT: f32 = 0.03;
 
 /// Per-event travel below this is already continuous (a trackpad stream), so
 /// it keeps the platform's own scrolling.
@@ -142,19 +143,32 @@ impl Element for SmoothScroll {
                 return;
             }
             cx.stop_propagation();
-            let mut remaining = dy.clamp(-MAX_PENDING_PIXELS, MAX_PENDING_PIXELS);
             let window_handle = window.window_handle();
-            cx.spawn(async move |cx: &mut AsyncApp| {
-                while remaining != 0.0 {
-                    cx.background_executor().timer(FRAME).await;
-                    let (step, left) = glide_step(remaining, FRAME);
-                    remaining = left;
-                    if step != 0.0 && !replay(cx, window_handle, bounds, step) {
-                        return;
-                    }
+            let (first, left) = glide_step(dy.clamp(-MAX_PENDING_PIXELS, MAX_PENDING_PIXELS), FRAME);
+            // The first slice lands before this wheel's update ends. Containers
+            // decide synchronously from the wheel they receive (the transcript
+            // releases its prompt hold, a list re-pins at the end) and a frame
+            // of delay lets their animation frames undo that input.
+            cx.defer(move |cx| {
+                if !replay(cx, window_handle, bounds, first) || left == 0.0 {
+                    return;
                 }
-            })
-            .detach();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    let mut remaining = left;
+                    loop {
+                        cx.background_executor().timer(FRAME).await;
+                        let (step, left) = glide_step(remaining, FRAME);
+                        remaining = left;
+                        if step != 0.0 && !replay(cx, window_handle, bounds, step) {
+                            return;
+                        }
+                        if remaining == 0.0 {
+                            return;
+                        }
+                    }
+                })
+                .detach();
+            });
         });
     }
 }
@@ -170,8 +184,8 @@ impl IntoElement for SmoothScroll {
 /// Push one eased slice back through the window's normal wheel dispatch.
 /// Returns false when the pointer left the wrapper (or the window is gone), in
 /// which case the glide is abandoned rather than scrolling someone else.
-fn replay(
-    cx: &mut AsyncApp,
+fn replay<C: AppContext>(
+    cx: &mut C,
     window_handle: gpui::AnyWindowHandle,
     bounds: Bounds<Pixels>,
     dy: f32,
@@ -218,10 +232,10 @@ mod tests {
     }
 
     #[test]
-    fn glide_first_step_is_a_small_share_of_the_notch() {
+    fn glide_first_step_is_a_snappy_share_of_the_notch() {
         let (step, left) = glide_step(100.0, FRAME);
-        assert!(step > 10.0 && step < 20.0, "step {step}");
-        assert!(left > 80.0);
+        assert!(step > 35.0 && step < 48.0, "step {step}");
+        assert!(left > 50.0);
     }
 
     #[test]

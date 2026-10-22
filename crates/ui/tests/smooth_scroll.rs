@@ -52,16 +52,17 @@ fn a_mouse_notch_glides_over_several_frames(cx: &mut TestAppContext) {
 
     // Negative y is one notch down; positive would clamp against the top.
     cx.simulate_event(wheel(ScrollDelta::Lines(point(0.0, -3.0))));
-    assert_eq!(
-        scrolled(&scroll),
-        0.0,
-        "the notch is queued, not applied in one jump"
+    cx.update(|window, cx| window.draw(cx).clear());
+    let started = scrolled(&scroll);
+    assert!(
+        started < notch * 0.6,
+        "the notch starts as a slice, not one jump: {started} of {notch}"
     );
 
     let mut frames = 0;
-    let mut first_move = None;
+    let mut first_move = (started > 0.0).then_some(started);
     while scrolled(&scroll) < notch - 0.01 && frames < 120 {
-        clock.advance_clock(Duration::from_millis(8));
+        clock.advance_clock(Duration::from_millis(16));
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
         frames += 1;
