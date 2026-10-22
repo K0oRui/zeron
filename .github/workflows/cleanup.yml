@@ -25,11 +25,12 @@ on:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    # One cleanup at a time: every workflow completion triggers this, so
-    # superseded runs cancel instead of piling up behind each other.
+    # One cleanup at a time. A started purge is allowed to finish: cancelling
+    # it mid-list restarts from the top and never drains a backlog. Triggers
+    # that arrive while it runs collapse into one pending run.
     concurrency:
       group: cleanup
-      cancel-in-progress: true
+      cancel-in-progress: false
     permissions:
       actions: write
       contents: read
@@ -66,20 +67,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REPO="${{ github.repository }}"
-          # Same transient 502s as run deletion. A cache that survives the
-          # retries only costs storage, so warn instead of failing CI.
-          delete_cache() {
-            for attempt in 1 2 3 4 5; do
-              if gh api -X DELETE "$1" >/dev/null 2>&1; then return 0; fi
-              sleep $((attempt * 2))
-            done
-            echo "::warning::could not delete $1"
-          }
+          # Caches are deleted in parallel: a backlog can run to thousands,
+          # and a serial loop never drains it before the next run starts.
+          # A cache that survives the retries only costs storage, so warn
+          # instead of failing CI.
           gh api --paginate "/repos/$REPO/actions/caches?per_page=100" \
             --jq '.actions_caches[] | "\(.id) \(.last_accessed_at)"' \
             | sort -k2 -r \
             | tail -n +2 \
             | awk '{print $1}' \
-            | while read -r id; do
-                [ -z "$id" ] || delete_cache "/repos/$REPO/actions/caches/$id"
-              done
+            | xargs -r -P 16 -I{} bash -c '
+                for attempt in 1 2 3; do
+                  if gh api -X DELETE "$0" >/dev/null 2>&1; then exit 0; fi
+                  sleep $((attempt * 2))
+                done
+                echo "::warning::could not delete $0"' \
+                "/repos/$REPO/actions/caches/{}"
