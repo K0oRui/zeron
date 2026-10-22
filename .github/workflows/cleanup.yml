@@ -57,7 +57,7 @@ jobs:
             gh api "/repos/$REPO/actions/workflows/$workflow/runs?per_page=100" --jq '.workflow_runs' \
               | jq -r 'sort_by(.run_number) | reverse | .[1:] | map(select(.status == "completed")) | .[].id' \
               | while read -r id; do
-                  [ -n "$id" ] && delete_run "/repos/$REPO/actions/runs/$id"
+                  [ -z "$id" ] || delete_run "/repos/$REPO/actions/runs/$id"
                 done
           done
 
@@ -81,5 +81,5 @@ jobs:
             | tail -n +2 \
             | awk '{print $1}' \
             | while read -r id; do
-                [ -n "$id" ] && delete_cache "/repos/$REPO/actions/caches/$id"
+                [ -z "$id" ] || delete_cache "/repos/$REPO/actions/caches/$id"
               done
