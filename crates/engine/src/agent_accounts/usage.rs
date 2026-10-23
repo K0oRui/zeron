@@ -350,20 +350,25 @@ impl AgentAccounts {
 
 /// Grok's `/billing?format=credits`: the current period, with the Grok Build
 /// product's share of it (the blended `creditUsagePercent` as fallback).
+/// Proto3 omits zero scalars, so a fresh period can arrive without either
+/// field: a valid `currentPeriod` there means zero used, not schema drift.
 pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapshot> {
     let config = body.get("config")?;
     let period = config.get("currentPeriod");
-    let used_percent = config
+    let product_percent = config
         .get("productUsage")
         .and_then(|u| u.as_array())
         .and_then(|products| {
-            products.iter().find_map(|p| {
-                (p.get("product").and_then(|v| v.as_str()) == Some("GrokBuild"))
-                    .then(|| p.get("usagePercent").and_then(|v| v.as_f64()))
-                    .flatten()
-            })
-        })
-        .or_else(|| config.get("creditUsagePercent").and_then(|v| v.as_f64()))?;
+            products
+                .iter()
+                .find(|p| p.get("product").and_then(|v| v.as_str()) == Some("GrokBuild"))
+                // An omitted percentage on a present product is zero (proto3).
+                .map(|p| p.get("usagePercent").and_then(json_f64).unwrap_or(0.0))
+        });
+    let used_percent = product_percent
+        .or_else(|| config.get("creditUsagePercent").and_then(json_f64))
+        .or_else(|| on_demand_percent(config))
+        .or_else(|| period.is_some().then_some(0.0))?;
     let label = match period.and_then(|p| p.get("type")).and_then(|v| v.as_str()) {
         Some("USAGE_PERIOD_TYPE_DAILY") => "Day",
         Some("USAGE_PERIOD_TYPE_WEEKLY") => "Week",
@@ -373,7 +378,7 @@ pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
     Some(UsageSnapshot {
         windows: vec![AgentUsageWindow {
             label: label.to_string(),
-            used_fraction: (used_percent / 100.0) as f32,
+            used_fraction: (used_percent.clamp(0.0, 100.0) / 100.0) as f32,
             resets_at: parse_when(
                 period
                     .and_then(|p| p.get("end"))
@@ -382,6 +387,26 @@ pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
         }],
         plan_label: None,
     })
+}
+
+/// `onDemandUsed / onDemandCap` when the account has an on-demand allowance.
+/// The values are proto3 money objects (`{"val": n}`), and an omitted `val`
+/// is zero.
+fn on_demand_percent(config: &serde_json::Value) -> Option<f64> {
+    let cap = config
+        .get("onDemandCap")
+        .and_then(|v| v.get("val"))
+        .and_then(json_f64)
+        .unwrap_or(0.0);
+    if cap <= 0.0 {
+        return None;
+    }
+    let used = config
+        .get("onDemandUsed")
+        .and_then(|v| v.get("val"))
+        .and_then(json_f64)
+        .unwrap_or(0.0);
+    Some(used / cap * 100.0)
 }
 
 /// Who a Devin key belongs to, from its status reply.

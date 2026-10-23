@@ -292,6 +292,56 @@ fn grok_usage_uses_the_grok_build_share_of_the_period() {
     assert!(grok_usage_snapshot(&serde_json::json!({ "config": {} })).is_none());
 }
 
+#[test]
+fn grok_usage_treats_an_omitted_percent_as_zero() {
+    // Proto3 zero-elision: a fresh weekly period has no `creditUsagePercent`.
+    let body = serde_json::json!({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2030-01-08T00:00:00Z",
+            },
+            "onDemandCap": { "val": 0 },
+            "onDemandUsed": { "val": 0 },
+            "isUnifiedBillingUser": true,
+        }
+    });
+    let snapshot = grok_usage_snapshot(&body).unwrap();
+    assert_eq!(snapshot.windows.len(), 1);
+    assert_eq!(snapshot.windows[0].label, "Week");
+    assert_eq!(snapshot.windows[0].used_fraction, 0.0);
+    assert!(snapshot.windows[0].resets_at.is_some());
+
+    // A present product with an omitted percentage is zero too.
+    let body = serde_json::json!({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2030-01-08T00:00:00Z",
+            },
+            "productUsage": [{ "product": "GrokBuild" }],
+        }
+    });
+    let snapshot = grok_usage_snapshot(&body).unwrap();
+    assert_eq!(snapshot.windows[0].used_fraction, 0.0);
+}
+
+#[test]
+fn grok_usage_falls_back_to_on_demand_spend() {
+    let body = serde_json::json!({
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2030-01-08T00:00:00Z",
+            },
+            "onDemandCap": { "val": 200 },
+            "onDemandUsed": { "val": 50 },
+        }
+    });
+    let snapshot = grok_usage_snapshot(&body).unwrap();
+    assert!((snapshot.windows[0].used_fraction - 0.25).abs() < 1e-6);
+}
+
 #[tokio::test]
 async fn grok_logins_snapshot_swap_and_forget() {
     let tmp = tempfile::tempdir().unwrap();
