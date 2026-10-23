@@ -1021,6 +1021,14 @@ pub struct UiSettings {
     pub sidebar_show_project_filter: bool,
     /// The Archived accordion below the active session list.
     pub sidebar_show_archived: bool,
+    /// Disclosure state for the sidebar's Pinned, Sessions, and Archived
+    /// groups, remembered across launches.
+    pub sidebar_pinned_open: bool,
+    pub sidebar_sessions_open: bool,
+    pub sidebar_archived_open: bool,
+    /// Device and project groups the user closed, keyed by organization.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub sidebar_collapsed_groups: std::collections::HashSet<String>,
     /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
@@ -1218,6 +1226,10 @@ impl Default for UiSettings {
             sidebar_show_pull_request: true,
             sidebar_show_project_filter: true,
             sidebar_show_archived: true,
+            sidebar_pinned_open: true,
+            sidebar_sessions_open: true,
+            sidebar_archived_open: true,
+            sidebar_collapsed_groups: std::collections::HashSet::new(),
             github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -1874,6 +1886,10 @@ impl UiSettings {
             sidebar_show_pull_request,
             sidebar_show_project_filter,
             sidebar_show_archived,
+            sidebar_pinned_open,
+            sidebar_sessions_open,
+            sidebar_archived_open,
+            sidebar_collapsed_groups,
             github_star_banner_dismissed,
             last_space_id,
             last_project_action_by_space_id,
@@ -2915,6 +2931,12 @@ mod tests {
             sidebar_show_pull_request: false,
             sidebar_show_project_filter: false,
             sidebar_show_archived: false,
+            sidebar_pinned_open: false,
+            sidebar_sessions_open: true,
+            sidebar_archived_open: false,
+            sidebar_collapsed_groups: std::collections::HashSet::from([
+                "project:acme/zeron".to_string(),
+            ]),
             github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
@@ -3057,6 +3079,33 @@ mod tests {
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));
         assert!(json.contains(r#""codeFontSize": 11.0"#));
+    }
+
+    #[test]
+    fn sidebar_disclosures_default_open_and_keep_closed_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300.0}"#).unwrap();
+        let mut settings = UiSettings::load(dir.path());
+        assert!(settings.sidebar_pinned_open);
+        assert!(settings.sidebar_sessions_open);
+        assert!(settings.sidebar_archived_open);
+
+        settings.sidebar_pinned_open = false;
+        settings.sidebar_archived_open = false;
+        settings
+            .sidebar_collapsed_groups
+            .insert("project:acme/zeron".into());
+        settings.save(dir.path()).unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.sidebar_pinned_open);
+        assert!(loaded.sidebar_sessions_open);
+        assert!(!loaded.sidebar_archived_open);
+        assert!(
+            loaded
+                .sidebar_collapsed_groups
+                .contains("project:acme/zeron")
+        );
     }
 
     #[test]

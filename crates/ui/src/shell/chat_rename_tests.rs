@@ -223,7 +223,7 @@ fn rename_opens_a_collapsed_pinned_section_with_its_motion(cx: &mut TestAppConte
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
         shell.set_chat_pinned("older".into(), true, cx);
-        shell.pinned_open = false;
+        shell.settings.sidebar_pinned_open = false;
         cx.notify();
     });
     redraw(cx);
@@ -231,7 +231,7 @@ fn rename_opens_a_collapsed_pinned_section_with_its_motion(cx: &mut TestAppConte
     rename(&shell, cx, "older");
     assert_eq!(editing(&shell, cx).as_deref(), Some("older"));
     shell.read_with(cx, |shell, _| {
-        assert!(shell.pinned_open);
+        assert!(shell.settings.sidebar_pinned_open);
         // The queued reveal became the disclosure's opening motion.
         assert!(shell.sidebar_reveal_motions.is_empty());
         let motion = shell.sidebar_disclosure_motion["pinned"];
@@ -245,14 +245,14 @@ fn rename_opens_a_collapsed_pinned_section_with_its_motion(cx: &mut TestAppConte
 fn rename_opens_collapsed_sessions_groups_and_the_sidebar(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
-        shell.sessions_open = false;
+        shell.settings.sidebar_sessions_open = false;
         shell.settings.sidebar_collapsed = true;
         cx.notify();
     });
     redraw(cx);
     rename(&shell, cx, "newer");
     shell.read_with(cx, |shell, _| {
-        assert!(shell.sessions_open);
+        assert!(shell.settings.sidebar_sessions_open);
         assert!(!shell.settings.sidebar_collapsed);
     });
     assert_eq!(editing(&shell, cx).as_deref(), Some("newer"));
@@ -262,6 +262,7 @@ fn rename_opens_collapsed_sessions_groups_and_the_sidebar(cx: &mut TestAppContex
         shell.finish_rename_chat(false, cx);
         shell.settings.sidebar_organization = SidebarOrganization::ByProject;
         shell
+            .settings
             .sidebar_collapsed_groups
             .insert("project:home:local".into());
         cx.notify();
@@ -269,7 +270,7 @@ fn rename_opens_collapsed_sessions_groups_and_the_sidebar(cx: &mut TestAppContex
     redraw(cx);
     rename(&shell, cx, "older");
     shell.read_with(cx, |shell, _| {
-        assert!(shell.sidebar_collapsed_groups.is_empty());
+        assert!(shell.settings.sidebar_collapsed_groups.is_empty());
         assert!(shell.sidebar_reveal_motions.is_empty());
     });
     assert!(cx.debug_bounds("chat-title-editor-older").is_some());
@@ -286,7 +287,7 @@ fn rename_pages_the_archived_shelf_to_its_row(cx: &mut TestAppContext) {
         true,
     );
     shell.update(cx, |shell, cx| {
-        shell.archived_open = false;
+        shell.settings.sidebar_archived_open = false;
         cx.notify();
     });
     redraw(cx);
@@ -294,7 +295,7 @@ fn rename_pages_the_archived_shelf_to_its_row(cx: &mut TestAppContext) {
     // Oldest last: the 13th row is past the first page of ten.
     rename(&shell, cx, "archived-12");
     shell.read_with(cx, |shell, _| {
-        assert!(shell.archived_open);
+        assert!(shell.settings.sidebar_archived_open);
         assert_eq!(shell.archived_shown, 35);
     });
     assert!(cx.debug_bounds("chat-title-editor-archived-12").is_some());

@@ -1284,6 +1284,7 @@ struct SidebarSessionGap {
 }
 
 /// The same slot-to-slot easing as pinned reordering, applied to the actual row.
+#[derive(Clone)]
 struct SidebarSessionSlide {
     from: f32,
     to: f32,
@@ -1313,6 +1314,10 @@ struct SidebarSessionReturn {
     transfer: SidebarSessionTransfer,
     epoch: u64,
     started: std::time::Instant,
+    /// The drop committed and the row now lives in its new slot. Sibling
+    /// offsets are already part of that layout, so they must not glide a
+    /// second time; only the lifted card travels home.
+    landed: bool,
 }
 
 /// Live destination for a pinned-session drag. The real row remains clipped
@@ -1322,8 +1327,6 @@ struct PinnedSessionDragState {
     visible_ids: std::sync::Arc<Vec<String>>,
     from: usize,
     over: usize,
-    prev_over: usize,
-    epoch: usize,
     filter: Option<String>,
     profile_key: String,
     pointer_y: Option<f32>,
@@ -1331,6 +1334,22 @@ struct PinnedSessionDragState {
     viewport_bottom: f32,
     generation: u64,
     autoscroll_active: bool,
+    /// One paint slide per pinned row, retargeted from where each row is
+    /// currently drawn so a fast drag never snaps a sibling back to its last
+    /// slot before gliding on.
+    siblings: Vec<SidebarSessionSlide>,
+    /// One pinned slot (the dragged row's height plus the list gap).
+    step: f32,
+}
+
+impl PinnedSessionDragState {
+    fn retarget_siblings(&mut self) {
+        for (ix, slide) in self.siblings.iter_mut().enumerate() {
+            slide.retarget(
+                crate::terminal::panel::slide_offset(ix, self.from, self.over) * self.step,
+            );
+        }
+    }
 }
 
 /// Drag payload for reordering custom sections by their header.
@@ -1371,12 +1390,21 @@ struct SidebarProjectDrag {
 }
 
 /// The lifted project card that follows the pointer, plus the section it
-/// would land in.
+/// would land in and where among that section's projects. While it reorders
+/// inside its own section, its emptied slot slides to the insertion point and
+/// its siblings close up behind it.
 struct SidebarProjectDragState {
     payload: SidebarProjectDrag,
     pointer: Point<Pixels>,
     cursor_offset: Point<Pixels>,
     target: Option<String>,
+    index: Option<usize>,
+    /// The section holding the project when it was lifted, and its slot there.
+    source_section: Option<String>,
+    source_index: Option<usize>,
+    /// The lifted block's painted height (header plus sessions).
+    height: f32,
+    siblings: std::collections::HashMap<String, SidebarSessionSlide>,
     generation: u64,
 }
 
@@ -1390,6 +1418,10 @@ pub(super) struct SidebarSectionProject {
 }
 
 type SidebarKeyedRow = (String, f32, AnyElement);
+
+/// Per-section project slots as painted: project key, top, bottom.
+type SidebarProjectSlots =
+    std::cell::RefCell<std::collections::HashMap<String, Vec<(String, f32, f32)>>>;
 
 struct SidebarSessionRows {
     custom_count: usize,
@@ -2135,16 +2167,10 @@ pub struct Shell {
     /// Shared route clock and measured prepaint geometry for the persistent composer.
     composer_dock: crate::composer_dock::SharedDock,
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
-    /// Session-transient disclosure state, matching the Archived shelf.
-    pub(super) pinned_open: bool,
-    pub(super) sessions_open: bool,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
+    /// The sidebar's Archived shelf page count. The disclosure state lives in
+    /// settings so a closed shelf stays closed; `archived_shown` pages the
     /// expanded list ("Show more" reveals another page).
-    pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
-    /// Ephemeral collapsed project/device sections, keyed by organization + id.
-    pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2320,8 +2346,14 @@ pub struct Shell {
     /// A project in flight, drawn as a lifted card over the list.
     sidebar_project_drag: Option<SidebarProjectDragState>,
     sidebar_project_drag_generation: u64,
+    /// Remaining project-slide offsets after a drop, gliding home.
+    sidebar_project_settle: std::collections::HashMap<String, f32>,
+    sidebar_project_settle_epoch: u64,
     /// Each custom section's painted bounds, measured every frame.
     sidebar_section_bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<Pixels>>>>,
+    /// Each custom section's painted project slots in order: project key, top,
+    /// bottom. Read while a project drag picks its insertion index.
+    sidebar_section_project_bounds: std::rc::Rc<SidebarProjectSlots>,
     /// Painted content-space y extents of sidebar chat rows, keyed by chat id.
     /// Rows outside the viewport keep a fixed-height placeholder in the tree;
     /// the extents let the next frame know which ones can skip their content.
@@ -2719,11 +2751,7 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
-            pinned_open: true,
-            sessions_open: true,
             archived_shown: 0,
-            sidebar_collapsed_groups: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -2830,7 +2858,10 @@ impl Shell {
             sidebar_section_drag: None,
             sidebar_project_drag: None,
             sidebar_project_drag_generation: 0,
+            sidebar_project_settle: Default::default(),
+            sidebar_project_settle_epoch: 0,
             sidebar_section_bounds: Default::default(),
+            sidebar_section_project_bounds: Default::default(),
             sidebar_row_extents: Default::default(),
             sidebar_virtual_window: None,
             sidebar_pin_write: None,
@@ -9520,7 +9551,7 @@ impl Shell {
         if self.sidebar_project_drag.is_some()
             && (!cx.has_active_drag() || !self.sidebar_section_projects_supported(cx))
         {
-            self.end_sidebar_project_drag(cx);
+            self.end_sidebar_project_drag(false, cx);
         }
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
@@ -9573,7 +9604,7 @@ impl Shell {
             order.push((
                 "sidebar-pinned-header".to_string(),
                 spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT
-                    + if self.pinned_open {
+                    + if self.settings.sidebar_pinned_open {
                         spaces::SIDEBAR_DISCLOSURE_BODY_INSET - SIDEBAR_LIST_GAP
                     } else {
                         0.0
@@ -9590,17 +9621,17 @@ impl Shell {
                         } else {
                             0.0
                         }
-                        + if self.sessions_open {
+                        + if self.settings.sidebar_sessions_open {
                             spaces::SIDEBAR_DISCLOSURE_BODY_INSET - SIDEBAR_LIST_GAP
                         } else {
                             0.0
                         },
                 ));
             }
-            if ungrouped && ix >= regular_start && !self.sessions_open {
+            if ungrouped && ix >= regular_start && !self.settings.sidebar_sessions_open {
                 continue;
             }
-            if ix < pinned_count && !self.pinned_open {
+            if ix < pinned_count && !self.settings.sidebar_pinned_open {
                 continue;
             }
             order.push((key.clone(), *height));
@@ -9648,7 +9679,7 @@ impl Shell {
                     .as_ref()
                     .is_none_or(|drag| drag.preview.as_ref().is_none_or(|gap| gap.pinned))
             })
-            .map(|drag| (drag.from, drag.over, drag.prev_over, drag.epoch));
+            .map(|drag| (drag.from, drag.siblings.clone()));
         // A lifted custom section leaves an empty slot behind and paints in
         // the list's movement layer; its siblings slide around the gap.
         let section_offsets = self
@@ -9676,26 +9707,16 @@ impl Shell {
                         .into_any_element();
                 }
                 if ix < pinned_count
-                    && let Some((from, over, prev_over, drag_epoch)) = pinned_drag
+                    && let Some((from, siblings)) = &pinned_drag
                 {
                     // Its actual row is drawn once in the sidebar's movement layer.
-                    if ix == from {
+                    if ix == *from {
                         return element;
                     }
-                    let start = crate::terminal::panel::slide_offset(ix, from, prev_over)
-                        * (self
-                            .sidebar_pinned_heights
-                            .get(from)
-                            .copied()
-                            .unwrap_or(61.0)
-                            + SIDEBAR_LIST_GAP);
-                    let target = crate::terminal::panel::slide_offset(ix, from, over)
-                        * (self
-                            .sidebar_pinned_heights
-                            .get(from)
-                            .copied()
-                            .unwrap_or(61.0)
-                            + SIDEBAR_LIST_GAP);
+                    let Some(slide) = siblings.get(ix) else {
+                        return element;
+                    };
+                    let (start, target, slide_epoch) = (slide.from, slide.to, slide.epoch);
                     if self.reduced_motion {
                         return div()
                             .relative()
@@ -9706,10 +9727,7 @@ impl Shell {
                     return div()
                         .child(element)
                         .with_animation(
-                            (
-                                "pinned-session-slide",
-                                (ix as u64) | ((drag_epoch as u64) << 32),
-                            ),
+                            ("pinned-session-slide", (ix as u64) | (slide_epoch << 32)),
                             TAB_SLIDE.animation(),
                             move |el, t| el.relative().top(px(motion::lerp(start, target, t))),
                         )

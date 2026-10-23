@@ -163,7 +163,12 @@ fn sidebar_session_drop_pins(
 }
 
 /// Preview geometry only: regular ordering is never persisted by a drag.
-fn sidebar_gap_offset(row: usize, source: Option<usize>, boundary: usize, height: f32) -> f32 {
+pub(super) fn sidebar_gap_offset(
+    row: usize,
+    source: Option<usize>,
+    boundary: usize,
+    height: f32,
+) -> f32 {
     match source {
         Some(source) if row == source => 0.0,
         Some(source) if row < source && row >= boundary => height,
@@ -1049,6 +1054,291 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn sidebar_project_group_right_click_opens_project_actions(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.spaces = ["a"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                    })).unwrap()).collect();
+                    state.chats = {
+                        let mut chat = pin_test_chat("a-new");
+                        chat.space_id = Some("a".into());
+                        vec![chat]
+                    };
+                });
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let at = cx.debug_bounds("sidebar-group-project:a").unwrap().center();
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::default());
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                let (space_id, _) = shell.space_menu.get().expect("project menu opens");
+                assert_eq!(space_id.as_str(), "a");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_projects_reorder_inside_a_section(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| serde_json::from_value(serde_json::json!({
+                            "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                        })).unwrap())
+                        .collect();
+                    state.chats = [("a-new", "a"), ("b-new", "b")]
+                        .into_iter()
+                        .map(|(id, project)| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat
+                        })
+                        .collect();
+                });
+                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
+                shell.settings.sidebar_sections_by_profile.insert(
+                    key,
+                    vec![crate::settings::SidebarSection {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        session_ids: vec![],
+                        project_keys: vec!["a".into(), "b".into()],
+                        collapsed: false,
+                    }],
+                );
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let order = |cx: &mut gpui::VisualTestContext| {
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.active_sidebar_sections(cx)[0].project_keys.clone()
+                })
+                .unwrap()
+        };
+        assert_eq!(order(&mut cx), ["a", "b"]);
+        let from = cx.debug_bounds("section-project-focus-b").unwrap().center();
+        let a_top = cx.debug_bounds("section-project-focus-a").unwrap().top();
+        let to = cx.debug_bounds("section-project-focus-a").unwrap().center();
+        let nudge = gpui::point(px(0.0), px(10.0));
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from - nudge, Some(MouseButton::Left), none);
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                let drag = shell.sidebar_project_drag.as_ref().unwrap();
+                assert_eq!(drag.target.as_deref(), Some("focus"));
+                assert_eq!(drag.index, Some(0), "released above the first project");
+                assert!(
+                    drag.siblings.get("a").is_some_and(|slide| slide.to > 0.0),
+                    "the project below the gap slides down to make room"
+                );
+            })
+            .unwrap();
+        assert!(
+            cx.debug_bounds("section-project-focus-b").is_none(),
+            "the lifted project is a landing pad until it is released"
+        );
+        assert!(
+            cx.debug_bounds("section-project-focus-a").unwrap().top() > a_top,
+            "the resting project moves to its previewed slot"
+        );
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(order(&mut cx), ["b", "a"]);
+        window
+            .update(&mut cx, |shell, _, _| {
+                assert!(shell.sidebar_project_drag.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_project_reorder_crosses_a_short_neighbour(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    state.chats = [("a-new", "a"), ("b-new", "b")]
+                        .into_iter()
+                        .map(|(id, project)| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat
+                        })
+                        .collect();
+                });
+                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
+                shell.settings.sidebar_sections_by_profile.insert(
+                    key,
+                    vec![crate::settings::SidebarSection {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        session_ids: vec![],
+                        project_keys: vec!["a".into(), "b".into()],
+                        collapsed: false,
+                    }],
+                );
+                let collapsed = shell.sidebar_group_collapse_key("a");
+                shell.settings.sidebar_collapsed_groups.insert(collapsed);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let from = cx.debug_bounds("section-project-focus-b").unwrap().center();
+        let to = cx.debug_bounds("section-project-focus-a").unwrap().center();
+        let nudge = gpui::point(px(0.0), px(10.0));
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from - nudge, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        // A second move while still over the dragged project's slot establishes
+        // its index, as a real pointer does before travelling to the target.
+        cx.simulate_mouse_move(from, Some(MouseButton::Left), none);
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                let drag = shell.sidebar_project_drag.as_ref().unwrap();
+                assert_eq!(drag.index, Some(0), "the pointer reached the first project");
+            })
+            .unwrap();
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, cx| {
+                assert_eq!(
+                    shell.active_sidebar_sections(cx)[0].project_keys,
+                    ["b", "a"]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_project_reorder_downward_past_a_tall_neighbour(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        use gpui::MouseButton;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    state.chats = [("a-new", "a"), ("b-new", "b")]
+                        .into_iter()
+                        .map(|(id, project)| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat
+                        })
+                        .collect();
+                });
+                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
+                shell.settings.sidebar_sections_by_profile.insert(
+                    key,
+                    vec![crate::settings::SidebarSection {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        session_ids: vec![],
+                        project_keys: vec!["a".into(), "b".into()],
+                        collapsed: false,
+                    }],
+                );
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+        cx.run_until_parked();
+        let from = cx.debug_bounds("section-project-focus-a").unwrap().center();
+        let to = cx.debug_bounds("section-project-focus-b").unwrap().center();
+        let nudge = gpui::point(px(0.0), px(10.0));
+        let none = gpui::Modifiers::default();
+        cx.simulate_mouse_down(from, MouseButton::Left, none);
+        cx.simulate_mouse_move(from + nudge, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        cx.simulate_mouse_move(from, Some(MouseButton::Left), none);
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, _| {
+                let drag = shell.sidebar_project_drag.as_ref().unwrap();
+                assert_eq!(drag.index, Some(1), "the pointer reached the second project");
+            })
+            .unwrap();
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |shell, _, cx| {
+                assert_eq!(
+                    shell.active_sidebar_sections(cx)[0].project_keys,
+                    ["b", "a"]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -1344,6 +1634,13 @@ mod pinned_session_tests {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
         });
         let (host, cx) = cx.add_window_view(|_, cx| {
             PinnedHost(cx.new(|cx| {
@@ -1380,13 +1677,13 @@ mod pinned_session_tests {
         });
         let shell = host.read_with(cx, |host, _| host.0.clone());
         for open in [true, false, true] {
-            if !open || !shell.read_with(cx, |shell, _| shell.pinned_open) {
+            if !open || !shell.read_with(cx, |shell, _| shell.settings.sidebar_pinned_open) {
                 let toggle = cx.debug_bounds("pinned-toggle").unwrap().center();
                 cx.simulate_mouse_down(toggle, MouseButton::Left, gpui::Modifiers::default());
                 cx.simulate_mouse_up(toggle, MouseButton::Left, gpui::Modifiers::default());
             }
             shell.update(cx, |shell, cx| {
-                assert_eq!(shell.pinned_open, open);
+                assert_eq!(shell.settings.sidebar_pinned_open, open);
                 let expected = if open {
                     vec!["pin", "regular"]
                 } else {
@@ -1532,10 +1829,10 @@ mod pinned_session_tests {
         // Hiding Archived removes the whole shelf without changing its chats or disclosure state.
         for visible in [false, true, false] {
             shell.update(cx, |shell, cx| {
-                let open = shell.archived_open;
+                let open = shell.settings.sidebar_archived_open;
                 shell.activate_sidebar_view_row(SidebarViewRow::ShowArchived, cx);
                 assert_eq!(shell.settings.sidebar_show_archived, visible);
-                assert_eq!(shell.archived_open, open);
+                assert_eq!(shell.settings.sidebar_archived_open, open);
                 assert_eq!(shell.archived_sidebar_chats(cx).len(), 1);
             });
             cx.update(|window, cx| {
@@ -1563,7 +1860,7 @@ mod pinned_session_tests {
             cx.simulate_mouse_down(toggle, MouseButton::Left, gpui::Modifiers::default());
             cx.simulate_mouse_up(toggle, MouseButton::Left, gpui::Modifiers::default());
             shell.update(cx, |shell, cx| {
-                assert_eq!(shell.sessions_open, open);
+                assert_eq!(shell.settings.sidebar_sessions_open, open);
                 assert_eq!(
                     shell.sidebar_visible_order(cx),
                     if open {
@@ -1675,6 +1972,13 @@ mod pinned_session_tests {
                 "successful pin must not replay the movement"
             );
             assert!(shell.sidebar_new_keys.is_empty());
+            assert!(
+                shell
+                    .sidebar_session_return
+                    .as_ref()
+                    .is_some_and(|returning| returning.landed)
+            );
+            shell.sidebar_session_return = None;
             cx.notify();
         });
 
@@ -1716,6 +2020,13 @@ mod pinned_session_tests {
                 "successful unpin must not replay the movement"
             );
             assert!(shell.sidebar_new_keys.is_empty());
+            assert!(
+                shell
+                    .sidebar_session_return
+                    .as_ref()
+                    .is_some_and(|returning| returning.landed)
+            );
+            shell.sidebar_session_return = None;
             cx.notify();
         });
 
@@ -1749,7 +2060,7 @@ mod pinned_session_tests {
 
         // A closed Pinned header remains a valid target and opens on success.
         shell.update(cx, |shell, cx| {
-            shell.pinned_open = false;
+            shell.settings.sidebar_pinned_open = false;
             cx.notify();
         });
         let from = cx.debug_bounds("chat-newer").unwrap().center();
@@ -1763,10 +2074,17 @@ mod pinned_session_tests {
         cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::default());
         cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
         shell.update(cx, |shell, cx| {
-            assert!(shell.pinned_open);
+            assert!(shell.settings.sidebar_pinned_open);
             assert_eq!(shell.active_sidebar_pins(cx), ids(&["newer"]));
             assert!(shell.sidebar_resort.is_empty());
             assert!(shell.sidebar_new_keys.is_empty());
+            assert!(
+                shell
+                    .sidebar_session_return
+                    .as_ref()
+                    .is_some_and(|returning| returning.landed)
+            );
+            shell.sidebar_session_return = None;
             cx.notify();
         });
 
@@ -1903,7 +2221,15 @@ mod pinned_session_tests {
             );
             assert!(shell.sidebar_new_keys.is_empty());
             assert!(shell.sidebar_session_transfer.is_none());
-            assert!(shell.sidebar_session_return.is_none());
+            // The lifted card glides into the slot the preview opened; the
+            // siblings themselves are already there and must not slide twice.
+            let returning = shell
+                .sidebar_session_return
+                .as_ref()
+                .expect("a completed reorder still lands the card");
+            assert!(returning.landed);
+            assert!(returning.transfer.preview.is_none());
+            shell.sidebar_session_return = None;
         });
 
         // Suppressing a completed drag must not disable later activity-driven glides.
@@ -1951,7 +2277,7 @@ mod pinned_session_tests {
         cx.simulate_mouse_down(toggle, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_up(toggle, MouseButton::Left, gpui::Modifiers::default());
         shell.update(cx, |shell, cx| {
-            assert!(!shell.sessions_open);
+            assert!(!shell.settings.sidebar_sessions_open);
             shell.sidebar_disclosure_motion.clear();
             cx.notify();
         });
@@ -1966,7 +2292,7 @@ mod pinned_session_tests {
         cx.simulate_mouse_move(target, Some(MouseButton::Left), gpui::Modifiers::default());
         cx.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
         shell.read_with(cx, |shell, cx| {
-            assert!(shell.sessions_open);
+            assert!(shell.settings.sidebar_sessions_open);
             assert!(shell.active_sidebar_pins(cx).is_empty());
         });
     }
@@ -3180,8 +3506,12 @@ impl Shell {
             });
         slide.retarget(target);
         let (from, to, epoch) = (slide.from, slide.to, slide.epoch);
+        let landing = self
+            .sidebar_session_return
+            .as_ref()
+            .is_some_and(|state| state.landed);
         let frame = div().relative().child(row);
-        if !returning || self.reduced_motion {
+        if self.reduced_motion || landing {
             frame.top(px(to)).into_any_element()
         } else {
             frame
@@ -3335,61 +3665,100 @@ impl Shell {
     pub(super) fn cancel_sidebar_session_transfer(&mut self, cx: &mut Context<Self>) {
         self.chat_status_hover = None;
         self.cancel_pinned_session_drag(cx);
-        if let Some(mut transfer) = self.sidebar_session_transfer.take() {
-            transfer.preview = None;
-            if !self.reduced_motion && self.sidebar_session_transfer_is_valid(&transfer.payload, cx)
-            {
-                self.sidebar_session_return = Some(SidebarSessionReturn {
-                    transfer,
-                    epoch: self.pinned_session_drag_generation,
-                    started: std::time::Instant::now(),
-                });
-                let epoch = self.pinned_session_drag_generation;
-                cx.spawn(async move |this, cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(
-                                SIDEBAR_DRAG_SCROLL_FRAME_MS,
-                            ))
-                            .await;
-                        let keep_running = this
-                            .update(cx, |shell, cx| {
-                                let Some(returning) = shell.sidebar_session_return.as_ref() else {
-                                    return false;
-                                };
-                                if returning.epoch != epoch {
-                                    return false;
-                                }
-                                if returning.started.elapsed() >= TAB_SLIDE.total()
-                                    && returning.transfer.slide.started.elapsed()
-                                        >= TAB_SLIDE.total()
-                                    && returning.transfer.source_collapse.started.elapsed()
-                                        >= TAB_SLIDE.total()
-                                    && returning
-                                        .transfer
-                                        .section_gaps
-                                        .values()
-                                        .all(|gap| gap.started.elapsed() >= TAB_SLIDE.total())
-                                {
-                                    shell.sidebar_session_return = None;
-                                    cx.notify();
-                                    return false;
-                                }
-                                cx.notify();
-                                true
-                            })
-                            .unwrap_or(false);
-                        if !keep_running {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-                self.pinned_session_drag_generation =
-                    self.pinned_session_drag_generation.wrapping_add(1);
-            }
-            cx.notify();
+        let Some(transfer) = self.sidebar_session_transfer.take() else {
+            return;
+        };
+        if !self.reduced_motion && self.sidebar_session_transfer_is_valid(&transfer.payload, cx) {
+            self.begin_sidebar_session_return(transfer, false, cx);
         }
+        cx.notify();
+    }
+
+    /// A committed drop: the row already sits in its new slot, so only the
+    /// lifted card travels home. Sibling slots must not replay their preview
+    /// offsets, which the new layout now contains.
+    pub(super) fn land_sidebar_session_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = self.sidebar_session_transfer.take() else {
+            return;
+        };
+        if self.reduced_motion {
+            cx.notify();
+            return;
+        }
+        self.begin_sidebar_session_return(transfer, true, cx);
+    }
+
+    /// Glide the lifted card from where the pointer released it to its slot.
+    /// The origin is re-anchored to the card first so the first frame does
+    /// not race to the card's pre-drag position.
+    fn begin_sidebar_session_return(
+        &mut self,
+        mut transfer: SidebarSessionTransfer,
+        landed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        transfer.preview = None;
+        transfer.origin.set(transfer.pointer - transfer.cursor_offset);
+        if landed {
+            transfer.source_collapse = SidebarSessionSlide {
+                from: 0.0,
+                to: 0.0,
+                epoch: 0,
+                started: std::time::Instant::now(),
+            };
+            transfer.collapsed_height = 0.0;
+            transfer.section_gaps.clear();
+        }
+        self.sidebar_session_return = Some(SidebarSessionReturn {
+            transfer,
+            epoch: self.pinned_session_drag_generation,
+            started: std::time::Instant::now(),
+            landed,
+        });
+        let epoch = self.pinned_session_drag_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(
+                        SIDEBAR_DRAG_SCROLL_FRAME_MS,
+                    ))
+                    .await;
+                let keep_running = this
+                    .update(cx, |shell, cx| {
+                        let Some(returning) = shell.sidebar_session_return.as_ref() else {
+                            return false;
+                        };
+                        if returning.epoch != epoch {
+                            return false;
+                        }
+                        if returning.started.elapsed() >= TAB_SLIDE.total()
+                            && returning.transfer.slide.started.elapsed()
+                                >= TAB_SLIDE.total()
+                            && returning.transfer.source_collapse.started.elapsed()
+                                >= TAB_SLIDE.total()
+                            && returning
+                                .transfer
+                                .section_gaps
+                                .values()
+                                .all(|gap| gap.started.elapsed() >= TAB_SLIDE.total())
+                        {
+                            shell.sidebar_session_return = None;
+                            cx.notify();
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+        self.pinned_session_drag_generation =
+            self.pinned_session_drag_generation.wrapping_add(1);
+        cx.notify();
     }
 
     pub(super) fn render_moving_sidebar_session(
@@ -3608,12 +3977,22 @@ impl Shell {
                 );
             }
         }
-        self.sidebar_session_transfer = None;
         self.cancel_pinned_session_drag(cx);
+        // The preview already drew every sibling in its final slot. Keep the
+        // lifted card and ease it into the row that is now actually there.
+        self.land_sidebar_session_transfer(cx);
+        let mut persist = false;
         if matches!(target, SidebarSessionDrop::Pinned(_)) {
-            self.pinned_open = true;
-        } else {
-            self.sessions_open = true;
+            if !self.settings.sidebar_pinned_open {
+                self.settings.sidebar_pinned_open = true;
+                persist = true;
+            }
+        } else if !self.settings.sidebar_sessions_open {
+            self.settings.sidebar_sessions_open = true;
+            persist = true;
+        }
+        if persist {
+            self.schedule_save(cx);
         }
         // Membership changes preserve each group's live activity sort.
         // Drag previews already animated this move. Establish a fresh layout
@@ -3690,7 +4069,7 @@ impl Shell {
         over: usize,
         cx: &mut Context<Self>,
     ) {
-        if !self.pinned_open
+        if !self.settings.sidebar_pinned_open
             || self.active_sidebar_pin_profile_key(cx).as_deref() != Some(&payload.profile_key)
         {
             self.cancel_pinned_session_drag(cx);
@@ -3716,9 +4095,8 @@ impl Shell {
                     && drag.visible_ids.as_ref() == payload.visible_ids.as_ref()
                     && drag.over != over =>
             {
-                drag.prev_over = drag.over;
                 drag.over = over;
-                drag.epoch = drag.epoch.wrapping_add(1);
+                drag.retarget_siblings();
                 cx.notify();
             }
             Some(drag)
@@ -3729,13 +4107,18 @@ impl Shell {
             _ => {
                 self.pinned_session_drag_generation =
                     self.pinned_session_drag_generation.wrapping_add(1);
-                self.pinned_session_drag = Some(PinnedSessionDragState {
+                let step = self
+                    .sidebar_pinned_heights
+                    .get(from)
+                    .copied()
+                    .unwrap_or(61.0)
+                    + SIDEBAR_LIST_GAP;
+                let now = std::time::Instant::now();
+                let mut drag = PinnedSessionDragState {
                     chat_id: payload.chat_id.clone(),
                     visible_ids: payload.visible_ids.clone(),
                     from,
                     over,
-                    prev_over: from,
-                    epoch: 0,
                     filter: payload.filter.clone(),
                     profile_key: payload.profile_key.clone(),
                     pointer_y: None,
@@ -3743,7 +4126,18 @@ impl Shell {
                     viewport_bottom: 0.0,
                     generation: self.pinned_session_drag_generation,
                     autoscroll_active: false,
-                });
+                    siblings: (0..payload.visible_ids.len())
+                        .map(|_| SidebarSessionSlide {
+                            from: 0.0,
+                            to: 0.0,
+                            epoch: 0,
+                            started: now,
+                        })
+                        .collect(),
+                    step,
+                };
+                drag.retarget_siblings();
+                self.pinned_session_drag = Some(drag);
                 cx.notify();
             }
         }
@@ -3865,9 +4259,8 @@ impl Shell {
         if let Some(drag) = self.pinned_session_drag.as_mut()
             && drag.over != over
         {
-            drag.prev_over = drag.over;
             drag.over = over;
-            drag.epoch = drag.epoch.wrapping_add(1);
+            drag.retarget_siblings();
         }
         cx.notify();
         true
@@ -3877,7 +4270,7 @@ impl Shell {
         let Some(drag) = self.pinned_session_drag.as_ref() else {
             return true;
         };
-        if !self.pinned_open
+        if !self.settings.sidebar_pinned_open
             || drag.filter != self.settings.space_filter
             || self.active_sidebar_pin_profile_key(cx).as_deref() != Some(&drag.profile_key)
         {
@@ -5237,8 +5630,8 @@ impl Shell {
             pinned_order,
             &custom_sections,
             self.settings.sidebar_organization,
-            self.sessions_open,
-            self.pinned_open,
+            self.settings.sidebar_sessions_open,
+            self.settings.sidebar_pinned_open,
             state,
         )
     }
@@ -5266,12 +5659,13 @@ impl Shell {
                 .is_some_and(|chat| {
                     self.sidebar_group_key(state, chat).is_none_or(|group| {
                         !self
+                            .settings
                             .sidebar_collapsed_groups
                             .contains(&self.sidebar_group_collapse_key(&group))
                     })
                 });
         }
-        self.archived_open
+        self.settings.sidebar_archived_open
             && self
                 .archived_sidebar_chats(cx)
                 .iter()
@@ -5347,10 +5741,12 @@ impl Shell {
             self.show_notice(crate::toast::ToastKind::Error, "Clear the project filter to rename this session", cx);
             return false;
         }
+        let mut persist = false;
         if let Some(chat) = &active {
             if self.active_sidebar_pins(cx).contains(&chat.id) {
-                if !self.pinned_open {
-                    self.pinned_open = true;
+                if !self.settings.sidebar_pinned_open {
+                    self.settings.sidebar_pinned_open = true;
+                    persist = true;
                     self.queue_sidebar_reveal("pinned");
                 }
             } else if let Some(section) = self.sidebar_section_for_chat(chat, cx) {
@@ -5377,26 +5773,36 @@ impl Shell {
                         && section.project_keys.contains(&key)
                     {
                         let collapse_key = self.sidebar_group_collapse_key(&key);
-                        self.sidebar_collapsed_groups.remove(&collapse_key);
+                        persist |= self
+                            .settings
+                            .sidebar_collapsed_groups
+                            .remove(&collapse_key);
                     }
                 }
             } else if let Some(group) = self.sidebar_group_key(self.state.read(cx), chat) {
                 let collapse_key = self.sidebar_group_collapse_key(&group);
-                if self.sidebar_collapsed_groups.remove(&collapse_key) {
+                if self
+                    .settings
+                    .sidebar_collapsed_groups
+                    .remove(&collapse_key)
+                {
+                    persist = true;
                     self.queue_sidebar_reveal(&format!("group:{collapse_key}"));
                 }
-            } else if !self.sessions_open {
-                self.sessions_open = true;
+            } else if !self.settings.sidebar_sessions_open {
+                self.settings.sidebar_sessions_open = true;
+                persist = true;
                 self.queue_sidebar_reveal("sessions");
             }
         } else if let Some(index) = archived {
             if !self.settings.sidebar_show_archived {
                 self.settings.sidebar_show_archived = true;
-                self.schedule_save(cx);
+                persist = true;
             }
-            if !self.archived_open {
-                self.archived_open = true;
+            if !self.settings.sidebar_archived_open {
+                self.settings.sidebar_archived_open = true;
                 self.archived_shown = ARCHIVED_INITIAL_ROWS;
+                persist = true;
                 self.queue_sidebar_reveal("archived");
             }
             // Page the shelf just far enough to include the row, in the
@@ -5407,6 +5813,9 @@ impl Shell {
                     + (index + 1 - ARCHIVED_INITIAL_ROWS).div_ceil(ARCHIVED_PAGE_ROWS)
                         * ARCHIVED_PAGE_ROWS;
             }
+        }
+        if persist {
+            self.schedule_save(cx);
         }
         if self.settings.sidebar_collapsed {
             self.toggle_sidebar(cx);
@@ -5558,8 +5967,8 @@ impl Shell {
                 pinned_order,
                 &custom_sections,
                 self.settings.sidebar_organization,
-                self.sessions_open,
-                self.pinned_open,
+                self.settings.sidebar_sessions_open,
+                self.settings.sidebar_pinned_open,
                 state,
             )
             .into_iter()
@@ -5888,7 +6297,7 @@ impl Shell {
                 } else {
                     None
                 };
-                let drag = (self.pinned_open || slot >= pinned_count)
+                let drag = (self.settings.sidebar_pinned_open || slot >= pinned_count)
                     .then(|| {
                         profile_key.as_ref().map(|profile_key| SidebarSessionDrag {
                             chat_id: chat.id.clone(),
@@ -6144,7 +6553,10 @@ impl Shell {
             }
             let collapse_key = self.sidebar_group_collapse_key(&key);
             let motion_key = format!("group:{collapse_key}");
-            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let collapsed = self
+                .settings
+                .sidebar_collapsed_groups
+                .contains(&collapse_key);
             let row_count = rendered_rows.len();
             let extra_gap = self.sidebar_transfer_extra_gap(&drag_group);
             let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
@@ -6242,19 +6654,39 @@ impl Shell {
                     move || format!("sidebar-group-{key}")
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
+                    let was_open = !this
+                        .settings
+                        .sidebar_collapsed_groups
+                        .contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
                         &toggle_motion_key,
                         if was_open { body_height } else { 0.0 },
                         if was_open { 0.0 } else { body_height },
                     );
                     if was_open {
-                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                        this.settings
+                            .sidebar_collapsed_groups
+                            .insert(toggle_key.clone());
                     } else {
-                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                        this.settings
+                            .sidebar_collapsed_groups
+                            .remove(&toggle_key);
                     }
+                    this.schedule_save(cx);
                     cx.notify();
                 }))
+                // Right-click offers the project's own actions: reveal its
+                // folder, rename it, or remove it.
+                .when(project_group, |el| {
+                    let project_key = key.clone();
+                    el.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_project_group_menu(&project_key, event.position, cx);
+                        }),
+                    )
+                })
                 // A project drags into a custom section from its group header.
                 .when_some(
                     (project_group && self.sidebar_section_projects_supported(cx)).then(|| {
@@ -6311,7 +6743,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.pinned_open;
+        let open = self.settings.sidebar_pinned_open;
         self.begin_queued_sidebar_reveal("pinned", open, body_height);
         let count = (!open).then_some(items.len());
         let chevron = self.sidebar_disclosure_chevron("pinned", open, theme);
@@ -6342,14 +6774,15 @@ impl Shell {
                 this.finish_sidebar_session_transfer(payload, SidebarSessionDrop::Pinned(0), cx);
             }))
             .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.pinned_open;
+                let was_open = this.settings.sidebar_pinned_open;
                 this.cancel_pinned_session_drag(cx);
                 this.begin_sidebar_disclosure_motion(
                     "pinned",
                     if was_open { body_height } else { 0.0 },
                     if was_open { 0.0 } else { body_height },
                 );
-                this.pinned_open = !was_open;
+                this.settings.sidebar_pinned_open = !was_open;
+                this.schedule_save(cx);
                 // The disclosure owns this movement; avoid a second FLIP
                 // animation on the regular sessions below it.
                 this.sidebar_prev_order.clear();
@@ -6388,7 +6821,7 @@ impl Shell {
         if self.settings.sidebar_organization != SidebarOrganization::InOneList {
             return content;
         }
-        let open = self.sessions_open;
+        let open = self.settings.sidebar_sessions_open;
         self.begin_queued_sidebar_reveal("sessions", open, body_height);
         let chevron = self.sidebar_disclosure_chevron("sessions", open, theme);
         let header = sidebar_disclosure_header(
@@ -6425,13 +6858,14 @@ impl Shell {
             }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.cancel_sidebar_session_transfer(cx);
-                let was_open = this.sessions_open;
+                let was_open = this.settings.sidebar_sessions_open;
                 this.begin_sidebar_disclosure_motion(
                     "sessions",
                     if was_open { body_height } else { 0.0 },
                     if was_open { 0.0 } else { body_height },
                 );
-                this.sessions_open = !was_open;
+                this.settings.sidebar_sessions_open = !was_open;
+                this.schedule_save(cx);
                 this.sidebar_prev_order.clear();
                 this.sidebar_resort.clear();
                 this.sidebar_new_keys.clear();
@@ -6500,7 +6934,7 @@ impl Shell {
                 .collect()
         };
         let total = rows.len();
-        let open = self.archived_open;
+        let open = self.settings.sidebar_archived_open;
         let shown = self.archived_shown.max(INITIAL);
         let visible_count = total.min(shown);
         let has_more = total > shown;
@@ -6545,14 +6979,15 @@ impl Shell {
             .id("archived-toggle")
             .debug_selector(|| "archived-toggle".into())
             .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
+                let was_open = this.settings.sidebar_archived_open;
                 this.begin_sidebar_disclosure_motion(
                     "archived",
                     if was_open { body_height } else { 0.0 },
                     if was_open { 0.0 } else { body_height },
                 );
-                this.archived_open = !was_open;
+                this.settings.sidebar_archived_open = !was_open;
                 this.archived_shown = INITIAL;
+                this.schedule_save(cx);
                 cx.notify();
             }));
         let section = div().flex().flex_col().child(header);
@@ -8103,6 +8538,34 @@ impl Shell {
         }
     }
 
+    /// The checkout a project's context menu acts on: this device's when it
+    /// has one, else the project's first member.
+    fn project_menu_space_id(&self, project_key: &str, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        let space = state
+            .spaces
+            .iter()
+            .find(|space| zeron_proto::view::project_key(space) == project_key)?;
+        state
+            .project_members(space)
+            .first()
+            .map(|member| member.id.clone())
+    }
+
+    /// Right-click on a project group: reveal, rename, or remove the project.
+    pub(super) fn open_project_group_menu(
+        &mut self,
+        project_key: &str,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(space_id) = self.project_menu_space_id(project_key, cx) else {
+            return;
+        };
+        self.space_menu.open((space_id, position));
+        cx.notify();
+    }
+
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.close_space_menu(cx);
         let current = self
@@ -8165,6 +8628,17 @@ impl Shell {
             let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
+            // Revealing only means something for a checkout on this device; a
+            // project hosted elsewhere simply doesn't offer the row.
+            let project_path = {
+                let state = self.state.read(cx);
+                state
+                    .space_row(&space_id)
+                    .filter(|space| {
+                        state.local_device_id.as_deref() == Some(space.device_id.as_str())
+                    })
+                    .map(|space| space.path.clone())
+            };
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -8172,6 +8646,23 @@ impl Shell {
                 }))
                 .flex()
                 .flex_col()
+                .when_some(project_path, |el, path| {
+                    el.child(
+                        popover::menu_row(&theme, false, format!("space-menu-open-{space_id}"))
+                            .id("space-menu-open")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_space_menu(cx);
+                                cx.reveal_path(std::path::Path::new(&path));
+                            }))
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Open folder")),
+                    )
+                    .child(popover::menu_separator())
+                })
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-rename-{space_id}"))
                         .id("space-menu-rename")

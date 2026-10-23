@@ -1665,6 +1665,76 @@ fn sidebar_sections_place_projects_apart_from_sessions() {
 }
 
 #[test]
+fn sidebar_sections_reorder_projects_with_anchors() {
+    use zeron_proto::SidebarSectionChange::*;
+    let mut doc = RegistryDoc::new("a");
+    for (id, path) in [
+        ("sp-1", "/work/one"),
+        ("sp-2", "/work/two"),
+        ("sp-3", "/work/three"),
+    ] {
+        doc.upsert_space(&space(id, "dev-a", path)).unwrap();
+    }
+    section_change(
+        &mut doc,
+        Create {
+            id: "focus".into(),
+            name: "Focus".into(),
+        },
+    );
+    for key in ["sp-1", "sp-2", "sp-3"] {
+        section_change(
+            &mut doc,
+            AssignProject {
+                project_key: key.into(),
+                section_id: Some("focus".into()),
+                after: None,
+                before: None,
+            },
+        );
+    }
+    let keys = |doc: &RegistryDoc| {
+        doc.sidebar_preferences().unwrap().sections[0]
+            .project_keys
+            .clone()
+    };
+    assert_eq!(keys(&doc), ["sp-1", "sp-2", "sp-3"]);
+    // Last to first.
+    section_change(
+        &mut doc,
+        AssignProject {
+            project_key: "sp-3".into(),
+            section_id: Some("focus".into()),
+            after: None,
+            before: Some("sp-1".into()),
+        },
+    );
+    assert_eq!(keys(&doc), ["sp-3", "sp-1", "sp-2"]);
+    // First to last.
+    section_change(
+        &mut doc,
+        AssignProject {
+            project_key: "sp-1".into(),
+            section_id: Some("focus".into()),
+            after: Some("sp-2".into()),
+            before: None,
+        },
+    );
+    assert_eq!(keys(&doc), ["sp-3", "sp-2", "sp-1"]);
+    // Back into the middle.
+    section_change(
+        &mut doc,
+        AssignProject {
+            project_key: "sp-1".into(),
+            section_id: Some("focus".into()),
+            after: Some("sp-3".into()),
+            before: Some("sp-2".into()),
+        },
+    );
+    assert_eq!(keys(&doc), ["sp-3", "sp-1", "sp-2"]);
+}
+
+#[test]
 fn sidebar_sections_honor_pin_toggles_from_older_clients() {
     use zeron_proto::SidebarSectionChange::*;
     let mut doc = RegistryDoc::new("a");

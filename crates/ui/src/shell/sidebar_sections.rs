@@ -59,6 +59,92 @@ fn sidebar_project_target(
         .map(|(ix, _)| ix)
 }
 
+/// How far past a midline the pointer must travel before the insertion point
+/// changes. Without it, a pointer resting on a boundary makes the line flip
+/// between two slots on every tiny movement.
+const PROJECT_DROP_BAND: f32 = 6.0;
+
+/// A header's measured centre can sit a pixel or two off its slot's centre.
+/// Near a midline the drag direction decides the side, so a drop on the
+/// header lands where the pointer travelled rather than on that rounding.
+const PROJECT_DROP_SNAP: f32 = 3.0;
+
+/// Where a released project would land among a section's placed projects:
+/// past each project whose header middle the pointer has crossed, with a dead
+/// band around the boundary it last chose. The dragged project's own slot does
+/// not count, so its index is the position it takes once lifted out. The first
+/// move away from that slot skips the band, so a short neighbour's header is
+/// still a usable drop point.
+fn project_drop_index(
+    slots: Option<&[(String, f32, f32)]>,
+    pointer_y: f32,
+    moving: &str,
+    previous: Option<usize>,
+    leaving_source: bool,
+    moving_down: Option<bool>,
+) -> usize {
+    let Some(slots) = slots else {
+        return 0;
+    };
+    // The header is the handle, so its middle decides the side even when the
+    // project's sessions make the block much taller.
+    let midlines: Vec<f32> = slots
+        .iter()
+        .filter(|(key, _, _)| key != moving)
+        .map(|(_, top, _)| top + spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT / 2.0)
+        .collect();
+    let below = midlines.iter().filter(|mid| pointer_y > **mid).count();
+    let up = midlines
+        .iter()
+        .filter(|mid| pointer_y > **mid + PROJECT_DROP_SNAP)
+        .count();
+    let down = midlines
+        .iter()
+        .filter(|mid| pointer_y + PROJECT_DROP_SNAP >= **mid)
+        .count();
+    // Near a midline the drag direction picks the side: down goes after the
+    // project, up goes before it. Without this, a drop on a short neighbour's
+    // middle never leaves the source slot.
+    let raw = match moving_down {
+        Some(true) => down,
+        Some(false) => up,
+        None => below,
+    };
+    let Some(previous) = previous.map(|index| index.min(midlines.len())) else {
+        return raw;
+    };
+    if raw == previous || leaving_source {
+        return raw;
+    }
+    if raw > previous {
+        // Moving down: hold the old slot until the next midline is clearly
+        // behind the pointer.
+        if pointer_y < midlines[previous] + PROJECT_DROP_BAND {
+            previous
+        } else {
+            raw
+        }
+    } else {
+        // Moving up: hold until the pointer is clearly above the last midline.
+        if pointer_y > midlines[previous - 1] - PROJECT_DROP_BAND {
+            previous
+        } else {
+            raw
+        }
+    }
+}
+
+/// The natural top of the insertion gap among a section's project slots, in
+/// window coordinates. `index` counts the projects that stay above the gap;
+/// the dragged project's own height is left out, as if it were already lifted.
+fn project_drop_top(slots: &[(String, f32, f32)], moving: &str, index: usize) -> Option<f32> {
+    let mut top = slots.first()?.1;
+    for (_, slot_top, slot_bottom) in slots.iter().filter(|(key, _, _)| key != moving).take(index) {
+        top += (slot_bottom - slot_top) + SIDEBAR_LIST_GAP;
+    }
+    Some(top)
+}
+
 pub(super) struct SectionDialog {
     profile: String,
     id: Option<String>,
@@ -341,10 +427,114 @@ impl Shell {
     ) -> SidebarKeyedRow {
         let id = section.id.clone();
         let open = !section.collapsed;
+        let reduced_motion = self.reduced_motion;
         let project_target = self
             .sidebar_project_drag
             .as_ref()
             .is_some_and(|drag| drag.target.as_deref() == Some(id.as_str()));
+        // The slots measured by the last paint, in natural section order. The
+        // preview never moves these: offsets are painted inside each slot.
+        let natural_slots: Vec<(String, f32, f32)> = self
+            .sidebar_section_project_bounds
+            .borrow()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let moving_key = self
+            .sidebar_project_drag
+            .as_ref()
+            .map(|drag| drag.payload.project_key.clone());
+        let insert = self
+            .sidebar_project_drag
+            .as_ref()
+            .filter(|drag| drag.target.as_deref() == Some(id.as_str()))
+            .and_then(|drag| drag.index);
+        // Reordering inside one section previews the real gap: the lifted
+        // block's slot becomes an empty landing pad and its siblings close in
+        // behind it. A move between sections keeps the plain insertion line.
+        // The lifted project keeps its emptied slot while it is anywhere in
+        // flight, so it never pops back into the list mid-drag.
+        let placeholder_key = self
+            .sidebar_project_drag
+            .as_ref()
+            .filter(|drag| drag.source_section.as_deref() == Some(id.as_str()))
+            .map(|drag| drag.payload.project_key.clone());
+        let in_place = self
+            .sidebar_project_drag
+            .as_ref()
+            .filter(|drag| {
+                !section.collapsed
+                    && drag.target.as_deref() == Some(id.as_str())
+                    && drag.source_section.as_deref() == Some(id.as_str())
+            })
+            .and_then(|drag| {
+                let moving = drag.payload.project_key.as_str();
+                let source = drag.source_index?;
+                let height = drag.height;
+                let index = drag.index?;
+                Some((moving.to_owned(), source, height, index))
+            });
+        let mut slide_frames: std::collections::HashMap<String, (f32, f32, u64)> =
+            std::collections::HashMap::new();
+        if let Some(drag) = self.sidebar_project_drag.as_mut() {
+            let moving = drag.payload.project_key.clone();
+            let boundary = in_place.as_ref().map(|(_, source, _, index)| {
+                if *index <= *source {
+                    *index
+                } else {
+                    *index + 1
+                }
+            });
+            let step = in_place
+                .as_ref()
+                .map(|(_, _, height, _)| height + SIDEBAR_LIST_GAP)
+                .unwrap_or(0.0);
+            let target_top = in_place
+                .as_ref()
+                .and_then(|(_, _, _, index)| project_drop_top(&natural_slots, &moving, *index));
+            for (ix, (key, top, _)) in natural_slots.iter().enumerate() {
+                let target = match (&in_place, boundary, target_top) {
+                    (Some(_), Some(_), Some(target_top)) if key == &moving => target_top - top,
+                    (Some(_), Some(boundary), _) => spaces::sidebar_gap_offset(
+                        ix,
+                        in_place.as_ref().map(|(_, source, _, _)| *source),
+                        boundary,
+                        step,
+                    ),
+                    _ => 0.0,
+                };
+                let slide =
+                    drag.siblings
+                        .entry(key.clone())
+                        .or_insert_with(|| SidebarSessionSlide {
+                            from: 0.0,
+                            to: 0.0,
+                            epoch: 0,
+                            started: std::time::Instant::now(),
+                        });
+                slide.retarget(target);
+                slide_frames.insert(key.clone(), (slide.from, slide.to, slide.epoch));
+            }
+        }
+        let anchors: Vec<String> = section
+            .project_keys
+            .iter()
+            .filter(|key| moving_key.as_ref() != Some(key))
+            .cloned()
+            .collect();
+        let insert_before = insert.and_then(|index| anchors.get(index).cloned());
+        let insert_after_last = insert.is_some_and(|index| index >= anchors.len());
+        let last_anchor = anchors.last().cloned();
+        let show_line = insert.is_some() && in_place.is_none();
+        let insert_line = || {
+            div()
+                .absolute()
+                .left(px(10.0))
+                .right(px(0.0))
+                .h(px(2.0))
+                .rounded_full()
+                .bg(theme.accent)
+        };
         let extra = self.sidebar_transfer_extra_gap(&drag_group);
         let session_count = rows.len()
             + projects
@@ -362,7 +552,10 @@ impl Shell {
                 rows: project_rows,
             } = project;
             let collapse_key = self.sidebar_group_collapse_key(&key);
-            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let collapsed = self
+                .settings
+                .sidebar_collapsed_groups
+                .contains(&collapse_key);
             let motion_key = format!("group:{collapse_key}");
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let count = project_rows.len();
@@ -380,12 +573,31 @@ impl Shell {
                 chevron,
             )
             .id(SharedString::from(format!("section-project-{id}-{key}")))
+            .debug_selector({
+                let id = id.clone();
+                let key = key.clone();
+                move || format!("section-project-{id}-{key}")
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.sidebar_collapsed_groups.remove(&toggle_key) {
-                    this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                if !this.settings.sidebar_collapsed_groups.remove(&toggle_key) {
+                    this.settings
+                        .sidebar_collapsed_groups
+                        .insert(toggle_key.clone());
                 }
+                this.schedule_save(cx);
                 cx.notify();
             }))
+            // Placed projects share the group header's context actions.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let project_key = key.clone();
+                    move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_project_group_menu(&project_key, event.position, cx);
+                    }
+                }),
+            )
             // A placed project drags back out, to its own group or another
             // section, from this header as well as from its group header.
             .when_some(
@@ -415,27 +627,94 @@ impl Shell {
                     .sum::<f32>()
                     + SIDEBAR_LIST_GAP * project_rows.len().saturating_sub(1) as f32
             };
-            let block = div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .child(header)
-                .when(!collapsed, |el| {
-                    el.child(
+            let line_before = show_line && insert_before.as_deref() == Some(key.as_str());
+            let line_after =
+                show_line && insert_after_last && last_anchor.as_deref() == Some(key.as_str());
+            let block_height = spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT + body_height;
+            // The lifted project leaves an empty landing pad of its own height
+            // so the gap can travel without moving the rows below it.
+            let placeholder = placeholder_key.as_deref() == Some(key.as_str());
+            let block: AnyElement = if placeholder {
+                // The slot keeps the whole block's height; only a header-high
+                // pad marks where the project will land.
+                div()
+                    .w_full()
+                    .h(px(block_height))
+                    .flex()
+                    .flex_col()
+                    .child(
                         div()
                             .w_full()
-                            .flex()
-                            .flex_col()
-                            .pl(px(10.0))
-                            .gap(px(SIDEBAR_LIST_GAP))
-                            .children(project_rows.into_iter().map(|(_, _, row)| row)),
+                            .h(px(spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+                            .flex_none()
+                            .rounded(px(8.0))
+                            .bg(theme.accent_wash.opacity(0.35))
+                            .border_1()
+                            .border_color(theme.accent.opacity(0.25)),
                     )
-                })
-                .into_any_element();
+                    .into_any_element()
+            } else {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .when(!collapsed, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .pl(px(10.0))
+                                .gap(px(SIDEBAR_LIST_GAP))
+                                .children(project_rows.into_iter().map(|(_, _, row)| row)),
+                        )
+                    })
+                    .relative()
+                    .when(line_before, |el| {
+                        el.child(insert_line().top(px(-SIDEBAR_LIST_GAP)))
+                    })
+                    .when(line_after, |el| {
+                        el.child(insert_line().bottom(px(-SIDEBAR_LIST_GAP)))
+                    })
+                    .into_any_element()
+            };
+            let slide = slide_frames.get(&key).copied();
+            let settle = self.sidebar_project_settle.get(&key).copied();
+            let settle_epoch = self.sidebar_project_settle_epoch;
+            let block: AnyElement = if !reduced_motion
+                && let Some(offset) = settle.filter(|offset| offset.abs() > 0.5)
+            {
+                div()
+                    .child(block)
+                    .with_animation(
+                        SharedString::from(format!("project-settle-{settle_epoch}-{key}")),
+                        TAB_SLIDE.animation(),
+                        move |el, t| el.relative().top(px(offset * (1.0 - t))),
+                    )
+                    .into_any_element()
+            } else {
+                match slide {
+                    Some((_, to, _)) if reduced_motion => {
+                        div().relative().top(px(to)).child(block).into_any_element()
+                    }
+                    Some((from, to, epoch)) if from != 0.0 || to != 0.0 => div()
+                        .child(block)
+                        .with_animation(
+                            SharedString::from(format!("project-slide-{key}-{epoch}")),
+                            TAB_SLIDE.animation(),
+                            move |el, t| el.relative().top(px(crate::motion::lerp(from, to, t))),
+                        )
+                        .into_any_element(),
+                    _ => block,
+                }
+            };
+            // The measured slot stays at its natural position; only its child
+            // slides.
             children.push((
                 format!("sp:{key}"),
-                spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT + body_height,
-                block,
+                block_height,
+                div().w_full().child(block).into_any_element(),
             ));
         }
         children.extend(rows);
@@ -531,12 +810,31 @@ impl Shell {
         } else {
             "Drop sessions here"
         };
+        // One prepaint pass replaces this section's slot table atomically, so
+        // a drag never sees a half-cleared list and jumps to the first slot.
+        let slot_map = self.sidebar_section_project_bounds.clone();
+        let slot_section = id.clone();
+        let slot_keys = section.project_keys.clone();
         let content = div()
             .w_full()
             .flex()
             .flex_col()
             .pt(px(spaces::SIDEBAR_DISCLOSURE_BODY_INSET))
             .gap(px(SIDEBAR_LIST_GAP))
+            .on_children_prepainted(move |bounds, _, _| {
+                let slots = slot_keys
+                    .iter()
+                    .zip(bounds.iter())
+                    .map(|(key, bounds)| {
+                        (
+                            key.clone(),
+                            f32::from(bounds.top()),
+                            f32::from(bounds.bottom()),
+                        )
+                    })
+                    .collect();
+                slot_map.borrow_mut().insert(slot_section.clone(), slots);
+            })
             .when(empty, |el| {
                 el.child(
                     div()
@@ -657,12 +955,45 @@ impl Shell {
         self.cancel_sidebar_session_transfer(cx);
         self.cancel_sidebar_section_drag(cx);
         self.section_menu = None;
+        self.sidebar_project_settle.clear();
+        self.sidebar_project_settle_epoch = self.sidebar_project_settle_epoch.wrapping_add(1);
+        let source = self
+            .active_sidebar_sections(cx)
+            .into_iter()
+            .find_map(|section| {
+                section
+                    .project_keys
+                    .iter()
+                    .position(|key| key == &payload.project_key)
+                    .map(|index| (section.id, index))
+            });
+        let height = source
+            .as_ref()
+            .and_then(|(id, _)| {
+                self.sidebar_section_project_bounds
+                    .borrow()
+                    .get(id)
+                    .and_then(|slots| {
+                        slots
+                            .iter()
+                            .find(|(key, _, _)| key == &payload.project_key)
+                            .map(|(_, top, bottom)| {
+                                (bottom - top).max(spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT)
+                            })
+                    })
+            })
+            .unwrap_or(spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT);
         self.sidebar_project_drag_generation = self.sidebar_project_drag_generation.wrapping_add(1);
         self.sidebar_project_drag = Some(SidebarProjectDragState {
             payload: payload.clone(),
             pointer: window.mouse_position(),
             cursor_offset,
             target: None,
+            index: None,
+            source_section: source.as_ref().map(|(id, _)| id.clone()),
+            source_index: source.map(|(_, index)| index),
+            height,
+            siblings: Default::default(),
             generation: self.sidebar_project_drag_generation,
         });
         cx.notify();
@@ -673,25 +1004,106 @@ impl Shell {
         pointer: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let target = {
+        let (target, index) = {
             let bounds = self.sidebar_section_bounds.borrow();
             let sections = self.active_sidebar_sections(cx);
-            sidebar_project_target(&bounds, pointer, sections.len())
+            let target = sidebar_project_target(&bounds, pointer, sections.len())
                 .and_then(|ix| sections.get(ix))
-                .map(|section| section.id.clone())
+                .map(|section| section.id.clone());
+            match target {
+                Some(id) => {
+                    let moving = self
+                        .sidebar_project_drag
+                        .as_ref()
+                        .map(|drag| drag.payload.project_key.clone())
+                        .unwrap_or_default();
+                    // Hysteresis only compares against the same section's
+                    // previous slot; a new target starts fresh.
+                    let drag = self.sidebar_project_drag.as_ref();
+                    let previous = drag
+                        .filter(|drag| drag.target.as_deref() == Some(id.as_str()))
+                        .and_then(|drag| drag.index);
+                    let source_index = drag
+                        .filter(|drag| drag.source_section.as_deref() == Some(id.as_str()))
+                        .and_then(|drag| drag.source_index);
+                    let leaving_source = previous.is_some() && previous == source_index;
+                    let pointer_y = f32::from(pointer.y);
+                    let moving_down = drag.and_then(|drag| {
+                        let delta = pointer_y - f32::from(drag.pointer.y);
+                        (delta.abs() > 0.5).then_some(delta > 0.0)
+                    });
+                    // A collapsed section shows only its header, so a release
+                    // there appends where a hit-tested slot cannot be seen.
+                    let index = match sections.iter().find(|section| section.id == id) {
+                        Some(section) if section.collapsed => section
+                            .project_keys
+                            .iter()
+                            .filter(|key| key.as_str() != moving)
+                            .count(),
+                        _ => {
+                            let slots = self.sidebar_section_project_bounds.borrow();
+                            project_drop_index(
+                                slots.get(&id).map(Vec::as_slice),
+                                pointer_y,
+                                &moving,
+                                previous,
+                                leaving_source,
+                                moving_down,
+                            )
+                        }
+                    };
+                    (Some(id), Some(index))
+                }
+                None => (None, None),
+            }
         };
         let Some(drag) = self.sidebar_project_drag.as_mut() else {
             return;
         };
         drag.pointer = pointer;
         drag.target = target;
+        drag.index = index;
         cx.notify();
     }
 
-    pub(super) fn end_sidebar_project_drag(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_project_drag.take().is_some() {
-            cx.notify();
+    /// Drop the drag state. `placed` means the order changed, so each slide's
+    /// preview target is now its natural slot; otherwise the old order
+    /// returns and the whole current offset unwinds.
+    pub(super) fn end_sidebar_project_drag(&mut self, placed: bool, cx: &mut Context<Self>) {
+        let Some(drag) = self.sidebar_project_drag.take() else {
+            return;
+        };
+        // A release can land while the preview slides are still moving. The
+        // remaining distance becomes a short glide from wherever each project
+        // was painted to its final slot, so nothing snaps.
+        if !self.reduced_motion {
+            let settle: std::collections::HashMap<String, f32> = drag
+                .siblings
+                .iter()
+                .filter_map(|(key, slide)| {
+                    let current = slide.current();
+                    let offset = if placed { current - slide.to } else { current };
+                    (offset.abs() > 0.5).then(|| (key.clone(), offset))
+                })
+                .collect();
+            if !settle.is_empty() {
+                self.sidebar_project_settle_epoch =
+                    self.sidebar_project_settle_epoch.wrapping_add(1);
+                let epoch = self.sidebar_project_settle_epoch;
+                self.sidebar_project_settle = settle;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TAB_SLIDE.total()).await;
+                    let _ = this.update(cx, |shell, cx| {
+                        if shell.sidebar_project_settle_epoch == epoch {
+                            shell.sidebar_project_settle.clear();
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
         }
+        cx.notify();
     }
 
     /// The lifted project, frosted a level above the list like a lifted
@@ -777,31 +1189,67 @@ impl Shell {
     }
 
     /// Move a project into `target`, or back to its own group when it is
-    /// `None`. Its sessions follow it wherever it lands.
+    /// `None`. Its sessions follow it wherever it lands; inside a section the
+    /// pointer's position decides its slot.
     pub(super) fn finish_sidebar_project_transfer(
         &mut self,
         payload: &SidebarProjectDrag,
         target: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        self.end_sidebar_project_drag(cx);
+        let drag = self.sidebar_project_drag.as_ref();
+        let index = drag.and_then(|drag| drag.index);
+        let source_section = drag.and_then(|drag| drag.source_section.clone());
+        let source_index = drag.and_then(|drag| drag.source_index);
         if !self.sidebar_section_projects_supported(cx) {
+            self.end_sidebar_project_drag(false, cx);
             return;
         }
-        if let Some(id) = target
-            && !self
-                .active_sidebar_sections(cx)
-                .iter()
-                .any(|section| section.id == id)
-        {
+        let sections = self.active_sidebar_sections(cx);
+        let section = target.and_then(|id| sections.iter().find(|section| section.id == id));
+        if target.is_some() && section.is_none() {
+            self.end_sidebar_project_drag(false, cx);
             return;
         }
+        let Some(section) = section else {
+            if source_section.is_none() {
+                self.end_sidebar_project_drag(false, cx);
+                return;
+            }
+            self.end_sidebar_project_drag(true, cx);
+            self.change_sidebar_section(
+                SidebarSectionChange::AssignProject {
+                    project_key: payload.project_key.clone(),
+                    section_id: None,
+                    after: None,
+                    before: None,
+                },
+                cx,
+            );
+            return;
+        };
+        let placed: Vec<_> = section
+            .project_keys
+            .iter()
+            .filter(|key| key.as_str() != payload.project_key)
+            .collect();
+        let index = index.unwrap_or(placed.len()).min(placed.len());
+        // Releasing over the slot it already occupies changes nothing; skip
+        // the write so a cancelled drag cannot refresh the whole list.
+        if source_section.as_deref() == Some(section.id.as_str()) && source_index == Some(index) {
+            self.end_sidebar_project_drag(false, cx);
+            return;
+        }
+        self.end_sidebar_project_drag(true, cx);
         self.change_sidebar_section(
             SidebarSectionChange::AssignProject {
                 project_key: payload.project_key.clone(),
-                section_id: target.map(str::to_owned),
-                after: None,
-                before: None,
+                section_id: Some(section.id.clone()),
+                after: index
+                    .checked_sub(1)
+                    .and_then(|ix| placed.get(ix))
+                    .map(|key| (*key).clone()),
+                before: placed.get(index).map(|key| (*key).clone()),
             },
             cx,
         );
@@ -1672,6 +2120,96 @@ mod tests {
         assert_eq!(
             sidebar_project_target(&bounds, gpui::point(px(20.0), px(20.0)), 1),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn project_drop_index_skips_the_lifted_project_and_counts_crossed_midlines() {
+        let slots = vec![
+            ("a".to_string(), 10.0, 40.0),
+            ("b".to_string(), 42.0, 80.0),
+            ("c".to_string(), 82.0, 120.0),
+        ];
+        // Above the first midline: first slot.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 20.0, "b", None, false, None),
+            0
+        );
+        // Past a's midline but before c's: between a and c.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 60.0, "b", None, false, None),
+            1
+        );
+        // Dropping a on its own slot ignores it entirely.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 15.0, "a", None, false, None),
+            0
+        );
+        // Below every remaining project: append.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 110.0, "a", None, false, None),
+            2
+        );
+        // An empty section has one place to land.
+        assert_eq!(
+            project_drop_index(None, 50.0, "a", None, false, None),
+            0
+        );
+        // The dead band holds the last slot until a header midline is clearly
+        // crossed: midlines at 24 and 96 for a dragged b.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 100.0, "b", Some(1), false, None),
+            1
+        );
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 108.0, "b", Some(1), false, None),
+            2
+        );
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 99.0, "b", Some(2), false, None),
+            2
+        );
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 90.0, "b", Some(2), false, None),
+            1
+        );
+        // The first move out of the lifted project's own slot lands at the
+        // midline, so a short neighbour cannot trap the index on its source.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 103.0, "b", Some(1), true, None),
+            2
+        );
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 24.0, "b", Some(1), true, None),
+            0
+        );
+        // Near a midline the drag direction decides the side, even when the
+        // header's centre is a pixel off the slot's centre.
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 26.0, "b", Some(0), true, Some(true)),
+            1
+        );
+        assert_eq!(
+            project_drop_index(Some(slots.as_slice()), 24.0, "b", Some(1), true, Some(false)),
+            0
+        );
+    }
+
+    #[test]
+    fn project_drop_top_stacks_the_projects_that_stay_above_the_gap() {
+        let slots = vec![
+            ("a".to_string(), 0.0, 100.0),
+            ("b".to_string(), 102.0, 152.0),
+            ("c".to_string(), 154.0, 234.0),
+        ];
+        assert_eq!(project_drop_top(&slots, "b", 0), Some(0.0));
+        assert_eq!(
+            project_drop_top(&slots, "b", 1),
+            Some(100.0 + SIDEBAR_LIST_GAP)
+        );
+        assert_eq!(
+            project_drop_top(&slots, "b", 2),
+            Some(102.0 + 80.0 + SIDEBAR_LIST_GAP)
         );
     }
 
