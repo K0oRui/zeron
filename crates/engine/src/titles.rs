@@ -195,6 +195,7 @@ impl TitleGenerator {
             zeron_harness::TITLE_INSTRUCTIONS,
             serde_json::to_string(prompt).ok()?
         );
+        let mut last_error: Option<EngineError> = None;
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {
                 mcp: None,
@@ -222,15 +223,29 @@ impl TitleGenerator {
                     if !candidate.is_empty() {
                         return Some(candidate);
                     }
+                    last_error = Some(EngineError::Other(
+                        "title generation returned nothing".into(),
+                    ));
                 }
                 Err(err) => {
-                    tracing::warn!(attempt = attempt + 1, error = %err,
+                    // Providers rate-limit and retry inside their own CLI; an
+                    // intermediate failure is expected, not a warning. Only the
+                    // exhausted ladder is worth a log line.
+                    tracing::debug!(attempt = attempt + 1, error = %err,
                         "automatic chat title generation attempt failed");
+                    last_error = Some(err);
                 }
             }
             if let Some(delay) = RETRY_DELAYS_MS.get(attempt) {
                 tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
             }
+        }
+        if let Some(error) = last_error {
+            tracing::warn!(
+                attempts = RETRY_DELAYS_MS.len() + 1,
+                error = %error,
+                "automatic chat title generation failed"
+            );
         }
         None
     }
