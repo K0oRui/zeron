@@ -631,7 +631,7 @@ impl HarnessUpdateCoordinator {
         };
         let spec = provider(harness);
         let version_lease = self.inner.registry.execution_lease(harness).await;
-        let installed = run_version_command(harness, &executable, spec.version_args).await;
+        let installed = installed_version_for(harness, &executable, spec.version_args).await;
         drop(version_lease);
         let installed = match installed {
             Ok(version) => version,
@@ -1092,7 +1092,7 @@ impl HarnessUpdateCoordinator {
         });
         let verified = match self.executable(harness) {
             Ok(executable) => {
-                run_version_command(harness, &executable, provider(harness).version_args)
+                installed_version_for(harness, &executable, provider(harness).version_args)
                     .await
                     .map(|version| (version, executable))
             }
@@ -2162,6 +2162,22 @@ async fn run_version_command(
     let output = run_command_output(executable, args, COMMAND_TIMEOUT).await?;
     installed_version(harness, &output)
         .ok_or_else(|| "command returned no recognizable version".into())
+}
+
+/// Antigravity's server has no `--version` flag; the managed install directory
+/// is keyed by the release Zeron fetched, so that is the version to report.
+/// Custom binaries still get the normal CLI probe.
+async fn installed_version_for(
+    harness: HarnessId,
+    executable: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    if harness == HarnessId::Antigravity
+        && let Some(version) = zeron_harness::acp::managed_antigravity_version(executable)
+    {
+        return Ok(version);
+    }
+    run_version_command(harness, executable, args).await
 }
 
 async fn run_command(executable: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {

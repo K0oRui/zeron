@@ -46,7 +46,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -617,6 +617,13 @@ pub fn is_managed_antigravity_server(executable: &Path) -> bool {
     newest_antigravity_install().is_some_and(|(_, entry)| entry == executable)
 }
 
+/// the release version of a managed install, `None` for a custom binary.
+pub fn managed_antigravity_version(executable: &Path) -> Option<String> {
+    newest_antigravity_install()
+        .filter(|(_, entry)| entry == executable)
+        .map(|(version, _)| version.to_string())
+}
+
 /// the registry's current release for this platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityRelease {
@@ -706,35 +713,87 @@ pub async fn install_antigravity_release(
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `agy_acp_server` has no `--version` flag. Its `initialize` response carries
+/// `agentInfo.version`, which is also the only version the server reports for
+/// every platform archive.
 async fn confirm_reported_version(server: &Path, expected: &str) -> Result<(), HarnessError> {
     let mut command = Command::new(server);
     command
-        .arg("--version")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(VERSION_PROBE_TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            HarnessError::Install(format!(
-                "the downloaded Antigravity server did not report its version within {}s",
-                VERSION_PROBE_TIMEOUT.as_secs()
-            ))
-        })??;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    match antigravity_build_version(&text) {
-        Some(reported) if reported == expected => Ok(()),
-        Some(reported) => Err(HarnessError::Install(format!(
-            "the ACP registry lists Antigravity {expected}, but its archive contains {reported}"
-        ))),
-        None => Err(HarnessError::Install(format!(
-            "the downloaded Antigravity {expected} server reported no build label"
-        ))),
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        HarnessError::Install("the downloaded Antigravity server has no stdin".into())
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        HarnessError::Install("the downloaded Antigravity server has no stdout".into())
+    })?;
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientInfo": {
+                "name": "zeron",
+                "title": "Zeron",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false,
+            },
+        },
+    });
+    let reported = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await?;
+        stdin.flush().await?;
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if message.get("id").and_then(Value::as_u64) != Some(1) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(HarnessError::Install(format!(
+                    "the downloaded Antigravity server rejected initialize: {error}"
+                )));
+            }
+            return message
+                .pointer("/result/agentInfo/version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    HarnessError::Install(
+                        "the downloaded Antigravity server reported no agent version".into(),
+                    )
+                });
+        }
+        Err(HarnessError::Install(
+            "the downloaded Antigravity server exited before reporting its version".into(),
+        ))
+    })
+    .await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let reported = reported.map_err(|_| {
+        HarnessError::Install(format!(
+            "the downloaded Antigravity server did not report its version within {}s",
+            VERSION_PROBE_TIMEOUT.as_secs()
+        ))
+    })??;
+    if reported == expected {
+        Ok(())
+    } else {
+        Err(HarnessError::Install(format!(
+            "the ACP registry lists Antigravity {expected}, but its archive reports {reported}"
+        )))
     }
 }
 
@@ -3062,7 +3121,9 @@ fn is_rate_limit_text(text: &str) -> bool {
     let lower = text.to_lowercase();
     // `429` only on digit boundaries: `exit 4290` and `14293 tokens` are
     // not rate limits.
-    let rate_limited = lower.split(|c: char| !c.is_ascii_digit()).any(|t| t == "429");
+    let rate_limited = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|t| t == "429");
     rate_limited
         || lower.contains("rate_limit")
         || lower.contains("rate limit")
@@ -5259,23 +5320,28 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("agy_acp_server.par");
-        std::fs::write(
-            &server,
-            "#!/bin/sh\necho 'Built from changelist 1 based on //depot/branches/agy_acp_server_release_branch/973763860.1'\necho 'Build label: 1.2.0'\n",
-        )
-        .unwrap();
+        let script = |version: &str| {
+            format!(
+                "#!/bin/sh\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"agentInfo\":{{\"name\":\"antigravity-acp\",\"version\":\"{version}\"}}}}}}'\n"
+            )
+        };
+        std::fs::write(&server, script("1.2.0")).unwrap();
         std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
         confirm_reported_version(&server, "1.2.0").await.unwrap();
         let error = confirm_reported_version(&server, "9.9.9")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("contains 1.2.0"), "{error}");
+        assert!(error.to_string().contains("reports 1.2.0"), "{error}");
 
-        std::fs::write(&server, "#!/bin/sh\necho 'agy 9.9.9'\n").unwrap();
+        std::fs::write(
+            &server,
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n",
+        )
+        .unwrap();
         let error = confirm_reported_version(&server, "9.9.9")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("no build label"), "{error}");
+        assert!(error.to_string().contains("no agent version"), "{error}");
     }
 
     #[test]
@@ -5700,12 +5766,21 @@ mod tests {
         assert!(harness.installed());
         assert_eq!(harness.executable_path(), Some(legacy_server.clone()));
         assert!(is_managed_antigravity_server(&legacy_server));
+        assert_eq!(
+            managed_antigravity_version(&legacy_server).as_deref(),
+            Some(legacy.version)
+        );
 
         let current_server = install(current.version, current.sha512);
         install("9.0.0", "tampered");
         install("not-a-version", ANTIGRAVITY_SIGNED_MARKER);
         assert_eq!(harness.executable_path(), Some(current_server.clone()));
         assert!(!is_managed_antigravity_server(&legacy_server));
+        assert_eq!(managed_antigravity_version(&legacy_server), None);
+        assert_eq!(
+            managed_antigravity_version(&current_server).as_deref(),
+            Some(current.version)
+        );
 
         let signed_server = install("99.0.0", ANTIGRAVITY_SIGNED_MARKER);
         let newest = if crate::code_signature::SUPPORTED {
@@ -5789,7 +5864,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("contains {}", pin.version)),
+                .contains(&format!("reports {}", pin.version)),
             "{error}"
         );
         assert!(trusted_antigravity_installs().is_empty());
