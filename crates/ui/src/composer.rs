@@ -64,6 +64,9 @@ pub const TEXTAREA_MIN: f32 = 76.0;
 pub const TEXTAREA_MAX: f32 = 260.0;
 /// Expanded actions row: 2px top + 32px picker + 8px bottom.
 const ACTIONS_BOTTOM_PAD: f32 = 8.0;
+/// How long after a send that brings a Cloud machine up its first setup step
+/// appears (the message and the working line land first).
+const CLOUD_SETUP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 pub const ACTIONS_ROW_HEIGHT: f32 = 2.0 + 32.0 + ACTIONS_BOTTOM_PAD;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
@@ -1003,6 +1006,9 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         .collect()
 }
 
+/// What a masked input shows in place of each character.
+const MASK_GLYPH: char = '•';
+
 #[derive(Debug, Clone, Default)]
 struct TextProjection {
     display: String,
@@ -1234,6 +1240,21 @@ impl TextProjection {
     /// a dangling reference and shows as its plain label.
     fn rich(raw: &str, active: Option<Range<usize>>, live: Option<&HashSet<u32>>) -> Self {
         Self::project(raw, active, true, live)
+    }
+
+    /// Secret fields: every character shown as one bullet. A mapping per
+    /// character keeps the caret, selection and hit-testing exact.
+    fn masked(raw: &str) -> Self {
+        let mut projection = Self::default();
+        for (start, ch) in raw.char_indices() {
+            let display_start = projection.display.len();
+            projection.display.push(MASK_GLYPH);
+            projection.mappings.push((
+                start..start + ch.len_utf8(),
+                display_start..projection.display.len(),
+            ));
+        }
+        projection
     }
 
     fn project(
@@ -2018,6 +2039,8 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
+    /// Secret entry (API keys): shown as bullets and never copied or cut.
+    masked: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -2128,6 +2151,7 @@ impl ComposerInput {
             syntax_task: None,
             ghost: None,
             mentions_enabled: false,
+            masked: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -2180,6 +2204,15 @@ impl ComposerInput {
     /// Join the window's Tab order, for a field the keyboard must reach.
     pub(crate) fn with_tab_stop(mut self) -> Self {
         self.focus_handle = self.focus_handle.tab_stop(true);
+        self
+    }
+
+    /// Secret entry: characters render as bullets, copy and cut do nothing,
+    /// and assistive tech is told it is a password field.
+    pub fn with_masked(mut self) -> Self {
+        self.masked = true;
+        self.accessibility_role = Role::PasswordInput;
+        self.refresh_projection();
         self
     }
 
@@ -2260,7 +2293,9 @@ impl ComposerInput {
     }
 
     fn refresh_projection(&mut self) {
-        self.projection = if self.mentions_enabled {
+        self.projection = if self.masked {
+            TextProjection::masked(&self.content)
+        } else if self.mentions_enabled {
             let live: Option<HashSet<u32>> = self
                 .attachment_chips
                 .as_ref()
@@ -3134,6 +3169,10 @@ impl ComposerInput {
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
+        // Word stops would reveal where a secret's punctuation sits.
+        if self.masked {
+            return 0;
+        }
         if let Some(boundary) = self.projection.previous_boundary(offset) {
             return boundary;
         }
@@ -3145,6 +3184,9 @@ impl ComposerInput {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
+        if self.masked {
+            return self.content.len();
+        }
         if let Some(boundary) = self.projection.next_boundary(offset) {
             return boundary;
         }
@@ -3410,7 +3452,8 @@ impl ComposerInput {
     }
 
     fn clipboard_selection(&self) -> Option<(String, String)> {
-        if self.selected_range.is_empty() {
+        // A masked field's text never leaves it through the clipboard.
+        if self.selected_range.is_empty() || self.masked {
             return None;
         }
         let selected = self.projection.normalize_range(self.selected_range.clone());
@@ -8671,10 +8714,37 @@ impl Composer {
         true
     }
 
+    /// The send would run on Cloud (a new session there, or a chat whose
+    /// machine is Cloud's) and Cloud is out of credits: it can't start or
+    /// wake a machine.
+    fn out_of_cloud_credits(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        if !state
+            .cloud_status
+            .as_ref()
+            .is_some_and(crate::cloud::out_of_credits)
+        {
+            return false;
+        }
+        match state.selected_chat.as_deref() {
+            // A chat hosted on a Cloud session machine — known from its host
+            // device even before the session list has been read.
+            Some(chat) => {
+                state.chat_cloud_session(chat).is_some()
+                    || state
+                        .chats
+                        .iter()
+                        .find(|c| c.id == chat)
+                        .is_some_and(|c| state.is_cloud_session_device(&c.device_id))
+            }
+            None => self.pickers.read(cx).runs_on_cloud(cx),
+        }
+    }
+
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
-        if self.queue_edit_finishing {
+        if self.queue_edit_finishing || self.out_of_cloud_credits(cx) {
             return true;
         }
         let state = self.state.read(cx);
@@ -8764,6 +8834,12 @@ impl Composer {
             // escape_stops_active_agent is enabled.
             SendButtonMode::Stop => {}
             _ if no_content => {}
+            // Out of credits, a Cloud send can't start or wake its machine:
+            // say so instead of a button that silently does nothing.
+            _ if self.out_of_cloud_credits(cx) => crate::cloud::show_out_of_credits(
+                "You're out of Cloud credits. Add credits to send.",
+                cx,
+            ),
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: keep the message queued until the current turn ends.
@@ -8819,7 +8895,7 @@ impl Composer {
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
-        let plan = self.pickers.read(cx).checkout_plan();
+        let plan = self.pickers.read(cx).session_checkout_plan(cx);
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -9058,19 +9134,54 @@ impl Composer {
         }
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
-        self.state.update(cx, |s, cx| {
+        let cloud_boot = self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
+            let mut boot = None;
             if should_publish_optimistic_echo(queue) {
                 s.push_echo(&chat_id, echo);
+                // A send that brings a Cloud machine up shows its first setup
+                // step (below); the machine adds the rest as it gets there.
+                boot = if is_new {
+                    matches!(plan, crate::pickers::CheckoutPlan::Cloud { .. }).then_some(false)
+                } else {
+                    s.cloud_machine_booting(&chat_id)
+                        .map(|state| state != zeron_proto::CloudState::Provisioning)
+                };
                 // Working overlay until the host executes the queued command —
                 // without it a remote send flashed Completed (and could ring
                 // the done-chime) in the queue→drain→sync gap.
                 s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+                // A Cloud chat's machine may be starting or asleep: read
+                // where it stands (and follow it until it is up) — and
+                // whether credits allow it to, which can have changed since
+                // the status was last read.
+                if s.cloud_enabled() {
+                    s.refresh_cloud_sessions(cx);
+                    if boot.is_some() {
+                        s.recheck_cloud_credits(cx);
+                    }
+                }
             }
             cx.notify();
+            boot
         });
+        // The setup step arrives a beat after the message, like a turn's
+        // first tool call: the message lands with the working line under
+        // it, then the step reveals above that line.
+        if let Some(waking) = cloud_boot {
+            let state = self.state.clone();
+            let (chat_id, message_id) = (chat_id.clone(), message_id.clone());
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(CLOUD_SETUP_STEP_DELAY).await;
+                state.update(cx, |s, cx| {
+                    s.push_cloud_setup_echo(&chat_id, &message_id, created_at, waking);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -9263,10 +9374,17 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
+                // Cloud: the chat gets its own Cloud machine; its host and
+                // cwd come back from createChat.
+                let mut on_cloud = false;
                 if is_new && space_path.is_some() {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
+                        }
+                        crate::pickers::CheckoutPlan::Cloud { branch } => {
+                            chat_branch = branch.clone();
+                            on_cloud = true;
                         }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
@@ -9347,8 +9465,11 @@ impl Composer {
                         {
                             object.insert("config".into(), config);
                         }
+                        if on_cloud {
+                            object.insert("cloud".into(), serde_json::Value::Bool(true));
+                        }
                     }
-                    if let Err(err) = attachments::call_with_timeout(
+                    match attachments::call_with_timeout(
                         &engine,
                         cx.background_executor(),
                         methods::MUTATE,
@@ -9357,7 +9478,20 @@ impl Composer {
                     )
                     .await
                     {
-                        tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        // A Cloud chat runs in its machine's checkout.
+                        Ok(reply) if on_cloud => {
+                            if let Some(machine_cwd) = reply.get("cwd").and_then(|v| v.as_str()) {
+                                cwd = machine_cwd.to_string();
+                            }
+                        }
+                        Ok(_) => {}
+                        // No machine, no session: say why (Cloud can't
+                        // reach the repository, Cloud is off, …) instead of
+                        // queueing a run nobody will pick up.
+                        Err(err) if on_cloud => return Err(err),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        }
                     }
                 }
                 // A hand-started side chat is minted by its first send. Unlike
@@ -9436,6 +9570,7 @@ impl Composer {
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,
+                        env: Default::default(),
                     },
                     message_id: message_id.clone(),
                 };
@@ -9572,6 +9707,10 @@ impl Composer {
                     composer.failure_key = Some(restore_key.clone());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        s.remove_echo(
+                            &err_chat_id,
+                            &zeron_proto::cloud_setup_entry_id(&err_message_id),
+                        );
                         s.end_pending_send(&err_chat_id, &err_message_id);
                         if is_new && s.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
                             // Back to the canvas; the navigation draft-swap
@@ -10693,12 +10832,16 @@ impl Composer {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
+                // Dimmed when out of Cloud credits, but a click still says why.
+                let explains = self.out_of_cloud_credits(cx);
                 send_circle("composer-send", blocked, theme)
-                    .when(!blocked, |el| {
+                    .when(!blocked || explains, |el| {
                         el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        if mode == SendButtonMode::Queue {
+                        if self.out_of_cloud_credits(cx) {
+                            "Out of Cloud credits"
+                        } else if mode == SendButtonMode::Queue {
                             "Queue message"
                         } else {
                             "Send message"
@@ -10952,6 +11095,8 @@ impl Render for Composer {
         // reconnect) instead of letting the button imply instant delivery.
         let queue_notice: Option<(SharedString, bool)> = {
             use zeron_proto::ConnectivityState as S;
+            // A new session on Cloud never waits on the project's device.
+            let runs_on_cloud = self.pickers.read(cx).runs_on_cloud(cx);
             let state = self.state.read(cx);
             let degraded = match state.selected_chat.as_deref() {
                 Some(id) => state.chat_delivery_degraded(id),
@@ -10961,6 +11106,7 @@ impl Render for Composer {
                         .effective_device_id()
                         .is_some_and(|id| state.local_device_id.as_deref() != Some(id.as_str()));
                     remote_target
+                        && !runs_on_cloud
                         && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
                             || state
                                 .effective_device_id()
@@ -10968,7 +11114,23 @@ impl Render for Composer {
                 }
             };
             let offline = state.connectivity.state == S::Offline;
-            degraded.then(|| {
+            // A sleeping Cloud device is woken by the send itself.
+            let cloud_asleep = !offline
+                && state
+                    .selected_chat
+                    .as_deref()
+                    .and_then(|id| state.chats.iter().find(|c| c.id == id))
+                    .map(|chat| chat.device_id.clone())
+                    .or_else(|| state.effective_device_id())
+                    .is_some_and(|id| {
+                        matches!(
+                            state.device_presence(&id, chrono::Utc::now()),
+                            crate::cloud::Presence::Asleep | crate::cloud::Presence::Waking
+                        )
+                    });
+            // A sleeping Cloud machine isn't a delivery problem — the send
+            // wakes it, and the session card shows it asleep.
+            (degraded && !cloud_asleep).then(|| {
                 let text: SharedString = if offline {
                     "Offline — messages will send when you're back online.".into()
                 } else {
@@ -12672,6 +12834,49 @@ mod tests {
         });
     }
 
+    /// Out of credits, a send that would run on Cloud is held at the button:
+    /// Cloud can't start or wake its machine. Other chats are untouched.
+    #[gpui::test]
+    fn cloud_sends_wait_for_credits(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.cloud_status = Some(zeron_proto::CloudStatus {
+                state: zeron_proto::CloudState::Ready,
+                device_id: Some("cloud-1".into()),
+                available: true,
+                credits: Some(0.0),
+                ..Default::default()
+            });
+            state.cloud_sessions = Some(zeron_proto::CloudSessions {
+                sessions: vec![zeron_proto::CloudSession {
+                    chat_id: "on-cloud".into(),
+                    device_id: "cloud-s1".into(),
+                    state: zeron_proto::CloudState::Sleeping,
+                    ..Default::default()
+                }],
+                available: true,
+            });
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        state.update(cx, |state, _| state.selected_chat = Some("on-cloud".into()));
+        composer.update(cx, |composer, cx| {
+            assert!(composer.out_of_cloud_credits(cx));
+            assert!(composer.send_blocked(cx));
+        });
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("on-laptop".into())
+        });
+        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("on-cloud".into());
+            if let Some(status) = state.cloud_status.as_mut() {
+                status.credits = Some(30.0);
+            }
+        });
+        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
+    }
+
     #[gpui::test]
     fn submission_preserves_literal_command_and_skill_indentation(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -12802,6 +13007,8 @@ mod tests {
                 status: zeron_proto::SessionStatus::Working,
                 started_at: Some(updated),
                 updated_at: updated,
+                last_turn_outcome: None,
+                terminal_activity: None,
                 running_subagents: 0,
             }];
             state.selected_chat = Some("c".into());
@@ -14469,6 +14676,33 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[gpui::test]
+    fn masked_input_shows_bullets_and_keeps_its_text_off_the_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let input = cx.new(|cx| ComposerInput::new("API key", cx).with_masked());
+        input.update(cx, |input, cx| {
+            input.set_text("sk-é9", cx);
+            input.refresh_projection();
+            assert_eq!(input.projection.display, MASK_GLYPH.to_string().repeat(5));
+            // Every raw character boundary maps onto a bullet boundary and back.
+            for (bullet, (raw, _)) in input.content.char_indices().enumerate() {
+                let display = input.projection.raw_to_display(raw);
+                assert_eq!(display, bullet * MASK_GLYPH.len_utf8());
+                assert_eq!(input.projection.display_to_raw(display), raw);
+            }
+            assert_eq!(
+                input.projection.raw_to_display(input.content.len()),
+                input.projection.display.len()
+            );
+            input.selected_range = 0..input.content.len();
+            assert_eq!(input.clipboard_selection(), None);
+            assert_eq!(input.previous_word_boundary(4), 0);
+            assert_eq!(input.next_word_boundary(1), input.content.len());
+            assert_eq!(input.text(), "sk-é9");
         });
     }
 

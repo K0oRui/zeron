@@ -2469,6 +2469,7 @@ async fn agent_change_on_steer_is_adopted_before_the_prompt() {
                 resume: Some("fixture".into()),
                 attachments: Vec::new(),
                 worktree: None,
+                env: Default::default(),
             })),
         })
         .await

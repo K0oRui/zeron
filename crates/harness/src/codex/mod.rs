@@ -46,11 +46,12 @@
 
 pub(crate) mod catalog;
 mod normalize;
+pub mod npm_repair;
 pub mod realtime;
 mod subagents;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -779,45 +780,12 @@ impl CodexHarness {
         } else {
             zeron_proto::SandboxLevel::DangerFullAccess
         };
-        let mut cmd = Command::new(&exe);
-        cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("codex child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("codex child has no stdout".into()))?;
-        let stderr_tail = crate::StderrTail::default();
-        if let Some(stderr) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
-                    tail.push(&line);
-                }
-            });
-        }
-
-        let (client, incoming) = RpcClient::new(stdin, stdout);
+        let AppServer {
+            child,
+            client,
+            incoming,
+            stderr_tail,
+        } = spawn_app_server(&exe, &request)?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             title_only,
@@ -840,6 +808,72 @@ impl CodexHarness {
         .boxed())
     }
 }
+
+/// One `codex app-server` process and its wire.
+struct AppServer {
+    child: Child,
+    client: RpcClient,
+    incoming: mpsc::Receiver<Incoming>,
+    stderr_tail: crate::StderrTail,
+}
+
+fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, HarnessError> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("app-server");
+    crate::compose_child_path(&mut cmd, exe);
+    // Host-resolved credentials (a Cloud device's managed CODEX_HOME,
+    // GH_TOKEN, …). Absent on laptops: the CLI's own login is used.
+    crate::apply_run_env(&mut cmd, &request.env);
+    if !request.cwd.is_empty() {
+        cmd.current_dir(&request.cwd);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            HarnessError::NotInstalled(crate::executable::binary_hint(exe))
+        } else {
+            HarnessError::Io(e)
+        }
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("codex child has no stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::Protocol("codex child has no stdout".into()))?;
+    let stderr_tail = crate::StderrTail::default();
+    if let Some(stderr) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
+                tail.push(&line);
+            }
+        });
+    }
+    let (client, incoming) = RpcClient::new(stdin, stdout);
+    Ok(AppServer {
+        child,
+        client,
+        incoming,
+        stderr_tail,
+    })
+}
+
+/// Waits before relaunching an app-server that died before answering
+/// `initialize`: a just-started machine can lose the first launch (a CLI
+/// still finishing its install, a cold disk), and nothing has run yet.
+const STARTUP_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+];
 
 // ---------------------------------------------------------------------------
 // Session
@@ -1049,14 +1083,14 @@ async fn run_session(session: Session) {
         title_only,
         idle,
         mut child,
-        client,
+        mut client,
         mut incoming,
         event_tx,
         controls,
         request,
         interrupt_grace,
         kill_grace,
-        stderr_tail,
+        mut stderr_tail,
     } = session;
     let RunControls {
         realtime,
@@ -1131,23 +1165,115 @@ async fn run_session(session: Session) {
         p
     };
 
-    // ---- handshake + thread + first turn (interruptible) ------------------
-    let setup = async {
-        client
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "zeron-native",
-                        "title": "Zeron",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": { "experimentalApi": true },
-                }),
+    // ---- handshake (interruptible; relaunches a process that died first) ---
+    let mut attempt = 0;
+    loop {
+        let handshake = client.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "zeron-native",
+                    "title": "Zeron",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": { "experimentalApi": true },
+            }),
+        );
+        let failed = tokio::select! {
+            res = handshake => match res {
+                Ok(_) => break,
+                Err(e) => e,
+            },
+            _ = interrupt.cancelled() => {
+                let _ = event_tx
+                    .send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }))
+                    .await;
+                shutdown_child(&mut child, kill_grace).await;
+                return;
+            }
+        };
+        // Only a process that is gone gets another launch: an answer that
+        // refuses (bad config, unsupported version) would refuse again.
+        let exited = client.is_closed();
+        if exited && attempt < STARTUP_RETRY_DELAYS.len() {
+            let status = child.try_wait().ok().flatten();
+            tracing::warn!(
+                target: "zeron_harness::codex",
+                attempt = attempt + 1,
+                error = %crate::crash_message("codex app-server", status, &stderr_tail),
+                "app-server died before initialize; relaunching"
+            );
+            shutdown_child(&mut child, kill_grace).await;
+            tokio::select! {
+                _ = tokio::time::sleep(STARTUP_RETRY_DELAYS[attempt]) => {}
+                _ = interrupt.cancelled() => {
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Interrupted,
+                            result: None,
+                            error: None,
+                            session_id: None,
+                        }))
+                        .await;
+                    return;
+                }
+            }
+            attempt += 1;
+            match spawn_app_server(&executable, &request) {
+                Ok(next) => {
+                    child = next.child;
+                    client = next.client;
+                    incoming = next.incoming;
+                    stderr_tail = next.stderr_tail;
+                    continue;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(e.to_string()),
+                            session_id: None,
+                        }))
+                        .await;
+                    return;
+                }
+            }
+        }
+        // Out of launches: say why, with what the process printed.
+        let error = if exited {
+            stderr_tail.wait_closed().await;
+            format!(
+                "initialize: {}",
+                crate::crash_message(
+                    "codex app-server",
+                    child.try_wait().ok().flatten(),
+                    &stderr_tail
+                )
             )
-            .await?;
-        client.notify("initialized", None);
+        } else {
+            failed.to_string()
+        };
+        let _ = event_tx
+            .send(Ok(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: Some(error),
+                session_id: None,
+            }))
+            .await;
+        shutdown_child(&mut child, kill_grace).await;
+        return;
+    }
+    client.notify("initialized", None);
 
+    // ---- thread + first turn (interruptible) ------------------------------
+    let setup = async {
         if realtime.is_some() {
             // Codex's first account/read announces the initial auth snapshot
             // via account/updated. Load it before attaching the voice router,

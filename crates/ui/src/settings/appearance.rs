@@ -1636,7 +1636,7 @@ fn miniature_split(
         .into_any_element()
 }
 
-fn preview(
+pub(crate) fn preview(
     mode: AppearanceMode,
     themes: &ThemeSelection,
     accent: AccentSelection,
@@ -1682,7 +1682,7 @@ fn compact_action(
     label: &str,
     id: impl Into<SharedString>,
 ) -> gpui::Stateful<gpui::Div> {
-    widgets::text_action(theme, widgets::ActionTone::Outlined, label).id(id.into())
+    widgets::text_action(theme, widgets::ActionTone::Filled, label).id(id.into())
 }
 
 fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
@@ -1853,7 +1853,7 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> impl IntoElement {
     )
 }
 
-fn accent_swatch(
+pub(crate) fn accent_swatch(
     page_theme: &Theme,
     selection: AccentSelection,
     selected: bool,

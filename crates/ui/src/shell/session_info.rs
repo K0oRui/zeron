@@ -259,7 +259,7 @@ impl Shell {
         }
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (chat, device, local, online, project, branch) = {
+        let (chat, device, glyph, presence, project, branch) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
             let device: SharedString = state
@@ -268,7 +268,22 @@ impl Shell {
                 .to_owned()
                 .into();
             let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
-            let online = state.device_online(&chat.device_id, now);
+            let cloud = state.is_cloud_session_device(&chat.device_id)
+                || state
+                    .devices
+                    .iter()
+                    .find(|d| d.id == chat.device_id)
+                    .is_some_and(|d| {
+                        crate::cloud::is_cloud(d) || crate::cloud::is_cloud_account(d)
+                    });
+            let glyph = if cloud {
+                icons::CLOUD
+            } else if local {
+                icons::LAPTOP
+            } else {
+                icons::MONITOR
+            };
+            let presence = state.device_presence(&chat.device_id, now);
             let project = chat
                 .space_id
                 .as_deref()
@@ -283,23 +298,27 @@ impl Shell {
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
-            (chat, device, local, online, project, branch)
+            (chat, device, glyph, presence, project, branch)
         };
 
         // ── Where it runs.
-        let device_row = info_row(
-            &theme,
-            row_glyph(if local { icons::LAPTOP } else { icons::MONITOR }, &theme),
-            device,
-        )
-        .when(!online, |row| {
-            row.child(
-                icon(icons::WIFI_OFF)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.warning.opacity(0.8)),
-            )
-        });
+        let device_row = info_row(&theme, row_glyph(glyph, &theme), device)
+            .id("session-info-device")
+            .when(presence.warns(), |row| {
+                row.child(
+                    icon(icons::WIFI_OFF)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.warning.opacity(0.8)),
+                )
+            })
+            // A sleeping Cloud machine: it wakes on the next send.
+            .when(presence == crate::cloud::Presence::Asleep, |row| {
+                row.child(asleep_badge(&theme))
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Asleep — wakes when you send",
+                    ))
+            });
         let project_row = match project {
             Some((name, path)) => info_row(
                 &theme,
@@ -578,6 +597,26 @@ impl Shell {
         );
         rows
     }
+}
+
+/// The pull-request badge's pill, in frosted grey: a sleeping Cloud machine.
+fn asleep_badge(theme: &Theme) -> impl IntoElement {
+    crate::frost::frosted(
+        6.0,
+        crate::frost::MENU_BLUR,
+        div()
+            .h(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(7.0))
+            .rounded(px(6.0))
+            .bg(theme.text_muted.opacity(0.14))
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_muted)
+            .child("Asleep"),
+    )
 }
 
 #[cfg(test)]

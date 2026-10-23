@@ -1311,12 +1311,10 @@ impl PullRequestsPage {
                                     }),
                             )
                             .when(loading, |el| {
-                                el.child(crate::loaders::mini_glyph_spinner(
+                                el.child(crate::loaders::ring_spinner(
                                     "pr-project-resolving",
-                                    1.5,
-                                    theme.glyph,
-                                    cx.entity_id(),
-                                    cx,
+                                    12.0,
+                                    theme.text_muted,
                                 ))
                             })
                             // Disconnected glyph, as the device picker shows it.
@@ -1845,12 +1843,10 @@ impl PullRequestsPage {
                         .px(px(14.0))
                         .gap(px(8.0))
                         .when(loading, |el| {
-                            el.opacity(0.7).child(crate::loaders::mini_glyph_spinner(
+                            el.opacity(0.7).child(crate::loaders::ring_spinner(
                                 "pull-requests-more-spinner",
-                                1.5,
-                                theme.glyph,
-                                cx.entity_id(),
-                                cx,
+                                12.0,
+                                theme.text_muted,
                             ))
                         })
                         .child(label)
@@ -2374,12 +2370,10 @@ impl Render for PullRequestsPage {
                                     .when(loading, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|page, _, _, cx| page.refresh(cx)))
                                     .child(if refreshing {
-                                        crate::loaders::mini_glyph_spinner(
+                                        crate::loaders::ring_spinner(
                                             "pull-requests-refresh-spinner",
-                                            1.75,
-                                            theme.glyph,
-                                            cx.entity_id(),
-                                            cx,
+                                            13.0,
+                                            theme.text_muted,
                                         )
                                         .into_any_element()
                                     } else {
@@ -3681,6 +3675,7 @@ mod tests {
 
     fn space(id: &str, device: &str, git: bool, created_minutes_ago: i64) -> zeron_proto::Space {
         zeron_proto::Space {
+            github_repo: None,
             id: id.into(),
             device_id: device.into(),
             path: format!("/{id}"),
@@ -3708,6 +3703,7 @@ mod tests {
             last_message_at,
             created_at: Utc::now(),
             harness_session_id: None,
+            harness_session_harness: None,
             harness_session_cwd: None,
             parent_chat_id: None,
             space_id: Some(space.into()),
@@ -4342,6 +4338,7 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
+                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),
@@ -4525,6 +4522,7 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
+                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),
@@ -4587,6 +4585,7 @@ mod tests {
         state.update(cx, |state, cx| {
             state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
             state.spaces = vec![zeron_proto::Space {
+                github_repo: None,
                 id: "project".into(),
                 device_id: "local".into(),
                 path: "/checkout".into(),

@@ -119,6 +119,8 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     /// Following the tail: new content keeps the bottom in view.
     private(set) var following = true
     var onFollowChange: ((Bool) -> Void)?
+    /// A row's button was tapped (`sign-in` on an error card).
+    var onAction: ((String) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
     /// An attachment's picture, for an image chip opened full size.
@@ -670,6 +672,10 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     func rowView(_ view: RowView, toggleDetail detail: UInt64, open: Bool) {
         pendingFold = view.key
         engine.toggleDetail(row: view.key, detail: detail, open: open)
+    }
+
+    func rowView(_ view: RowView, perform action: String) {
+        onAction?(action)
     }
 
     func rowView(_ view: RowView, open url: URL) {

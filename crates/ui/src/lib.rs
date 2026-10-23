@@ -23,6 +23,7 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+pub mod cloud;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -49,7 +50,8 @@ mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
-pub mod notify;
+pub use zeron_notify as notify;
+pub mod onboarding;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -226,6 +228,13 @@ pub fn run_app(config: UiConfig) {
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
+                // A banner the background engine posted, clicked: the engine
+                // opens the app on `zeron://notification/<target>`.
+                if let Some(target) = notify::link_target(&url) {
+                    let target = target.to_owned();
+                    let _ = cx.update(|cx| open_notification_target(target, &url_state, cx));
+                    continue;
+                }
                 url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
             }
         })
@@ -243,6 +252,14 @@ pub fn run_app(config: UiConfig) {
             }
         })
         .detach();
+        // Sessions run in the background engine, which outlives this window
+        // (and posts the desktop banners); embedding stays the fallback, or
+        // the choice with ZERON_EMBED_ENGINE=1. An embedded engine posts the
+        // banners itself.
+        zeron_engine::desktop_notify::enable();
+        if std::env::var_os("ZERON_EMBED_ENGINE").is_none_or(|value| value.is_empty() || value == "0") {
+            state::launch_background_engine();
+        }
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -251,11 +268,17 @@ pub fn run_app(config: UiConfig) {
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
             app_update::install_on_quit(cx);
+            // The background engine outlives this app: banners resume at
+            // once rather than after the last focus report goes stale.
+            let unfocus = quit_state.read(cx).viewport_closing();
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
                 });
             async move {
+                if let Some(unfocus) = unfocus {
+                    unfocus.await;
+                }
                 if let Some(task) = shutdown {
                     let _ = task.await;
                 }

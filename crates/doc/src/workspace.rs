@@ -212,6 +212,7 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "gitCheckedAt", space.git_checked_at)?;
         set_opt_str(&row, "checkoutId", space.checkout_id.as_deref())?;
         set_opt_str(&row, "repositoryId", space.repository_id.as_deref())?;
+        set_opt_str(&row, "githubRepo", space.github_repo.as_deref())?;
         row.insert("createdAt", space.created_at.timestamp_millis())?;
         self.doc.commit();
         Ok(())
@@ -251,6 +252,7 @@ impl WorkspaceDoc {
         detected: bool,
         checkout_id: Option<&str>,
         repository_id: Option<&str>,
+        github_repo: Option<&str>,
         checked_at: DateTime<Utc>,
     ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("spaces", space_id) else {
@@ -259,6 +261,7 @@ impl WorkspaceDoc {
         row.insert("gitDetected", detected)?;
         set_opt_str(&row, "checkoutId", checkout_id)?;
         set_opt_str(&row, "repositoryId", repository_id)?;
+        set_opt_str(&row, "githubRepo", github_repo)?;
         row.insert("gitCheckedAt", checked_at.timestamp_millis())?;
         self.doc.commit();
         Ok(true)
@@ -325,6 +328,11 @@ impl WorkspaceDoc {
             &row,
             "harnessSessionCwd",
             chat.harness_session_cwd.as_deref(),
+        )?;
+        set_opt_str(
+            &row,
+            "harnessSessionHarness",
+            chat.harness_session_harness.as_deref(),
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
@@ -474,12 +482,14 @@ impl WorkspaceDoc {
         chat_id: &str,
         session_id: &str,
         cwd: &str,
+        harness: Option<&str>,
     ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("harnessSessionId", session_id)?;
         row.insert("harnessSessionCwd", cwd)?;
+        set_opt_str(&row, "harnessSessionHarness", harness)?;
         self.doc.commit();
         Ok(true)
     }
@@ -529,6 +539,20 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         row.insert("runningSubagents", i64::from(session.running_subagents))?;
+        match session.last_turn_outcome {
+            Some(outcome) => row.insert(
+                "lastTurnOutcome",
+                LoroValue::from(serde_json::to_value(outcome)?),
+            )?,
+            None => row.delete("lastTurnOutcome")?,
+        }
+        match &session.terminal_activity {
+            Some(activity) => row.insert(
+                "terminalActivity",
+                LoroValue::from(serde_json::to_value(activity)?),
+            )?,
+            None => row.delete("terminalActivity")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -701,6 +725,7 @@ pub(crate) struct RawSpace {
     checkout_id: Option<String>,
     #[serde(default)]
     repository_id: Option<String>,
+    github_repo: Option<String>,
     #[serde(default)]
     created_at: i64,
 }
@@ -716,6 +741,7 @@ impl From<RawSpace> for Space {
             git_checked_at: raw.git_checked_at.map(dt),
             checkout_id: raw.checkout_id,
             repository_id: raw.repository_id,
+            github_repo: raw.github_repo,
             created_at: dt(raw.created_at),
         }
     }
@@ -756,6 +782,8 @@ pub(crate) struct RawChat {
     harness_session_id: Option<String>,
     #[serde(default)]
     harness_session_cwd: Option<String>,
+    #[serde(default)]
+    harness_session_harness: Option<String>,
     #[serde(default)]
     space_id: Option<String>,
     #[serde(default)]
@@ -801,6 +829,7 @@ impl From<RawChat> for Chat {
             created_at: dt(raw.created_at),
             harness_session_id: raw.harness_session_id,
             harness_session_cwd: raw.harness_session_cwd,
+            harness_session_harness: raw.harness_session_harness,
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
@@ -812,6 +841,10 @@ impl From<RawChat> for Chat {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawSession {
+    #[serde(default)]
+    last_turn_outcome: Option<zeron_proto::NativeTurnOutcome>,
+    #[serde(default)]
+    terminal_activity: Option<zeron_proto::TerminalActivity>,
     #[serde(default)]
     last_completed_turn: Option<String>,
     chat_id: String,
@@ -834,6 +867,8 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            last_turn_outcome: raw.last_turn_outcome,
+            terminal_activity: raw.terminal_activity,
             running_subagents: raw.running_subagents,
         }
     }
@@ -943,6 +978,7 @@ mod tests {
             created_at: ts(2_000),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_harness: None,
             parent_chat_id: Some("parent-chat".into()),
             space_id: None,
             last_seen_at: None,
@@ -960,6 +996,7 @@ mod tests {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
             created_at: ts(1_500),
         }
     }
@@ -972,6 +1009,8 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            last_turn_outcome: None,
+            terminal_activity: None,
             running_subagents: 0,
         }
     }
@@ -1192,6 +1231,7 @@ mod tests {
                 true,
                 Some("checkout-abc"),
                 Some("github.com/owner/project"),
+                Some("acme/app"),
                 ts(4_000),
             )
             .unwrap()
@@ -1203,11 +1243,15 @@ mod tests {
             row.repository_id.as_deref(),
             Some("github.com/owner/project")
         );
+        assert_eq!(row.github_repo.as_deref(), Some("acme/app"));
         assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
         // Unknown rows report false, never invent rows.
         assert!(!ws.rename_space("nope", Some("x")).unwrap());
-        assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
+        assert!(
+            !ws.set_space_git("nope", true, None, None, None, ts(1))
+                .unwrap()
+        );
     }
 
     #[test]

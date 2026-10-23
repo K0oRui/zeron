@@ -17,6 +17,7 @@
 
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
@@ -98,6 +99,17 @@ struct DocPartJson {
     source_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_title: Option<String>,
+    /// Provider switch seam (`kind: "switch"`, additive): display names of
+    /// the provider before and after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_provider: Option<String>,
+    /// Harness slugs of the same two providers, for their logos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    to_harness: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +244,21 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             source_title: Some(source_title.clone()),
             ..Default::default()
         },
+        MessagePart::Switch {
+            id,
+            from,
+            to,
+            from_harness,
+            to_harness,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "switch".into(),
+            from_provider: Some(from.clone()),
+            to_provider: Some(to.clone()),
+            from_harness: from_harness.clone(),
+            to_harness: to_harness.clone(),
+            ..Default::default()
+        },
     })
 }
 
@@ -298,6 +325,13 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             source_chat_id: p.source_chat_id.unwrap_or_default(),
             source_title: p.source_title.unwrap_or_default(),
         },
+        "switch" => MessagePart::Switch {
+            id: p.id,
+            from: p.from_provider.unwrap_or_default(),
+            to: p.to_provider.unwrap_or_default(),
+            from_harness: p.from_harness,
+            to_harness: p.to_harness,
+        },
         _ => MessagePart::Text {
             id: p.id,
             text: p.text.unwrap_or_default(),
@@ -332,6 +366,21 @@ fn image_part(
             message: "Generated image unavailable".into(),
         },
     }
+}
+
+/// One provider's own session in a chat that changed provider (see
+/// [`SessionDoc::provider_sessions`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSessionMark {
+    pub session_id: String,
+    /// Where the provider created the session; resume is cwd-gated.
+    #[serde(default)]
+    pub cwd: String,
+    /// The last transcript entry this session has seen. Everything after it
+    /// ran elsewhere and is owed to the session when the chat comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<String>,
 }
 
 /// A session doc handle: typed access over a LoroDoc with the schema above.
@@ -413,6 +462,60 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Whether this chat has ever changed provider. Its transcript then holds
+    /// turns the current provider session never saw, so a fresh session is
+    /// owed the history. A cheap meta read: the warm-send path checks it on
+    /// every message, and must not decode the transcript to do so.
+    pub fn provider_switched(&self) -> bool {
+        matches!(
+            self.doc.get_map("meta").get("providerSwitched"),
+            Some(loro::ValueOrContainer::Value(LoroValue::Bool(true)))
+        )
+    }
+
+    pub fn mark_provider_switched(&self) -> Result<(), DocError> {
+        if !self.provider_switched() {
+            self.doc.get_map("meta").insert("providerSwitched", true)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    /// Each provider's own session in a chat that changed provider, keyed by
+    /// harness slug. Switching back resumes that session and hands it only
+    /// the turns after its `seen` entry, so its native history (and the
+    /// provider's prompt cache over it) stays intact. One atomic value so a
+    /// synced reader never sees half a record.
+    pub fn provider_sessions(&self) -> BTreeMap<String, ProviderSessionMark> {
+        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
+            self.doc.get_map("meta").get("providerSessions")
+        else {
+            return BTreeMap::new();
+        };
+        serde_json::from_str(&value).unwrap_or_default()
+    }
+
+    pub fn provider_session(&self, harness: &str) -> Option<ProviderSessionMark> {
+        self.provider_sessions().remove(harness)
+    }
+
+    pub fn set_provider_session(
+        &self,
+        harness: &str,
+        mark: &ProviderSessionMark,
+    ) -> Result<(), DocError> {
+        let mut marks = self.provider_sessions();
+        if marks.get(harness) == Some(mark) {
+            return Ok(());
+        }
+        marks.insert(harness.to_owned(), mark.clone());
+        self.doc
+            .get_map("meta")
+            .insert("providerSessions", serde_json::to_string(&marks)?)?;
+        self.doc.commit();
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> Option<String> {
         match self.doc.get_map("meta").get("chatId") {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
@@ -425,6 +528,21 @@ impl SessionDoc {
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
         let map = messages.push_container(LoroMap::new())?;
+        write_entry_scalar_fields(&map, entry)?;
+        let parts = map.insert_container("parts", LoroList::new())?;
+        for part in &entry.parts {
+            push_part(&parts, part)?;
+        }
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// [`push_message`](Self::push_message), but inserted before the last
+    /// `from_end` entries of the messages list (clamped to its start).
+    pub fn insert_message_before_last(&self, from_end: usize, entry: &SessionMessageEntry) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        let at = messages.len().saturating_sub(from_end);
+        let map = messages.insert_container(at, LoroMap::new())?;
         write_entry_scalar_fields(&map, entry)?;
         let parts = map.insert_container("parts", LoroList::new())?;
         for part in &entry.parts {
@@ -911,6 +1029,10 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     for (key, value) in [
         ("sourceChatId", &doc_part.source_chat_id),
         ("sourceTitle", &doc_part.source_title),
+        ("fromProvider", &doc_part.from_provider),
+        ("toProvider", &doc_part.to_provider),
+        ("fromHarness", &doc_part.from_harness),
+        ("toHarness", &doc_part.to_harness),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -1166,6 +1288,9 @@ pub struct SegmentWriter<'a> {
     /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
     created_at: i64,
+    /// What `durationMs` counts from: `created_at`, or an earlier moment the
+    /// turn really began ([`Self::count_duration_from`]).
+    duration_from: i64,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -1199,7 +1324,18 @@ impl<'a> SegmentWriter<'a> {
             entry_index,
             written: Vec::new(),
             created_at,
+            duration_from: created_at,
         })
+    }
+
+    /// Count this entry's `durationMs` from `started_at` (ms) rather than its
+    /// `createdAt` — never from a later moment. A Cloud machine's setup entry
+    /// opens the turn of the message that brought the machine up, and that
+    /// turn began at the send: starting the machine is part of the work.
+    pub fn count_duration_from(&mut self, started_at: i64) {
+        if started_at > 0 && started_at < self.duration_from {
+            self.duration_from = started_at;
+        }
     }
 
     /// Reattach to a streaming entry a prior [`Self::begin`] pushed on the
@@ -1221,6 +1357,7 @@ impl<'a> SegmentWriter<'a> {
             entry_index,
             written,
             created_at,
+            duration_from: created_at,
         }
     }
 
@@ -1324,8 +1461,8 @@ impl<'a> SegmentWriter<'a> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(self.created_at);
-        if self.created_at > 0 {
-            map.insert("durationMs", (now - self.created_at).max(0))?;
+        if self.duration_from > 0 {
+            map.insert("durationMs", (now - self.duration_from).max(0))?;
         }
         self.doc.doc.commit();
         Ok(())
@@ -1477,6 +1614,33 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
+    }
+
+    #[test]
+    fn provider_switch_seam_round_trips_and_flags_the_doc() {
+        let doc = SessionDoc::init("switch").unwrap();
+        assert!(!doc.provider_switched());
+        let seam = MessagePart::Switch {
+            id: "switch:1".into(),
+            from: "Claude Code".into(),
+            to: "Codex".into(),
+            from_harness: Some("claude-code".into()),
+            to_harness: Some("codex".into()),
+        };
+        doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
+            id: "switch:1".into(),
+            role: MessageRole::System,
+            parts: vec![seam.clone()],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.mark_provider_switched().unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, vec![seam]);
+        assert!(doc.provider_switched());
     }
     use zeron_proto::{AgentEvent, ToolCall};
 
@@ -1667,6 +1831,25 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn a_turn_counts_its_duration_from_when_it_really_began() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let doc = SessionDoc::init("c1").unwrap();
+        // The entry opens 5s ago; its turn began a minute ago (the send that
+        // had to wait for a Cloud machine). A later moment never shortens it.
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", now - 5_000).unwrap();
+        w.count_duration_from(now - 60_000);
+        w.count_duration_from(now - 1_000);
+        w.finish(&[], MessageStatus::Complete).unwrap();
+        let entry = &doc.read_entries().unwrap()[0];
+        assert_eq!(entry.created_at, now - 5_000, "the entry's own time is kept");
+        let duration = entry.duration_ms.unwrap();
+        assert!((60_000..65_000).contains(&duration), "{duration}");
     }
 
     #[test]

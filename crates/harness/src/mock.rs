@@ -25,6 +25,12 @@ fn fanout_count(prompt: &str) -> Option<usize> {
     Some(count.clamp(1, 200))
 }
 
+/// The message a `/error <message>` prompt fails the run with.
+fn scripted_error(prompt: &str) -> Option<&str> {
+    let message = prompt.trim().strip_prefix("/error ")?.trim();
+    (!message.is_empty()).then_some(message)
+}
+
 fn fanout_id(i: usize) -> String {
     format!("mock-fanout-{i}")
 }
@@ -273,6 +279,22 @@ impl Harness for MockHarness {
         // the only data-side way to fill the session card's subagent lane,
         // scroll it, and watch it drain into its finished fold. They settle
         // `ZERON_MOCK_DELAY_MS` apart, 2.5s by default.
+        // `/error <message>`: the run fails with that message (error cards
+        // for any provider failure, without a real provider).
+        if let Some(message) = scripted_error(&request.prompt) {
+            let events = vec![
+                Ok(AgentEvent::Error {
+                    message: message.to_string(),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            ];
+            return Ok(futures::stream::iter(events).boxed());
+        }
         if let Some(count) = fanout_count(&request.prompt) {
             let settle = if delay_ms == 0 {
                 std::time::Duration::from_millis(2500)
@@ -799,6 +821,16 @@ impl Harness for MockHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_prompt_names_the_failure() {
+        assert_eq!(
+            scripted_error("/error Not logged in"),
+            Some("Not logged in")
+        );
+        assert_eq!(scripted_error("/error  "), None);
+        assert_eq!(scripted_error("/errors"), None);
+    }
 
     #[test]
     fn fanout_reads_its_count_from_the_prompt() {
