@@ -451,6 +451,10 @@ mod tests {
             methods(HarnessId::Pi, Platform::Windows)[0],
             Method::Npm(_, true)
         ));
+        assert!(matches!(
+            methods(HarnessId::Grok, Platform::Windows)[0],
+            Method::PowerShell(_)
+        ));
     }
 
     #[tokio::test]
