@@ -848,14 +848,15 @@ fn full_registry() -> HarnessRegistry {
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
     // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
-    // Turn-boundary steering; the effort ladder rides model VARIANTS (the
-    // run sends the first advertised variant id for the picked level).
+    // Step-boundary steering (a steer preempts the generation between tools);
+    // the effort ladder rides model VARIANTS (the run sends the first
+    // advertised variant id for the picked level).
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Opencode,
             name: "OpenCode".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -1401,6 +1402,29 @@ mod tests {
             .descriptors()
             .into_iter()
             .find(|d| d.id == HarnessId::Codex)
+            .unwrap();
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.supports_steering, after.supports_steering);
+        assert_eq!(before.steering_mode, after.steering_mode);
+        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// OpenCode's slot has the same rule: a stale `steering_mode` here flips
+    /// the catalog entry (and with it the composer's steer affordance) the
+    /// moment the harness is first resolved.
+    #[test]
+    fn opencode_lazy_descriptor_matches_resolved_harness() {
+        let registry = default_registry();
+        let before = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Opencode)
+            .unwrap();
+        registry.resolve(HarnessId::Opencode).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Opencode)
             .unwrap();
         assert_eq!(before.name, after.name);
         assert_eq!(before.supports_steering, after.supports_steering);

@@ -18,7 +18,14 @@
 //!   readiness probes `/api/info`, `/api/status`, `/api/health` (2.x),
 //!   then `/global/health` (1.x), accepting version-bearing JSON.
 //! - 2.x discovery uses `GET /api/model` (with a plugin-settle poll),
-//!   `/api/agent` (Agent model option), and `/api/command`.
+//!   `/api/agent` (Agent model option), `/api/command`, and `/api/skill`.
+//!   The skill read primes `/api/model` because that route waits for location
+//!   plugin activation; `/api/skill` alone answers before the directory scan
+//!   finishes. A 2.x skill's identity is its path-derived `id` (loaded by
+//!   `@id` mention); 1.x advertises skills as commands tagged `source:"skill"`.
+//! - 2.x keeps logins in its own database. Zeron still owns `auth.json`
+//!   (account slots and logins write it), so boot publishes each entry
+//!   through `/api/credential` and activates the selected one.
 //! - 2.x creates via `POST /api/session` with `location.directory` and
 //!   optional `agent`; resumed selection uses `/api/session/{id}/agent`.
 //!   Session model selection uses `/api/session/{id}/model`; cancellation
@@ -159,7 +166,7 @@ const INSTALL_HINT: &str = "opencode (searched PATH, the login shell's PATH, ~/.
      ~/.local/bin, ~/.bun/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
      fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE, \
      %APPDATA%\\npm, and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; install with \
-     `curl -fsSL https://opencode.ai/install | bash` or \
+     `curl -fsSL https://opencode.ai/v2/install | bash` or \
      `npm install -g @opencode/cli`, then `opencode auth login`; set \
      OPENCODE_EXECUTABLE to override)";
 
@@ -314,7 +321,9 @@ impl OpencodeHarness {
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn_with_env(&exe, cwd, self.startup_timeout, mcp, run_env).await
+        let server = Server::spawn_with_env(&exe, cwd, self.startup_timeout, mcp, run_env).await?;
+        sync_legacy_credentials(&server, cwd).await;
+        Ok(server)
     }
 
     /// A short-lived server over the stored session, for a revert. Revive
@@ -403,11 +412,10 @@ impl Harness for OpencodeHarness {
     fn supports_steering(&self) -> bool {
         true
     }
-    /// Steers queue and deliver as the next prompt when the live turn goes
-    /// idle — opencode has no mid-turn injection on this wire.
+    /// A steer waits for the running tool to finish, then aborts the
+    /// generation and continues the turn with the new prompt; with no safe
+    /// point it delivers at the next idle. See `maybe_preempt!`.
     fn steering_mode(&self) -> SteeringMode {
-        // Steers preempt the generation (never a running tool) and continue
-        // the turn immediately; see `maybe_preempt!`.
         SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
@@ -471,17 +479,44 @@ impl Harness for OpencodeHarness {
         &self,
         cwd: &std::path::Path,
     ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
-        let mut skills = crate::skills::discover(self.id(), cwd).await?;
+        let discovered = crate::skills::discover(self.id(), cwd).await?;
         let _guard = self.probe_lock.lock().await;
         let directory = cwd
             .to_str()
             .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
         let mut server = self.server(Some(directory), None).await?;
-        let result = server.commands_wire(Some(directory)).await;
+        let result = async {
+            // 2.x owns a skill catalog: it includes plugin, config-file and
+            // HTTP-catalog skills the filesystem scan cannot see, and its
+            // path-derived ID is the identity `@mention` loading resolves.
+            // Some 2.x builds report an empty catalog for normal project
+            // roots, so the scan stays authoritative for presence and the
+            // catalog only renames what it does list.
+            if server.protocol().await == Protocol::V2 {
+                match server.skill_catalog(Some(directory)).await {
+                    Ok(catalog) if !catalog.is_empty() => {
+                        return Ok(merge_skill_catalog(discovered, &catalog));
+                    }
+                    Ok(_) => tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "skill catalog empty, using the filesystem scan"
+                    ),
+                    Err(error) => tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "skill catalog unavailable, using the filesystem scan: {error}"
+                    ),
+                }
+                return Ok(discovered);
+            }
+            // 1.x advertises skills as commands with `source: "skill"`.
+            let commands = server.commands_wire(Some(directory)).await?;
+            let mut skills = discovered;
+            merge_skill_commands(&mut skills, &commands);
+            Ok(skills)
+        }
+        .await;
         server.shutdown(self.kill_grace).await;
-        let commands = result?;
-        merge_skill_commands(&mut skills, &commands);
-        Ok(Some(skills))
+        result.map(Some)
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
@@ -1102,6 +1137,40 @@ impl Server {
         Ok(unwrap_data(raw))
     }
 
+    /// 2.x skill catalog: `{data: [{id, name, description, autoinvoke, path,
+    /// content}]}`. The `id` is path-derived and case-sensitive; `name` is
+    /// only a display label.
+    ///
+    /// A fresh server builds the catalog asynchronously and answers
+    /// `/api/skill` with the embedded skills (or nothing) for a moment.
+    /// `/api/model` waits for location plugin activation, which includes the
+    /// skill sources, so priming with it yields the complete catalog. It
+    /// costs a few milliseconds once the location is warm. A failure only
+    /// means the caller falls back to the filesystem scan.
+    async fn skill_catalog(&self, directory: Option<&str>) -> Result<Vec<Value>, HarnessError> {
+        let Some(directory) = directory else {
+            let raw = self.get_json("/api/skill", None).await?;
+            return Ok(catalog_entries(raw));
+        };
+        let prime_path = with_location("/api/model", directory);
+        let prime = self.get_json(&prime_path, Some(directory));
+        match tokio::time::timeout(std::time::Duration::from_secs(3), prime).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::debug!(
+                target: "zeron_harness::opencode",
+                "skill location prime failed, reading the catalog anyway: {error}"
+            ),
+            Err(_) => tracing::debug!(
+                target: "zeron_harness::opencode",
+                "skill location prime timed out, reading the catalog anyway"
+            ),
+        }
+        let raw = self
+            .get_json(&with_location("/api/skill", directory), Some(directory))
+            .await?;
+        Ok(catalog_entries(raw))
+    }
+
     /// Is the session mid-turn? V1 keeps a status map on `/session/status`;
     /// V2 lists running sessions on `/api/session/active`. `Err` = can't
     /// tell — the caller treats that as still running.
@@ -1130,7 +1199,9 @@ impl Server {
             Protocol::V1 => format!("/session/{session_id}/abort"),
             Protocol::V2 => format!("/api/session/{session_id}/interrupt"),
         };
-        self.post_json(&path, directory, &Value::Null).await
+        // `/interrupt` carries no request body (and `/abort` takes none either).
+        self.post_empty(&path, directory).await?;
+        Ok(Value::Null)
     }
 
     /// 2.x: model and reasoning variant ride the SESSION (set once per run),
@@ -1151,6 +1222,218 @@ impl Server {
         self.post_json(&path, directory, &json!({ "model": model_ref }))
             .await
             .map(|_| ())
+    }
+}
+
+/// One credential from OpenCode 1.x's `auth.json`, translated to the 2.x
+/// credential record that carries it.
+struct LegacyCredential {
+    id: String,
+    integration: String,
+    value: Value,
+    label: String,
+}
+
+/// 2.x keeps credentials in its database and imports `auth.json` exactly
+/// once, during migration. Zeron still manages that file (its account slots
+/// and logins write it), so push its entries through `/api/credential` when a
+/// server boots: without this a Zeron login or account switch is invisible to
+/// OpenCode 2.
+///
+/// The record id is derived from the secret, so an entry keeps the same id
+/// across boots; a token the server refreshed in its own database therefore
+/// stays the active row instead of being duplicated or overwritten.
+async fn sync_legacy_credentials(server: &Server, directory: Option<&str>) {
+    if server.protocol().await != Protocol::V2 {
+        return;
+    }
+    // The server reads its logins from the variable instead of the file.
+    if std::env::var_os("OPENCODE_AUTH_CONTENT").is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+    let Some(credentials) = legacy_credentials() else {
+        return;
+    };
+    let (existing, active): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) = match server.get_json("/api/credential", directory).await {
+        Ok(raw) => {
+            let entries: Vec<&Value> = raw
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut existing = std::collections::HashSet::new();
+            let mut active = std::collections::HashSet::new();
+            for entry in entries {
+                let Some(id) = entry.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                existing.insert(id.to_owned());
+                if entry.get("active").and_then(Value::as_bool) == Some(true) {
+                    active.insert(id.to_owned());
+                }
+            }
+            (existing, active)
+        }
+        Err(error) => {
+            tracing::debug!(
+                target: "zeron_harness::opencode",
+                "credential sync skipped: {error}"
+            );
+            return;
+        }
+    };
+
+    for credential in credentials {
+        if existing.contains(&credential.id) {
+            if !active.contains(&credential.id) {
+                activate_credential(server, directory, &credential.id).await;
+            }
+            continue;
+        }
+        let body = json!({
+            "id": credential.id,
+            "integrationID": credential.integration,
+            "label": credential.label,
+            "value": credential.value,
+            "activate": true,
+        });
+        match server
+            .post_json_raw("/api/credential", directory, &body)
+            .await
+        {
+            // 409: another boot created the same row first.
+            Ok((status, _)) if status.as_u16() == 409 => {
+                activate_credential(server, directory, &credential.id).await;
+            }
+            Ok((status, _)) if status.is_success() => {
+                tracing::debug!(
+                    target: "zeron_harness::opencode",
+                    integration = %credential.integration,
+                    "published legacy credential"
+                );
+            }
+            Ok((status, body)) => tracing::debug!(
+                target: "zeron_harness::opencode",
+                integration = %credential.integration,
+                "credential publish rejected: {status} {}",
+                truncate_body(&body)
+            ),
+            Err(error) => tracing::debug!(
+                target: "zeron_harness::opencode",
+                "credential publish failed: {error}"
+            ),
+        }
+    }
+}
+
+async fn activate_credential(server: &Server, directory: Option<&str>, id: &str) {
+    if let Err(error) = server
+        .post_empty(&format!("/api/credential/{id}/activate"), directory)
+        .await
+    {
+        tracing::debug!(
+            target: "zeron_harness::opencode",
+            "credential activation failed: {error}"
+        );
+    }
+}
+
+/// Read the file Zeron writes for OpenCode and translate every entry. `None`
+/// when there is no usable file or no entry the 2.x API can store.
+fn legacy_credentials() -> Option<Vec<LegacyCredential>> {
+    let path = legacy_auth_file()?;
+    let raw = std::fs::read(&path).ok()?;
+    let entries = serde_json::from_slice::<Value>(&raw).ok()?;
+    let entries = entries.as_object()?;
+    let credentials: Vec<_> = entries
+        .iter()
+        .filter_map(|(integration, entry)| legacy_credential(integration, entry))
+        .collect();
+    (!credentials.is_empty()).then_some(credentials)
+}
+
+/// Exactly the path the engine's account store writes (`XDG_DATA_HOME`, else
+/// `~/.local/share`, which OpenCode itself uses on every platform).
+fn legacy_auth_file() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::executable::home_dir().map(|home| home.join(".local").join("share")))?;
+    let path = data.join("opencode").join("auth.json");
+    path.is_file().then_some(path)
+}
+
+fn legacy_credential(integration: &str, entry: &Value) -> Option<LegacyCredential> {
+    if integration.trim().is_empty() {
+        return None;
+    }
+    let kind = entry.get("type").and_then(Value::as_str)?;
+    let (value, stable) = match kind {
+        // 1.x called an API key `api`; 2.x calls it `key`.
+        "api" | "key" => {
+            let key = entry.get("key").and_then(Value::as_str)?.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let mut value = json!({ "type": "key", "key": key });
+            if let Some(metadata) = entry.get("metadata").filter(|m| m.is_object()) {
+                value["metadata"] = metadata.clone();
+            }
+            (value, key.to_owned())
+        }
+        "oauth" => {
+            let refresh = entry.get("refresh").and_then(Value::as_str)?.trim();
+            let access = entry.get("access").and_then(Value::as_str)?.trim();
+            if refresh.is_empty() || access.is_empty() {
+                return None;
+            }
+            // 2.x needs the login method to know how to refresh the tokens.
+            let method = oauth_login_method(integration);
+            let mut value = json!({
+                "type": "oauth",
+                "methodID": method,
+                "refresh": refresh,
+                "access": access,
+                "expires": entry.get("expires").and_then(Value::as_i64).unwrap_or(0),
+            });
+            let mut metadata = serde_json::Map::new();
+            if let Some(account) = entry.get("accountId").and_then(Value::as_str) {
+                metadata.insert("accountID".to_owned(), Value::String(account.to_owned()));
+            }
+            if let Some(url) = entry.get("enterpriseUrl").and_then(Value::as_str) {
+                metadata.insert("enterpriseUrl".to_owned(), Value::String(url.to_owned()));
+            }
+            if !metadata.is_empty() {
+                value["metadata"] = Value::Object(metadata);
+            }
+            // The refresh token outlives every access-token rotation.
+            (value, refresh.to_owned())
+        }
+        _ => return None,
+    };
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(stable.as_bytes());
+    let tail: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(LegacyCredential {
+        id: format!("zeron-{integration}-{}", &tail[..12]),
+        integration: integration.to_owned(),
+        value,
+        label: "Zeron".into(),
+    })
+}
+
+/// The 2.x login method that refreshes the tokens Zeron minted. Mirrors the
+/// translation OpenCode's own `auth.json` migration uses, so a Zeron-written
+/// entry refreshes exactly like one imported by the server.
+fn oauth_login_method(integration: &str) -> &'static str {
+    match integration {
+        "openai" => "chatgpt-browser",
+        "github-copilot" | "opencode" | "xai" => "device",
+        _ => "oauth",
     }
 }
 
@@ -1361,8 +1644,98 @@ fn agent_option(agents: &Value) -> ModelOption {
     }
 }
 
-/// OpenCode exposes plugin/configured skills in its native command catalog.
-/// Source metadata prevents a command with the same name being misclassified.
+/// Both the catalog and the scan report absolute paths, yet the separator
+/// and case may differ on Windows.
+fn skill_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn catalog_entries(raw: Value) -> Vec<Value> {
+    raw.get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 2.x endpoints that take a location accept it as `location[directory]`.
+/// Percent-encode through `Url` so paths with `&`, spaces or `#` survive.
+fn with_location(path: &str, directory: &str) -> String {
+    let mut url = reqwest::Url::parse("http://opencode.invalid").expect("static URL");
+    url.query_pairs_mut()
+        .append_pair("location[directory]", directory);
+    let query = url.query().unwrap_or_default();
+    format!("{path}?{query}")
+}
+
+/// 2.x skill catalog → picker entries. The ID rides the `opencode-skill:`
+/// marker so the invocation names the exact skill OpenCode will load.
+///
+/// The catalog names each skill's exact ID (path-derived and case-sensitive),
+/// which is what an `@id` mention resolves; the scan supplies the file path
+/// and description for skills the catalog does list. Catalog entries the scan
+/// cannot see (config-file directories, HTTP catalogs) are added on their own
+/// because those bodies never touch this machine's known roots.
+fn merge_skill_catalog(
+    discovered: Vec<zeron_proto::invocation::Skill>,
+    catalog: &[Value],
+) -> Vec<zeron_proto::invocation::Skill> {
+    use zeron_proto::invocation::{Skill, valid_invocation_name};
+    // The server and the scan both report absolute paths, but Windows may
+    // differ in separator or case.
+    let by_path: std::collections::HashMap<String, &Value> = catalog
+        .iter()
+        .filter_map(|entry| Some((skill_path_key(entry["path"].as_str()?), entry)))
+        .collect();
+    let mut skills: std::collections::BTreeMap<String, Skill> = std::collections::BTreeMap::new();
+    for mut skill in discovered {
+        let known = by_path.get(&skill_path_key(&skill.path)).copied();
+        if let Some(id) = known.and_then(|entry| entry["id"].as_str())
+            && valid_invocation_name(id)
+        {
+            skill.name = id.into();
+            skill.path = format!("opencode-skill:{id}");
+            if skill.description.is_empty() {
+                skill.description = known
+                    .and_then(|entry| entry["description"].as_str())
+                    .unwrap_or_default()
+                    .into();
+            }
+        }
+        skills.insert(skill.name.clone(), skill);
+    }
+    for entry in catalog {
+        let Some(id) = entry["id"].as_str().filter(|id| valid_invocation_name(id)) else {
+            continue;
+        };
+        // The scan already produced this skill (renamed above), or an earlier
+        // catalog entry did; a duplicate must not replace it.
+        if skills.contains_key(id) {
+            continue;
+        }
+        skills.insert(
+            id.into(),
+            Skill {
+                name: id.into(),
+                path: format!("opencode-skill:{id}"),
+                description: entry["description"].as_str().unwrap_or_default().into(),
+                // `autoinvoke: false` only hides the skill from the model's
+                // automatic list; the user may still invoke it explicitly.
+                enabled: true,
+                command: None,
+            },
+        );
+    }
+    skills.into_values().collect()
+}
+
+/// OpenCode 1.x exposes plugin/configured skills in its native command
+/// catalog. Source metadata prevents a command with the same name being
+/// misclassified. (2.x dropped `source`; it uses [`merge_skill_catalog`].)
 fn merge_skill_commands(skills: &mut Vec<zeron_proto::invocation::Skill>, commands: &Value) {
     for command in commands.as_array().into_iter().flatten() {
         if command["source"] != "skill" {
@@ -1596,9 +1969,9 @@ struct TurnState {
     status_backoff: Duration,
     /// Bus events about our session seen since the prompt was posted.
     saw_activity: bool,
-    /// Renderable content (text/reasoning/tool) seen this turn.
-    saw_content: bool,
-    /// Terminal error to fold into Done.
+    /// Terminal error to fold into Done. Cleared when the turn keeps
+    /// producing work after it (`mark_content`), so only an error the turn
+    /// ended on fails it.
     error: Option<String>,
     /// Provider-retry chip already surfaced this turn.
     retry_reported: bool,
@@ -1657,7 +2030,6 @@ impl TurnState {
             status_poll: None,
             status_backoff: Duration::from_millis(100),
             saw_activity: false,
-            saw_content: false,
             error: None,
             retry_reported: false,
             aborted_for_retry: false,
@@ -1670,6 +2042,12 @@ impl TurnState {
     fn note_activity(&mut self) {
         self.saw_activity = true;
         self.stall_deadline = None;
+    }
+
+    /// A retry cap-out, or an error no later work followed: the turn failed
+    /// whatever it produced before the error.
+    fn errored(&self) -> bool {
+        self.aborted_for_retry || self.error.is_some()
     }
 }
 
@@ -2055,8 +2433,7 @@ async fn run_session(session: Session) {
             }).await {
                 break $label;
             }
-            let errored = turn.aborted_for_retry
-                || (turn.error.is_some() && !turn.saw_content);
+            let errored = turn.errored();
             let _ = send(&event_tx, AgentEvent::Done {
                 status: if errored {
                     DoneStatus::Errored
@@ -2518,7 +2895,10 @@ async fn set_agent(
     dir: Option<&str>,
     agent: &str,
 ) -> Result<(), HarnessError> {
-    if server.protocol().await == Protocol::V2 {
+    // No selection means "leave the session's agent alone": the route requires
+    // a real Agent.ID, and an empty one would either fail the resume or clear
+    // the choice the session already had.
+    if server.protocol().await == Protocol::V2 && !agent.is_empty() {
         server
             .post_json(
                 &format!("/api/session/{session_id}/agent"),
@@ -3032,16 +3412,21 @@ struct TurnSpec<'a> {
     message_id: Option<&'a str>,
 }
 
+/// 2.0.4+ takes `name` and `files` on the command route; 2.0.3 and the 1.x
+/// wire take `command`/`arguments` only.
+fn command_files_supported(version: Option<&ServerVersion>) -> bool {
+    version
+        .and_then(|v| v.number)
+        .is_some_and(|v| v >= (2, 0, 4))
+}
+
 fn command_body_v2(
     version: Option<&ServerVersion>,
     name: &str,
     text: &str,
     attachments: &[String],
 ) -> Value {
-    if version
-        .and_then(|v| v.number)
-        .is_some_and(|v| v >= (2, 0, 4))
-    {
+    if command_files_supported(version) {
         let mut body = json!({"name": name, "text": text});
         if !attachments.is_empty() {
             body["files"] = prompt_body_v2(text, attachments, None)["files"].clone();
@@ -3080,7 +3465,9 @@ async fn post_prompt(
     if let Some((name, arguments)) =
         native_command_request(prompt, commands, native_command_selected)?
     {
-        if !attachments.is_empty() {
+        let command_files =
+            protocol == Protocol::V2 && command_files_supported(server.version.get());
+        if !attachments.is_empty() && !command_files {
             return Err(HarnessError::Protocol(
                 "OpenCode commands cannot include attachments; send them in a separate prompt"
                     .into(),
@@ -3807,6 +4194,7 @@ fn mark_content(turn: &mut TurnState, events: &[AgentEvent]) {
         }
     }
     if turn.active
+        && !turn.aborted_for_retry
         && events.iter().any(|ev| {
             matches!(
                 ev,
@@ -3816,7 +4204,9 @@ fn mark_content(turn: &mut TurnState, events: &[AgentEvent]) {
             )
         })
     {
-        turn.saw_content = true;
+        // Work after an error means the session recovered from it; the chip
+        // stays in the transcript, but the turn must not settle as failed.
+        turn.error = None;
     }
 }
 

@@ -890,6 +890,69 @@ async fn catalog_decodes_fragmented_http_without_retaining_unused_fields() {
 }
 
 #[tokio::test]
+async fn skill_catalog_primes_through_model_then_reads_the_location() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8_lossy(&headers);
+            let line = head.lines().next().unwrap_or_default().to_owned();
+            recorded.lock().unwrap().push(line.clone());
+            let body = if line.contains("/api/model") {
+                json!({"data": []})
+            } else {
+                json!({"data": [{"id": "probe", "path": "/skills/probe/SKILL.md", "description": "d"}]})
+            }
+            .to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let server_state = Server {
+        child: None,
+        base: format!("http://{address}"),
+        auth: None,
+        client: http_client(),
+        stderr_tail: crate::StderrTail::default(),
+        protocol: tokio::sync::OnceCell::new(),
+        version: tokio::sync::OnceCell::new(),
+    };
+    server_state.protocol.set(Protocol::V2).ok();
+    let catalog = server_state
+        .skill_catalog(Some(r"C:\work dir"))
+        .await
+        .unwrap();
+    assert_eq!(catalog[0]["id"], "probe");
+    let seen = seen.lock().unwrap();
+    // The model route waits for location plugins; the skill route alone can
+    // answer with the embedded skills while the directory scan is in flight.
+    assert!(seen[0].starts_with("GET /api/model?"), "{:?}", *seen);
+    assert!(seen[1].starts_with("GET /api/skill?"), "{:?}", *seen);
+    assert!(
+        seen.iter().all(|line| line.contains("location")),
+        "{:?}",
+        *seen
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_catalog_decode_releases_a_stalled_http_body() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1133,12 +1196,13 @@ fn reasoning_ahead_of_its_message_role_is_held_and_replayed() {
     // The role lands; replay drains the held part.
     feed.assistant_messages.insert("msg_a".into(), true);
     let mut turn = TurnState::begin(None);
+    turn.error = Some("transient".into());
     let events = replay_pending(&mut feed, "msg_a", true, &mut turn);
     assert!(matches!(
         events.as_slice(),
         [AgentEvent::ReasoningDelta { text }] if text == "early thought"
     ));
-    assert!(turn.saw_content);
+    assert!(turn.error.is_none());
 }
 
 #[test]
@@ -1481,6 +1545,15 @@ fn tool_names_type_the_common_calls() {
     let call = oc_tool_call("mystery", &json!({"x": 1}));
     assert!(matches!(&call, ToolCall::Unknown { name, input: Some(_) } if name == "mystery"));
     assert!(!call.is_subagent_spawn());
+}
+
+#[test]
+fn v2_location_query_encodes_the_directory() {
+    let path = with_location("/api/skill", r"C:\Users\a b\proj&x");
+    assert_eq!(
+        path,
+        "/api/skill?location%5Bdirectory%5D=C%3A%5CUsers%5Ca+b%5Cproj%26x"
+    );
 }
 
 #[test]
@@ -2110,6 +2183,42 @@ async fn prompt_error_and_interrupt_before_busy_still_settle() {
 }
 
 #[tokio::test]
+async fn an_error_after_streamed_work_still_fails_the_turn() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.bus
+        .send(json!({"type":"message.updated", "properties":{"info":{"id":"answer", "sessionID":"fixture", "role":"assistant"}}}))
+        .unwrap();
+    wire.bus
+        .send(json!({"type":"message.part.updated", "properties":{"part":{"id":"text", "messageID":"answer", "sessionID":"fixture", "type":"text", "text":"working"}}}))
+        .unwrap();
+    wire.bus
+        .send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"ProviderError", "data":{"message":"Free usage limit reached"}}}}))
+        .unwrap();
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn work_after_a_transient_error_settles_completed() {
+    let mut wire = TurnWire::start(false).await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.bus
+        .send(json!({"type":"message.updated", "properties":{"info":{"id":"answer", "sessionID":"fixture", "role":"assistant"}}}))
+        .unwrap();
+    wire.bus
+        .send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"ProviderError", "data":{"message":"upstream blip"}}}}))
+        .unwrap();
+    wire.bus
+        .send(json!({"type":"message.part.updated", "properties":{"part":{"id":"text", "messageID":"answer", "sessionID":"fixture", "type":"text", "text":"recovered"}}}))
+        .unwrap();
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+}
+
+#[tokio::test]
 async fn v2_model_selection_and_prompt_use_the_documented_bodies() {
     let mut wire = TurnWire::start_proto(false, true).await;
     wire.request("/api/model").await;
@@ -2403,7 +2512,7 @@ async fn agent_selection_on_create_and_resume() {
                     }
                 });
                 let selected = if agent == "build-id" { "build-id" } else { "" };
-                let expected = if v2 && (resume || !selected.is_empty()) {
+                let expected = if v2 && !selected.is_empty() {
                     json!(selected)
                 } else {
                     Value::Null
@@ -2414,13 +2523,19 @@ async fn agent_selection_on_create_and_resume() {
                         .unwrap_or(Value::Null),
                     expected
                 );
-                if resume && v2 {
+                if resume && v2 && !selected.is_empty() {
                     assert_eq!(
                         posts[0],
                         (
                             "/api/session/fixture/agent".into(),
                             json!({"agent": selected})
                         )
+                    );
+                }
+                if v2 && selected.is_empty() {
+                    assert!(
+                        !posts.iter().any(|(path, _)| path.ends_with("/agent")),
+                        "no selection must not clear the agent the session already has"
                     );
                 }
             }
@@ -2836,5 +2951,182 @@ fn native_skill_catalog_rejects_unrepresentable_commands() {
             command: skill.command,
         };
         assert_eq!(invocation_links(&invocation.link())[0].1, invocation);
+    }
+}
+
+#[test]
+fn v2_skill_catalog_names_the_scanned_skills_by_id() {
+    use zeron_proto::invocation::{Invocation, Skill};
+    let discovered = vec![
+        // Its frontmatter label differs from the ID; the catalog settles it.
+        Skill {
+            name: "Git Release".into(),
+            path: "/repo/.opencode/skills/git-release/SKILL.md".into(),
+            description: String::new(),
+            enabled: true,
+            command: None,
+        },
+        // Not in the catalog: keep the scan entry (and its readable link).
+        Skill {
+            name: "local-only".into(),
+            path: "/repo/.agents/skills/local-only/SKILL.md".into(),
+            description: "Local".into(),
+            enabled: true,
+            command: None,
+        },
+    ];
+    let catalog = json!([
+        {
+            "id": "git-release",
+            "name": "Git Release",
+            "description": "Cut a release",
+            "autoinvoke": true,
+            "path": "/repo/.opencode/skills/git-release/SKILL.md",
+            "content": "# Git Release"
+        },
+        // No local file: a config-file directory or HTTP catalog skill.
+        {
+            "id": "quiet-review",
+            "name": "Quiet Review",
+            "description": "",
+            "autoinvoke": false,
+            "path": "/elsewhere/quiet-review/SKILL.md",
+            "content": ""
+        },
+        // A label is not an identity: an id the wire cannot carry is skipped.
+        { "id": "two words", "name": "Spaced", "description": "" },
+        // The catalog is keyed by id, so a duplicate must not double-list.
+        { "id": "git-release", "name": "Again", "description": "" }
+    ]);
+    let skills = merge_skill_catalog(discovered, catalog.as_array().unwrap());
+    assert_eq!(skills.len(), 3);
+
+    assert_eq!(skills[0].name, "git-release");
+    assert_eq!(skills[0].path, "opencode-skill:git-release");
+    assert_eq!(skills[0].description, "Cut a release");
+    assert!(skills[0].enabled);
+    assert!(skills[0].command.is_none());
+
+    assert_eq!(skills[1].name, "local-only");
+    assert_eq!(skills[1].path, "/repo/.agents/skills/local-only/SKILL.md");
+
+    assert_eq!(skills[2].name, "quiet-review");
+    assert_eq!(skills[2].path, "opencode-skill:quiet-review");
+    assert!(
+        skills[2].enabled,
+        "autoinvoke=false only hides it from the model, not the user"
+    );
+
+    let invocation = Invocation::Skill {
+        name: skills[0].name.clone(),
+        path: skills[0].path.clone(),
+        command: None,
+    };
+    assert_eq!(invocation.prompt_text(), "@git-release");
+    assert_eq!(
+        zeron_proto::invocation::harness_prompt(
+            &invocation.link(),
+            zeron_proto::HarnessId::Opencode
+        ),
+        "Use the skill @git-release"
+    );
+}
+
+#[test]
+fn command_attachments_start_at_two_zero_four() {
+    for (version, expected) in [
+        ("2.0.2", false),
+        ("2.0.3", false),
+        ("2.0.4", true),
+        ("2.0.11", true),
+        ("unknown", false),
+    ] {
+        let version = ServerVersion::parse(version);
+        assert_eq!(
+            command_files_supported(Some(&version)),
+            expected,
+            "{version:?}"
+        );
+    }
+    assert!(!command_files_supported(None));
+}
+
+#[test]
+fn legacy_credentials_translate_to_the_v2_shape() {
+    let key = legacy_credential("anthropic", &json!({"type":"api","key":"sk-ant"})).unwrap();
+    assert_eq!(key.integration, "anthropic");
+    assert_eq!(key.value, json!({"type":"key","key":"sk-ant"}));
+    assert!(key.id.starts_with("zeron-anthropic-"));
+    assert_eq!(
+        legacy_credential("anthropic", &json!({"type":"api","key":"sk-ant"}))
+            .unwrap()
+            .id,
+        key.id,
+        "the same secret must keep a stable id"
+    );
+    assert_ne!(
+        legacy_credential("anthropic", &json!({"type":"api","key":"sk-other"}))
+            .unwrap()
+            .id,
+        key.id
+    );
+
+    let oauth = legacy_credential(
+        "openai",
+        &json!({
+            "type":"oauth","refresh":"r1","access":"a1","expires":42,
+            "accountId":"acct","enterpriseUrl":"https://corp.example"
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        oauth.value,
+        json!({
+            "type":"oauth","methodID":"chatgpt-browser","refresh":"r1",
+            "access":"a1","expires":42,
+            "metadata":{"accountID":"acct","enterpriseUrl":"https://corp.example"}
+        })
+    );
+    assert_eq!(
+        oauth.id,
+        legacy_credential(
+            "openai",
+            &json!({"type":"oauth","refresh":"r1","access":"a2","expires":43}),
+        )
+        .unwrap()
+        .id,
+        "a rotated access token must not need a new credential row"
+    );
+    assert_eq!(
+        legacy_credential(
+            "github-copilot",
+            &json!({"type":"oauth","refresh":"r","access":"a","expires":1}),
+        )
+        .unwrap()
+        .value["methodID"],
+        "device"
+    );
+    assert_eq!(
+        legacy_credential(
+            "some-provider",
+            &json!({"type":"oauth","refresh":"r","access":"a","expires":1}),
+        )
+        .unwrap()
+        .value["methodID"],
+        "oauth"
+    );
+
+    for unusable in [
+        json!({"type":"api"}),
+        json!({"type":"api","key":"  "}),
+        json!({"type":"oauth","refresh":"","access":"a","expires":1}),
+        json!({"type":"wellknown","key":"k","token":"t"}),
+        json!({"type":"other"}),
+        json!("not an object"),
+    ] {
+        assert!(
+            legacy_credential("openai", &unusable).is_none(),
+            "{unusable}"
+        );
     }
 }

@@ -98,6 +98,11 @@ impl Invocation {
     pub fn prompt_text(&self) -> String {
         match self {
             Self::Command { name } => format!("/{name}"),
+            // OpenCode 2 loads a skill by its exact, case-sensitive ID through
+            // an @mention; a bare label would only read as ordinary prose.
+            Self::Skill { name, path, .. } if path.starts_with("opencode-skill:") => {
+                format!("@{name}")
+            }
             Self::Skill { name, path, .. } => {
                 if native_skill_identity(path) {
                     return name.clone();
@@ -438,6 +443,26 @@ mod tests {
                 "Use the skill [$review](/repo/SKILL.md)"
             );
         }
+    }
+
+    #[test]
+    fn opencode_catalog_skills_mention_their_id() {
+        let catalog = Invocation::Skill {
+            name: "git-release".into(),
+            path: "opencode-skill:git-release".into(),
+            command: None,
+        };
+        assert_eq!(catalog.prompt_text(), "@git-release");
+        assert_eq!(
+            harness_prompt(&catalog.link(), crate::HarnessId::Opencode),
+            "Use the skill @git-release"
+        );
+        // A file-backed skill keeps the readable Markdown reference.
+        let file = skill("review", "/repo/SKILL.md");
+        assert_eq!(
+            harness_prompt(&file.link(), crate::HarnessId::Opencode),
+            "Use the skill [$review](/repo/SKILL.md)"
+        );
     }
 
     #[test]
