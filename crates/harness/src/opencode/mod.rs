@@ -1956,6 +1956,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn: turn_control,
+        user_message_id: _,
     } = controls;
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());

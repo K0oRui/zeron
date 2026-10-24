@@ -976,6 +976,14 @@ pub fn antigravity_home() -> Result<PathBuf, HarnessError> {
     antigravity_paths::home()
 }
 
+/// Version reported by a managed Antigravity install. Antigravity's server
+/// exposes no `--version` flag, so the version is keyed by the managed
+/// install directory instead. Returns `None` when it can't be determined;
+/// the caller falls back to probing the executable.
+pub fn managed_antigravity_version(_executable: &Path) -> Option<String> {
+    None
+}
+
 /// The auth method Antigravity's server saved in `settings.json` (it records
 /// every successful `authenticate`), canonicalized the way sign-in reads it.
 /// `None` when nothing is saved or the file can't be read.
@@ -1141,6 +1149,37 @@ fn antigravity_spec() -> AcpAgentSpec {
         // preserves any method already selected in antigravity's settings.
         auth_method: Some("oauth-personal"),
         skill_dirs: antigravity_skill_dirs,
+        hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
+    }
+}
+
+/// Kilo Code (`kilo acp`) â€” an opencode fork driven over its own ACP server.
+fn kilo_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Kilo,
+        display_name: "Kilo Code",
+        executable: "kilo",
+        env_override: "KILO_EXECUTABLE",
+        args: &["acp"],
+        npm_package: None,
+        archive: None,
+        extra_paths: Vec::new,
+        cli_executable: "kilo",
+        cli_extra_paths: Vec::new,
+        install_hint: "Install Kilo Code to enable, or set KILO_EXECUTABLE to its ACP server",
+        models: || vec![],
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        effort_in_model_id: false,
+        auth_method: None,
+        skill_dirs: Vec::new,
         hidden_commands: &[],
         drops_unstarted_cancelled_prompt: false,
     }
@@ -1318,6 +1357,11 @@ impl AcpHarness {
     pub fn antigravity() -> Self {
         Self::with_spec(antigravity_spec())
             .with_model_discovery_timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT)
+    }
+
+    /// Kilo Code (`kilo acp`).
+    pub fn kilo() -> Self {
+        Self::with_spec(kilo_spec())
     }
 
     /// sign the agent out with acp `logout`, clearing the credentials its
@@ -4091,6 +4135,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn: turn_control,
+        user_message_id: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let rules = ConfigRules {

@@ -8,7 +8,7 @@ use crate::HarnessId;
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),

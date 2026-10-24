@@ -98,6 +98,7 @@ async fn an_approved_device_login_runs_real_turns_and_signs_out() {
             rx
         }),
         turn: TurnControl::default(),
+        user_message_id: None,
     };
     let harness = MuseHarness::new().with_executable(&bin);
     let mut stream = harness
@@ -185,6 +186,7 @@ async fn a_real_turn_reports_the_subscriptions_usage() {
             rx
         }),
         turn: TurnControl::default(),
+        user_message_id: None,
     };
     let request = RunRequest {
         prompt: "Reply with exactly the word: pong".into(),

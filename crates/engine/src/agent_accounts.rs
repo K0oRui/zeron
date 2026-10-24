@@ -1170,7 +1170,6 @@ impl AgentAccounts {
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
             HarnessId::Muse => self.set_muse_active(Some(&slot.id))?,
             HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
->>>>>>> upstream/main
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;

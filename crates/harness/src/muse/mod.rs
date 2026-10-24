@@ -154,8 +154,9 @@ impl MuseHarness {
                 request_input,
                 mut steering,
                 interrupt,
-                turn,
-            } = controls;
+        turn,
+        user_message_id: _,
+    } = controls;
             runner.input = Some(std::sync::Arc::from(request_input));
             runner.turn = turn;
             let consumer = runner.tx.clone();
