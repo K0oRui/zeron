@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use zeron_proto::{
     CloudSession, CloudSessions, CloudState, CloudStatus, Device, GithubRepo, VaultConnection,
-    VaultConnectionStatus, VaultDevice, VaultProvider, VaultStatus,
+    VaultConnectionStatus, VaultProvider, VaultStatus,
 };
 
 use crate::icons;

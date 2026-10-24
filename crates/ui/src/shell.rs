@@ -9041,7 +9041,6 @@ impl Shell {
         selected: bool,
         archived: bool,
         preview: bool,
-        remote: bool,
         drag: Option<SidebarSessionDrag>,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all

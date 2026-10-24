@@ -1107,8 +1107,6 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let remote =
-                    state.local_device_id.as_deref() != Some(chat.device_id.as_str());
                 self.render_chat_row(
                     id.clone(),
                     transcript::single_line(chat.title.as_deref().unwrap_or("New session")).into(),
@@ -1122,7 +1120,6 @@ impl Shell {
                     active,
                     chat.archived,
                     false,
-                    remote,
                     None,
                     None,
                     false,

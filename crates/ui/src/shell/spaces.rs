@@ -2629,7 +2629,6 @@ struct ActiveChatRow {
     branch: Option<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
-    remote: bool,
 }
 
 pub(super) fn compare_sidebar_chats(
@@ -6033,7 +6032,6 @@ impl Shell {
             SidebarOrganization::ByProject => Some(sidebar_project_group(state, &chat)),
             SidebarOrganization::InOneList => None,
         };
-        let remote = state.local_device_id.as_deref() != Some(chat.device_id.as_str());
         ActiveChatRow {
             status,
             chat: chat.clone(),
@@ -6041,7 +6039,6 @@ impl Shell {
             branch,
             change_request,
             group,
-            remote,
         }
     }
 
@@ -6421,7 +6418,6 @@ impl Shell {
                     branch,
                     change_request,
                     group: _,
-                    remote,
                 } = row;
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
@@ -6526,7 +6522,6 @@ impl Shell {
                         is_selected,
                         false,
                         is_moving,
-                        remote,
                         if is_moving { None } else { drag },
                         jump_label,
                         self.settings.sidebar_show_project_icon && !project_group && !in_project_block,
@@ -7155,7 +7150,6 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let remote = row.remote;
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
@@ -7173,7 +7167,6 @@ impl Shell {
                         is_selected,
                         true,
                         false,
-                        remote,
                         None,
                         None,
                         self.settings.sidebar_show_project_icon,
