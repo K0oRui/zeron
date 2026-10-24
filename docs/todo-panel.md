@@ -23,14 +23,17 @@ needs no history, only the latest `ToolCall::Todo` part.
 `TodoItem` is `{ text, done, status? }` (`crates/proto/src/agent.rs`).
 
 - `done` is unchanged and stays authoritative for completion.
-- `status` (`pending | inProgress | completed`) is additive and serde-defaulted. It
-  is written **only for an in-progress item**, so every other item serializes
-  byte-for-byte as before and old builds, iOS and the TS edge
-  (`edge/src/session-doc`) ignore it. A missing or unrecognised value derives from
-  `done`; an unknown future status never fails the whole tool call.
+- `status` (`pending | inProgress | completed | cancelled`) is additive and
+  serde-defaulted. It is written **only for an in-progress or cancelled item**,
+  so pending and done items serialize byte-for-byte as before and old builds,
+  iOS and the TS edge (`edge/src/session-doc`) ignore it. A missing or
+  unrecognised value derives from `done`; an unknown future status never fails
+  the whole tool call.
 - Use `TodoItem::new(text, status)` to keep `done` and `status` consistent and
   `item.status()` to read the effective value.
-- `cancelled` (OpenCode) decodes as pending: it is not done and not being worked on.
+- `cancelled` (OpenCode) is neither done nor planned: the panel renders it
+  faintly, skips it when choosing the headline, and treats a list of done plus
+  cancelled items as finished.
 
 The ACP and Codex plan updates reuse one tool id, so the fold refreshes the same
 part in place within a segment and appends a new one in the next segment. The

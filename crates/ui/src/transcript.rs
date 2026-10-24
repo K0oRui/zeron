@@ -950,6 +950,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
                     zeron_proto::TodoStatus::Completed => "[x]",
                     zeron_proto::TodoStatus::InProgress => "[~]",
                     zeron_proto::TodoStatus::Pending => "[ ]",
+                    zeron_proto::TodoStatus::Cancelled => "[-]",
                 };
                 format!("{mark} {}", i.text)
             })

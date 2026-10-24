@@ -540,15 +540,18 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    /// The agent dropped the item. It is neither done nor still planned.
+    Cancelled,
 }
 
 impl TodoStatus {
-    /// Decode a harness status string. Anything unrecognised (including
-    /// `cancelled`) is `Pending`: not finished, not being worked on.
+    /// Decode a harness status string. Anything unrecognised is `Pending`:
+    /// not finished, not being worked on.
     pub fn parse(raw: &str) -> Self {
         match raw {
             "completed" | "complete" | "done" => Self::Completed,
             "in_progress" | "inProgress" | "in-progress" | "active" => Self::InProgress,
+            "cancelled" | "canceled" => Self::Cancelled,
             _ => Self::Pending,
         }
     }
@@ -559,8 +562,9 @@ impl TodoStatus {
 /// `done` is the original wire field and stays authoritative for completion,
 /// so docs written before `status` existed (and readers that ignore it) keep
 /// working. `status` is additive and written only when it adds information —
-/// i.e. for an in-progress item; a missing or unreadable value derives from
-/// `done`. Build items with [`TodoItem::new`] to keep the two consistent.
+/// i.e. for an in-progress or cancelled item; a missing or unreadable value
+/// derives from `done`. Build items with [`TodoItem::new`] to keep the two
+/// consistent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
@@ -579,7 +583,8 @@ impl TodoItem {
         Self {
             text: text.into(),
             done: status == TodoStatus::Completed,
-            status: (status == TodoStatus::InProgress).then_some(status),
+            status: matches!(status, TodoStatus::InProgress | TodoStatus::Cancelled)
+                .then_some(status),
         }
     }
 
@@ -1050,15 +1055,20 @@ mod todo_item_tests {
     }
 
     #[test]
-    fn only_in_progress_adds_a_field_so_other_docs_are_unchanged() {
+    fn pending_and_done_keep_the_legacy_shape() {
         let pending = serde_json::to_value(TodoItem::new("a", TodoStatus::Pending)).unwrap();
         let done = serde_json::to_value(TodoItem::new("b", TodoStatus::Completed)).unwrap();
         let active = serde_json::to_value(TodoItem::new("c", TodoStatus::InProgress)).unwrap();
+        let cancelled = serde_json::to_value(TodoItem::new("d", TodoStatus::Cancelled)).unwrap();
         assert_eq!(pending, json!({ "text": "a", "done": false }));
         assert_eq!(done, json!({ "text": "b", "done": true }));
         assert_eq!(
             active,
             json!({ "text": "c", "done": false, "status": "inProgress" })
+        );
+        assert_eq!(
+            cancelled,
+            json!({ "text": "d", "done": false, "status": "cancelled" })
         );
     }
 
@@ -1095,7 +1105,8 @@ mod todo_item_tests {
         assert_eq!(TodoStatus::parse("in_progress"), TodoStatus::InProgress);
         assert_eq!(TodoStatus::parse("inProgress"), TodoStatus::InProgress);
         assert_eq!(TodoStatus::parse("pending"), TodoStatus::Pending);
-        assert_eq!(TodoStatus::parse("cancelled"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse("cancelled"), TodoStatus::Cancelled);
+        assert_eq!(TodoStatus::parse("canceled"), TodoStatus::Cancelled);
         assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
     }
 }

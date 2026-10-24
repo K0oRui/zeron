@@ -59,9 +59,11 @@ pub(crate) fn latest_todo(entries: &[SessionMessageEntry]) -> Option<Vec<TodoIte
 pub(crate) struct TodoSummary {
     pub total: usize,
     pub done: usize,
+    /// Dropped by the agent; neither done nor still planned.
+    pub cancelled: usize,
     /// First in-progress item.
     pub active: Option<usize>,
-    /// First item not yet completed.
+    /// First item still to be done.
     pub next: Option<usize>,
 }
 
@@ -70,12 +72,14 @@ impl TodoSummary {
         let mut summary = Self {
             total: items.len(),
             done: 0,
+            cancelled: 0,
             active: None,
             next: None,
         };
         for (ix, item) in items.iter().enumerate() {
             match item.status() {
                 TodoStatus::Completed => summary.done += 1,
+                TodoStatus::Cancelled => summary.cancelled += 1,
                 TodoStatus::InProgress => {
                     summary.active.get_or_insert(ix);
                     summary.next.get_or_insert(ix);
@@ -89,7 +93,7 @@ impl TodoSummary {
     }
 
     pub fn finished(&self) -> bool {
-        self.total > 0 && self.done == self.total
+        self.total > 0 && self.done + self.cancelled == self.total
     }
 
     /// The item the header names: what is being worked on, else what is next.
@@ -605,7 +609,9 @@ fn todo_item_row(
 ) -> AnyElement {
     let status = item.status();
     let (color, weight) = match status {
-        TodoStatus::Completed => (theme.text_faint, gpui::FontWeight::NORMAL),
+        TodoStatus::Completed | TodoStatus::Cancelled => {
+            (theme.text_faint, gpui::FontWeight::NORMAL)
+        }
         TodoStatus::InProgress => (theme.text, gpui::FontWeight::MEDIUM),
         TodoStatus::Pending => (theme.text_muted, gpui::FontWeight::NORMAL),
     };
@@ -680,6 +686,12 @@ fn status_glyph(
             .border_1()
             .border_color(theme.text_faint.opacity(0.7))
             .into_any_element(),
+        TodoStatus::Cancelled => div()
+            .w(px(8.0))
+            .h(px(1.0))
+            .rounded_full()
+            .bg(theme.text_faint)
+            .into_any_element(),
     }
 }
 
@@ -688,7 +700,7 @@ mod tests {
     use super::*;
 
     fn items(spec: &str) -> Vec<TodoItem> {
-        // x = completed, > = in progress, . = pending
+        // x = completed, > = in progress, - = cancelled, . = pending
         spec.chars()
             .enumerate()
             .map(|(i, c)| {
@@ -697,6 +709,7 @@ mod tests {
                     match c {
                         'x' => TodoStatus::Completed,
                         '>' => TodoStatus::InProgress,
+                        '-' => TodoStatus::Cancelled,
                         _ => TodoStatus::Pending,
                     },
                 )
@@ -775,8 +788,8 @@ mod tests {
     fn summary_counts_and_names_the_current_item() {
         let s = TodoSummary::of(&items("xx>.."));
         assert_eq!(
-            (s.total, s.done, s.active, s.next),
-            (5, 2, Some(2), Some(2))
+            (s.total, s.done, s.cancelled, s.active, s.next),
+            (5, 2, 0, Some(2), Some(2))
         );
         assert_eq!(s.headline(), Some(2));
         assert!(!s.finished());
@@ -789,6 +802,10 @@ mod tests {
         let s = TodoSummary::of(&items("xxx"));
         assert!(s.finished());
         assert_eq!(s.headline(), None);
+        // A cancelled item is not work left, but it is not "done" either.
+        let s = TodoSummary::of(&items("x-x"));
+        assert_eq!((s.done, s.cancelled, s.headline()), (2, 1, None));
+        assert!(s.finished());
         assert!(!TodoSummary::of(&[]).finished());
     }
 

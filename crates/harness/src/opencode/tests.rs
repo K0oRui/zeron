@@ -1538,7 +1538,7 @@ fn tool_names_type_the_common_calls() {
                 TodoItem::new("step one", TodoStatus::Completed),
                 TodoItem::new("step two", TodoStatus::InProgress),
                 TodoItem::new("step three", TodoStatus::Pending),
-                TodoItem::new("step four", TodoStatus::Pending),
+                TodoItem::new("step four", TodoStatus::Cancelled),
             ]
         }
     );
