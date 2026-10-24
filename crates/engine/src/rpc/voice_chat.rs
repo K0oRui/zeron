@@ -178,8 +178,12 @@ mod tests {
         let row = core.workspace.chat(&first).unwrap().unwrap();
         assert_eq!(row.config, Some(config("b")));
 
-        core.workspace
-            .set_chat_harness_session(&first, "codex-thread", "/home/me", Some(HarnessId::Codex));
+        core.workspace.set_chat_harness_session(
+            &first,
+            "codex-thread",
+            "/home/me",
+            Some(HarnessId::Codex),
+        );
         let doc = core.doc_host.open(&first).unwrap();
         for i in 0..ROTATE_AFTER {
             doc.write_user_message(&format!("m{i}"), "hi", i as i64)
