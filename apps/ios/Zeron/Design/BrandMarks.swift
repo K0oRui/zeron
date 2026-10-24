@@ -8,7 +8,7 @@ import SwiftUI
 import UIKit
 
 enum BrandMark {
-    case claude, openai, cursor, devin, grok, hermes, pi, opencode, antigravity
+    case claude, openai, cursor, devin, grok, hermes, pi, opencode, kilo, antigravity
 
     var viewBox: CGSize {
         switch self {
@@ -20,6 +20,7 @@ enum BrandMark {
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
         case .opencode: return CGSize(width: 24, height: 30)
+        case .kilo: return CGSize(width: 16, height: 16)
         case .antigravity: return CGSize(width: 24, height: 24)
         }
     }
@@ -28,7 +29,7 @@ enum BrandMark {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi, .opencode, .antigravity: return true
+        case .hermes, .pi, .opencode, .kilo, .antigravity: return true
         default: return false
         }
     }
@@ -54,6 +55,9 @@ enum BrandMark {
             // 45%-opacity inner fill this single-path renderer skips — the
             // mark reads identically at glyph sizes).
             return "M24 0H0V30H24V0ZM18 6H6V24H18V6Z"
+        case .kilo:
+            // kilo-mark.svg's pixel-"K" in a solid frame (16×16, even-odd).
+            return "M16 16H0V0H16V16ZM10.09 10.09H8.7V12.27L9.64 13.22H11.83V11.83H10.09L10.09 10.09ZM13.22 9.64L12.27 8.7H10.09V10.09H11.83L11.83 11.83H13.22L13.22 9.64ZM7.3 8.7H5.91V10.09H7.3V8.7ZM2.78 12.27L3.73 13.22H7.3V11.83H4.17V8.7H2.78L2.78 12.27ZM11.64 5.91V3.73L10.7 2.78H8.7V4.17H10.25V5.91H8.7V7.3H13.22V5.91H11.64ZM4.17 2.78H2.78V7.3H4.17V5.74H5.91V7.3H7.3V5.74L5.91 4.35H4.17V2.78ZM7.3 2.78H5.91L5.91 4.35H7.3V2.78Z"
         case .antigravity:
             return "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
         }
@@ -68,6 +72,7 @@ enum BrandMark {
         case "hermes": return .hermes
         case "pi": return .pi
         case "opencode": return .opencode
+        case "kilo": return .kilo
         case "antigravity": return .antigravity
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }

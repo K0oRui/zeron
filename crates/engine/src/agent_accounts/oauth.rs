@@ -46,8 +46,8 @@ impl AgentAccounts {
         let listener = bind_loopback(wanted).await.map_err(|err| {
             EngineError::Other(if err.kind() == std::io::ErrorKind::AddrInUse {
                 format!(
-                    "Port {wanted} is in use — another ChatGPT sign-in (codex login, OpenCode or \
-                     Pi) is running. Finish or cancel it, then try again."
+                    "Port {wanted} is in use — another ChatGPT sign-in (codex login, OpenCode, \
+                     Kilo or Pi) is running. Finish or cancel it, then try again."
                 )
             } else {
                 format!("Could not open the sign-in callback: {err}")

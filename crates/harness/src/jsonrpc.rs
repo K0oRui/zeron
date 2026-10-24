@@ -190,6 +190,14 @@ impl RpcClient {
         let _ = self.writer.send(line.to_string());
     }
 
+    /// Write a bare newline. Kilo's ACP server spawns `git config` with stdin
+    /// inherited; on Windows that child reads the JSON-RPC pipe and the turn
+    /// stalls until another line arrives (Kilo issue #10768, unfixed as of
+    /// 7.8.17). Blank lines are ignored by every newline-framed reader here.
+    pub fn nudge(&self) {
+        let _ = self.writer.send(String::new());
+    }
+
     /// Answer a server→client request.
     pub fn respond(&self, id: &Value, result: Value) {
         let line = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -404,6 +412,20 @@ mod tests {
         );
         assert!(frame.get("id").is_none());
         assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nudge_queues_a_blank_line() {
+        let (writer, mut receiver) = mpsc::unbounded_channel();
+        let client = RpcClient {
+            next_id: Arc::new(AtomicI64::new(0)),
+            pending: Arc::default(),
+            writer,
+            closed: Arc::new(AtomicBool::new(false)),
+            voice_router: Arc::default(),
+        };
+        client.nudge();
+        assert_eq!(receiver.try_recv().unwrap(), "");
     }
 
     #[test]

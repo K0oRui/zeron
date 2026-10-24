@@ -20,9 +20,16 @@ struct Saved {
 
 fn location(root: &Path, harness: &dyn Harness, context: &ModelContext) -> PathBuf {
     let id = serde_json::to_value(harness.id()).unwrap();
+    // Kilo now persists only free gateway rows. The new name keeps the
+    // previous unfiltered catalog from being served once during an upgrade.
+    let name = if harness.id() == zeron_proto::HarnessId::Kilo {
+        format!("free-{}.json", context.hash)
+    } else {
+        format!("{}.json", context.hash)
+    };
     root.join("model-catalogs")
         .join(id.as_str().unwrap())
-        .join(format!("{}.json", context.hash))
+        .join(name)
 }
 fn read(path: &Path, context: &ModelContext) -> Option<Vec<Model>> {
     let saved: Saved = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;

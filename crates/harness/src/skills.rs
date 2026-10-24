@@ -115,6 +115,12 @@ fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
             ".cursor/skills",
         ],
         HarnessId::Opencode => &[".claude/skills", ".agents/skills", ".opencode/skills"],
+        HarnessId::Kilo => &[
+            ".claude/skills",
+            ".agents/skills",
+            ".kilo/skills",
+            ".kilocode/skills",
+        ],
         HarnessId::Grok => &[".agents/skills", ".claude/skills", ".grok/skills"],
         HarnessId::Hermes => &[".agents/skills"],
         HarnessId::Pi => &[".agents/skills", ".pi/skills"],
@@ -159,6 +165,15 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
                 .join("opencode/skills"),
             String::new(),
         )),
+        HarnessId::Kilo => {
+            let config = std::env::var_os("KILO_CONFIG_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+                .unwrap_or_else(|| home.join(".config"))
+                .join("kilo");
+            roots.push((config.join("skills"), String::new()));
+            roots.push((config.join("skill"), String::new()));
+        }
         HarnessId::ClaudeCode => {
             let config = std::env::var_os("CLAUDE_CONFIG_DIR")
                 .map(PathBuf::from)
@@ -551,7 +566,12 @@ mod tests {
             ),
             "/skill:review arguments"
         );
-        for harness in [HarnessId::Devin, HarnessId::Grok, HarnessId::Hermes] {
+        for harness in [
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Kilo,
+        ] {
             let mut skills = vec![Skill {
                 name: "review".into(),
                 path: "/repo/SKILL.md".into(),
@@ -575,6 +595,7 @@ mod tests {
             HarnessId::Devin,
             HarnessId::Grok,
             HarnessId::Hermes,
+            HarnessId::Kilo,
             HarnessId::Antigravity,
             HarnessId::Pi,
         ] {
@@ -724,6 +745,7 @@ mod tests {
             HarnessId::Devin,
             HarnessId::Grok,
             HarnessId::Hermes,
+            HarnessId::Kilo,
             HarnessId::Pi,
             HarnessId::Antigravity,
             HarnessId::Opencode,
@@ -753,6 +775,7 @@ mod tests {
             HarnessId::Devin,
             HarnessId::Grok,
             HarnessId::Hermes,
+            HarnessId::Kilo,
             HarnessId::Pi,
             HarnessId::Antigravity,
             HarnessId::Opencode,

@@ -41,7 +41,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_keychain_service: None,
         antigravity_home: Some(root.join("gemini")),
         antigravity_keychain: false,
-        // Grok / Devin / OpenCode / Pi / Hermes: temp homes too.
+        // Grok / Devin / OpenCode / Kilo / Pi / Hermes: temp homes too.
         ..AgentAccountsConfig::isolated(root)
     };
     (AgentAccounts::new(config.clone()), config)
@@ -643,7 +643,7 @@ async fn forget_guards_and_removes_slots() {
 /// exactly that agent's store (for OpenCode/Pi: exactly that provider's
 /// entry) at 0600.
 #[tokio::test]
-async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
+async fn grok_devin_opencode_kilo_and_pi_logins_swap_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (accounts, config) = test_accounts(tmp.path());
     let write = |path: &Path, contents: String| {
@@ -673,6 +673,7 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
     };
     let grok_file = config.grok_home.join("auth.json");
     let opencode_file = config.opencode_auth_file.clone();
+    let kilo_file = config.kilo_auth_file.clone();
     let pi_file = config.pi_agent_dir.join("auth.json");
     let opencode = |account: &str| {
         serde_json::json!({ "openai": chatgpt(account), "openrouter": { "type": "api", "key": "keep" } })
@@ -683,6 +684,7 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
     write(&grok_file, grok("ann"));
     write(&config.devin_credentials_file, devin("devin-ann"));
     write(&opencode_file, opencode("ann"));
+    write(&kilo_file, opencode("ann"));
     write(&pi_file, pi("ann"));
     let first = accounts.list(false).await.expect("list");
     let id_of = |snapshot: &AgentAccountsSnapshot, harness| {
@@ -697,6 +699,7 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
         HarnessId::Grok,
         HarnessId::Devin,
         HarnessId::Opencode,
+        HarnessId::Kilo,
         HarnessId::Pi,
     ]
     .into_iter()
@@ -706,6 +709,7 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
     write(&grok_file, grok("bob"));
     write(&config.devin_credentials_file, devin("devin-bob"));
     write(&opencode_file, opencode("bob"));
+    write(&kilo_file, opencode("bob"));
     write(&pi_file, pi("bob"));
     let second = accounts.list(false).await.expect("list");
     for (harness, _) in &ann {
@@ -736,6 +740,10 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
         serde_json::from_str(&std::fs::read_to_string(&opencode_file).unwrap()).unwrap();
     assert_eq!(opencode_live["openai"]["accountId"], "ann");
     assert_eq!(opencode_live["openrouter"]["key"], "keep");
+    let kilo_live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&kilo_file).unwrap()).unwrap();
+    assert_eq!(kilo_live["openai"]["accountId"], "ann");
+    assert_eq!(kilo_live["openrouter"]["key"], "keep");
     let pi_live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&pi_file).unwrap()).unwrap();
     assert_eq!(pi_live["openai-codex"]["accountId"], "ann");
@@ -744,6 +752,7 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
         &grok_file,
         &config.devin_credentials_file,
         &opencode_file,
+        &kilo_file,
         &pi_file,
     ] {
         use std::os::unix::fs::PermissionsExt;
@@ -756,7 +765,12 @@ async fn grok_devin_opencode_and_pi_logins_swap_round_trip() {
         snapshot
             .accounts
             .iter()
-            .filter(|a| matches!(a.harness, HarnessId::Opencode | HarnessId::Pi))
+            .filter(|a| {
+                matches!(
+                    a.harness,
+                    HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi
+                )
+            })
             .all(|a| a.provider.is_some())
     );
 }

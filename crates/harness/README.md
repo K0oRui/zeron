@@ -11,9 +11,10 @@ pinned Antigravity archive.
 | [Claude Code](https://code.claude.com/docs/en/setup) | `curl -fsSL https://claude.ai/install.sh \| bash` | `irm https://claude.ai/install.ps1 \| iex` |
 | [Codex](https://github.com/openai/codex/blob/main/README.md) | `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` | `irm https://chatgpt.com/codex/install.ps1 \| iex` |
 | [Cursor](https://cursor.com/docs/cli/installation) | `curl https://cursor.com/install -fsS \| bash` | `irm 'https://cursor.com/install?win32=true' \| iex` |
-| [OpenCode](https://opencode.ai/docs/) | `curl -fsSL https://opencode.ai/install \| bash` | `npm.cmd install -g @opencode/cli` |
+| [OpenCode](https://opencode.ai/v2/docs/) | `curl -fsSL https://opencode.ai/v2/install \| bash` | `npm.cmd install -g @opencode/cli` |
+| [Kilo](https://github.com/Kilo-Org/kilocode) | `curl -fsSL https://kilo.ai/cli/install \| bash`, else `npm install -g @kilocode/cli` | `npm.cmd install -g @kilocode/cli` |
 | [Pi](https://pi.dev/docs/latest) | `curl -fsSL https://pi.dev/install.sh \| sh` | `npm.cmd install -g --ignore-scripts @earendil-works/pi-coding-agent` |
-| [Grok](https://docs.x.ai/developers/release-notes) | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `npm.cmd install -g @xai-official/grok` |
+| [Grok](https://docs.x.ai/developers/release-notes) | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `irm https://x.ai/cli/install.ps1 \| iex` |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/getting-started/installation) | `curl -fsSL https://hermes-agent.nousresearch.com/install.sh \| bash` | `irm https://hermes-agent.nousresearch.com/install.ps1 \| iex` |
 | [Devin](https://cli.devin.ai/) | macOS, when brew resolves: `brew install --cask devin-cli`; otherwise `curl -fsSL https://cli.devin.ai/install.sh \| bash` | `irm https://static.devin.ai/cli/setup.ps1 \| iex` |
 | Antigravity | Existing verified 1.1.1 archive in `acp::antigravity_archive`; no shell command | Same archive path on supported architectures |
@@ -26,6 +27,7 @@ Windows npm commands use the resolved npm launcher (normally `npm.cmd`).
 If shell prerequisites are absent, these documented npm alternatives are used
 when npm resolves: `npm install -g @openai/codex`,
 `npm install -g @opencode/cli`,
+`npm install -g @kilocode/cli`,
 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, and
 `npm install -g @xai-official/grok`. Codex also falls back to npm on Windows when
 PowerShell is unavailable. Grok's npm route is documented in its

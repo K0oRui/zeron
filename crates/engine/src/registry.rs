@@ -855,6 +855,30 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
     );
+    // Kilo over ACP (`kilo acp`), same lazy pattern: the static descriptor
+    // mirrors AcpHarness::kilo() exactly. No `_session/steering` extension
+    // (turn boundaries); the effort ladder rides the session's `effort`
+    // config option.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Kilo,
+            name: "Kilo Code".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::kilo().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::kilo()) as Arc<dyn Harness>)),
+    );
     // antigravity over acp (google's agy_acp_server), same lazy pattern: the
     // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
     // extension (turn boundaries), and effort is baked into the model ids, so
@@ -955,6 +979,7 @@ mod tests {
                 HarnessId::Hermes,
                 HarnessId::Pi,
                 HarnessId::Opencode,
+                HarnessId::Kilo,
                 HarnessId::Antigravity
             ]
         );
@@ -1001,6 +1026,22 @@ mod tests {
         assert_eq!(opencode.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             opencode.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        // Kilo over ACP mirrors its spec too: same name, turn-boundary
+        // steering, and the effort ladder Kilo advertises per model.
+        let kilo = registry.resolve(HarnessId::Kilo).unwrap();
+        assert_eq!(kilo.id(), HarnessId::Kilo);
+        assert_eq!(kilo.display_name(), "Kilo Code");
+        assert_eq!(kilo.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            kilo.reasoning_levels(),
             &[
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -1601,6 +1642,7 @@ mod gate_tests {
             HarnessId::Hermes,
             HarnessId::Pi,
             HarnessId::Opencode,
+            HarnessId::Kilo,
             HarnessId::Antigravity,
         ] {
             assert!(!registry.is_registered(hidden), "{hidden:?}");

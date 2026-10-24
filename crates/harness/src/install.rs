@@ -73,15 +73,26 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
         Cursor => vec![Shell("curl https://cursor.com/install -fsS | bash", "bash")],
         Opencode if windows => vec![Npm("@opencode/cli", false)],
         Opencode => vec![
-            Shell("curl -fsSL https://opencode.ai/install | bash", "bash"),
+            // `opencode.ai/install` is the V1 installer (it pins the
+            // `opencode-ai` package and refuses the latest GitHub release,
+            // which may be V2); the documented V2 installer is `/v2/install`.
+            Shell("curl -fsSL https://opencode.ai/v2/install | bash", "bash"),
             Npm("@opencode/cli", false),
+        ],
+        Kilo if windows => vec![Npm("@kilocode/cli", false)],
+        Kilo => vec![
+            Shell("curl -fsSL https://kilo.ai/cli/install | bash", "bash"),
+            Npm("@kilocode/cli", false),
         ],
         Pi if windows => vec![Npm("@earendil-works/pi-coding-agent", true)],
         Pi => vec![
             Shell("curl -fsSL https://pi.dev/install.sh | sh", "sh"),
             Npm("@earendil-works/pi-coding-agent", true),
         ],
-        Grok if windows => vec![Npm("@xai-official/grok", false)],
+        Grok if windows => vec![
+            PowerShell("irm https://x.ai/cli/install.ps1 | iex"),
+            Npm("@xai-official/grok", false),
+        ],
         Grok => vec![
             Shell("curl -fsSL https://x.ai/cli/install.sh | bash", "bash"),
             Npm("@xai-official/grok", false),
@@ -154,6 +165,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Codex => "npm install -g @openai/codex",
         Cursor => "curl https://cursor.com/install -fsS | bash",
         Opencode => "npm install -g @opencode/cli",
+        Kilo => "npm install -g @kilocode/cli",
         Pi => "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
         Grok => "npm install -g @xai-official/grok",
         Hermes => "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
@@ -169,6 +181,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Codex => ("codex", "~/.local/bin or the npm global bin"),
         Cursor => ("cursor-agent", "~/.local/bin or ~/.cursor/bin"),
         Opencode => ("opencode", "~/.opencode/bin or the npm global bin"),
+        Kilo => ("kilo", "~/.kilo/bin or the npm global bin"),
         Pi => ("pi", "the npm global bin"),
         Grok => ("grok", "~/.grok/bin or the npm global bin"),
         Hermes => ("hermes", "~/.local/bin or ~/.hermes/bin"),
@@ -185,6 +198,7 @@ pub fn installed(id: HarnessId) -> bool {
         Codex => crate::CodexHarness::new().installed(),
         Cursor => crate::CursorHarness::new().installed(),
         Opencode => crate::OpencodeHarness::new().installed(),
+        Kilo => crate::AcpHarness::kilo().installed(),
         Pi => crate::PiHarness::new().installed(),
         Grok => crate::AcpHarness::grok().installed(),
         Hermes => crate::AcpHarness::hermes().installed(),
@@ -391,11 +405,12 @@ async fn run(
 mod tests {
     use super::*;
 
-    const IDS: [HarnessId; 10] = [
+    const IDS: [HarnessId; 11] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
         HarnessId::Opencode,
+        HarnessId::Kilo,
         HarnessId::Pi,
         HarnessId::Grok,
         HarnessId::Hermes,

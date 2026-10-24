@@ -20,6 +20,9 @@ pub enum HarnessId {
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).
     Opencode,
+    /// Kilo Code's CLI — an opencode fork driven over its own ACP server
+    /// (`kilo acp`).
+    Kilo,
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
@@ -29,7 +32,7 @@ pub enum HarnessId {
 
 impl HarnessId {
     /// Every harness, in declaration order.
-    pub const ALL: [HarnessId; 10] = [
+    pub const ALL: [HarnessId; 11] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -38,6 +41,7 @@ impl HarnessId {
         HarnessId::Hermes,
         HarnessId::Pi,
         HarnessId::Opencode,
+        HarnessId::Kilo,
         HarnessId::Antigravity,
         HarnessId::Mock,
     ];
@@ -53,6 +57,7 @@ impl HarnessId {
             HarnessId::Hermes => "hermes",
             HarnessId::Pi => "pi",
             HarnessId::Opencode => "opencode",
+            HarnessId::Kilo => "kilo",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Mock => "mock",
         }

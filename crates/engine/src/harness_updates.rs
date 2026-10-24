@@ -259,6 +259,12 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: Some(&["upgrade"]),
             manual_command: "opencode upgrade",
         },
+        HarnessId::Kilo => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Npm("@kilocode/cli"),
+            update_args: Some(&["upgrade"]),
+            manual_command: "kilo upgrade",
+        },
         HarnessId::Devin => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,

@@ -219,7 +219,7 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
             "Finish signing in to GitHub in your browser — enter the code shown below. The \
              new login is saved next to your current one — nothing changes until you switch."
         }
-        (HarnessId::Opencode | HarnessId::Pi, _) => {
+        (HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi, _) => {
             "Finish signing in to ChatGPT in your browser. The agent gets its own login, saved \
              next to any current one — nothing changes until you switch."
         }
@@ -2189,6 +2189,7 @@ impl Render for AccountsPage {
             HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
+            HarnessId::Kilo => (crate::icons::KILO_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
@@ -2225,6 +2226,7 @@ impl Render for AccountsPage {
                         HarnessId::Grok => "accounts-skeleton-grok",
                         HarnessId::Devin => "accounts-skeleton-devin",
                         HarnessId::Opencode => "accounts-skeleton-opencode",
+                        HarnessId::Kilo => "accounts-skeleton-kilo",
                         HarnessId::Pi => "accounts-skeleton-pi",
                         HarnessId::Hermes => "accounts-skeleton-hermes",
                         _ => "accounts-skeleton-claude",
@@ -2631,7 +2633,12 @@ mod tests {
             "Connect a Antigravity account"
         );
         // Every agent with a login of its own has an Accounts section.
-        for harness in [HarnessId::Opencode, HarnessId::Pi, HarnessId::Hermes] {
+        for harness in [
+            HarnessId::Opencode,
+            HarnessId::Kilo,
+            HarnessId::Pi,
+            HarnessId::Hermes,
+        ] {
             assert!(signs_in(harness), "{harness:?}");
             assert!(reports_usage(harness));
             for option in login_options(harness) {

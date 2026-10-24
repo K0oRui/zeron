@@ -8,7 +8,7 @@ use crate::HarnessId;
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -16,6 +16,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::Grok, "Grok", "grok login"),
     (HarnessId::Devin, "Devin", "devin auth login"),
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
+    (HarnessId::Kilo, "Kilo Code", "kilo auth login"),
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
 ];
@@ -67,7 +68,7 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
 }
 
 /// One way to add an account: agents that keep a login PER model provider
-/// (OpenCode, Pi, Hermes) sign in to a named provider; the rest have one.
+/// (OpenCode, Kilo, Pi, Hermes) sign in to a named provider; the rest have one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginOption {
     /// The engine's `provider` param (`None` = the agent's only login).
@@ -83,7 +84,7 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         label,
     };
     match harness {
-        HarnessId::Opencode => vec![
+        HarnessId::Opencode | HarnessId::Kilo => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),
         ],

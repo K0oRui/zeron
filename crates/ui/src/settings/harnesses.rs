@@ -120,6 +120,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
+        HarnessId::Kilo => "kilo",
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Mock => "mock",
     }
@@ -1741,6 +1742,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
         HarnessId::Pi,
         HarnessId::Grok,
         HarnessId::Hermes,
+        HarnessId::Kilo,
         HarnessId::Devin,
         HarnessId::Mock,
     ] {

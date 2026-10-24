@@ -799,6 +799,28 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert!(pi.reasoning_levels().is_empty());
 }
 
+#[test]
+fn kilo_descriptor_surfaces_match_registry_expectations() {
+    let kilo = AcpHarness::kilo();
+    assert_eq!(kilo.id(), HarnessId::Kilo);
+    assert_eq!(kilo.display_name(), "Kilo Code");
+    assert!(kilo.supports_steering());
+    assert_eq!(kilo.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        kilo.reasoning_levels(),
+        &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ]
+    );
+    let models = kilo.fallback_models();
+    assert_eq!(models[0].id, "kilo/kilo-auto/free");
+    assert_eq!(models[0].label, "Kilo Auto (Free)");
+}
+
 fn antigravity_harness() -> AcpHarness {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

@@ -6338,6 +6338,13 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             if let Some(label) = curated_label(&model.id) {
                 model.label = label;
             }
+            // Older engines (or a remote device on one) still store Kilo's
+            // provider prefix. The harness row already identifies Kilo.
+            if harness == HarnessId::Kilo
+                && let Some(label) = model.label.strip_prefix("Kilo Gateway/").map(str::to_owned)
+            {
+                model.label = label;
+            }
             Some(model)
         })
         .collect()
@@ -6360,6 +6367,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Pi => (crate::icons::PI_MARK, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
+        // Kilo Code's pixel-"K", monochrome like opencode's mark.
+        HarnessId::Kilo => (crate::icons::KILO_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
     }
 }
@@ -10156,6 +10165,23 @@ mod tests {
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["opus", "claude-fable-5", "sonnet", "haiku", "claude-nova-1"]
         );
+    }
+
+    #[test]
+    fn normalize_strips_the_kilo_gateway_provider_prefix() {
+        let models = normalize_model_rows(
+            HarnessId::Kilo,
+            vec![
+                bare_model("kilo/kilo-auto/free", "Kilo Gateway/Auto Free"),
+                bare_model(
+                    "kilo/nvidia/nemotron-3-super-120b-a12b:free",
+                    "Kilo Gateway/NVIDIA: Nemotron 3 Super (free)",
+                ),
+            ],
+        );
+        assert_eq!(models[0].label, "Auto Free");
+        assert_eq!(models[1].label, "NVIDIA: Nemotron 3 Super (free)");
+        assert_eq!(models[0].id, "kilo/kilo-auto/free");
     }
 
     #[test]

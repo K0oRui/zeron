@@ -165,6 +165,7 @@ pub fn harness_label(id: &str) -> String {
         "pi" => "Pi",
         "cursor" => "Cursor",
         "opencode" => "OpenCode",
+        "kilo" => "Kilo Code",
         "antigravity" => "Antigravity",
         "mock" => "Mock",
         other => return other.to_owned(),
@@ -259,6 +260,13 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
+        "kilo" => vec![model(
+            "kilo/kilo-auto/free",
+            "Kilo Auto (Free)",
+            "Kilo's router picks a model for the task",
+            &[],
+            vec![],
+        )],
         "antigravity" => vec![
             model(
                 "gemini-3.7-flash",

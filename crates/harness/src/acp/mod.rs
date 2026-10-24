@@ -2,8 +2,9 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`), Kilo ([`AcpHarness::kilo`],
+//! `kilo acp`) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
 //! pinned release archive). Pi, Claude, Codex and Cursor use native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -71,6 +72,12 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 // The one-file server unpacks on launch. A local cold probe took 1.903s, but
 // slower disks need substantially more headroom than the generic 10s budget.
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+// Kilo's catalog comes from its gateway, which it fetches with a 10s HTTP
+// timeout the first time `session/new` asks for providers. Matching that with
+// a 10s probe budget killed the child just as Kilo would have answered, so a
+// slow gateway fell back to the one-row static catalog ("Auto (Free)"). Leave
+// room for process boot, directory snapshot, and Kilo's own fetch/retry.
+const KILO_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -447,7 +454,101 @@ fn hermes_spec() -> AcpAgentSpec {
     }
 }
 
-/// google's builds as the acp registry lists them (`antigravity-acp`); `None`
+fn kilo_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        dirs.push(home.join(".kilo").join("bin").join("kilo"));
+        dirs.push(home.join(".local").join("bin").join("kilo"));
+        dirs.push(home.join(".bun").join("bin").join("kilo"));
+        dirs.push(home.join(".npm-global").join("bin").join("kilo"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/kilo"));
+    dirs.push(PathBuf::from("/usr/local/bin/kilo"));
+    dirs
+}
+
+/// Kilo Code (`kilo acp`) — the Kilo CLI, a fork of opencode that ships its
+/// own ACP server. It keeps its own data dir (`$XDG_DATA_HOME/kilo`), so its
+/// `auth.json` never collides with opencode's, and signs in through
+/// `kilo auth login` (Kilo's own account store, or any configured provider).
+fn kilo_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Kilo,
+        display_name: "Kilo Code",
+        executable: "kilo",
+        env_override: "KILO_EXECUTABLE",
+        args: &["acp"],
+        // The CLI *is* the ACP server, so a managed adapter copy would be a
+        // second full agent install; the user's own `kilo` is the one that
+        // holds their logins and config.
+        npm_package: None,
+        archive: None,
+        extra_paths: kilo_install_paths,
+        cli_executable: "kilo",
+        cli_extra_paths: kilo_install_paths,
+        install_hint: "kilo (searched PATH, the login shell's PATH, ~/.kilo/bin, \
+             ~/.local/bin, ~/.bun/bin, ~/.npm-global/bin, /opt/homebrew/bin, \
+             /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `npm install -g @kilocode/cli` or \
+             `curl -fsSL https://kilo.ai/cli/install | bash`, then \
+             `kilo auth login`; set KILO_EXECUTABLE to override)",
+        // Fallback only: discovery reads the real catalog from the ACP
+        // session's `model` config option (every provider the user configured).
+        // Kilo's own gateway default needs no API key.
+        models: || {
+            vec![Model {
+                id: "kilo/kilo-auto/free".into(),
+                label: "Kilo Auto (Free)".into(),
+                description: Some("Kilo's router picks a model for the task".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        // No `_session/steering` extension: a steer waits for the turn end.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Effort rides the session's `effort` option (category
+        // `thought_level`), whose values are the model's reasoning variants.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        effort_in_model_id: false,
+        // Kilo's ACP server serves anonymous/free runs and leaves account
+        // handling to `kilo auth login`; it never needs a client-side
+        // authenticate step.
+        auth_method: None,
+        skill_dirs: kilo_skill_dirs,
+        hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
+    }
+}
+
+/// Kilo's own skill folders: `<config>/skill{,s}/**/SKILL.md`, where config is
+/// `$KILO_CONFIG_DIR` or `$XDG_CONFIG_HOME/kilo`.
+fn kilo_skill_dirs() -> Vec<PathBuf> {
+    let Some(config) = std::env::var_os("KILO_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| crate::executable::home_dir().map(|home| home.join(".config")))
+        })
+    else {
+        return Vec::new();
+    };
+    let config = config.join("kilo");
+    vec![config.join("skills"), config.join("skill")]
+}
+
 /// on platforms without one, where only an explicit override can launch.
 fn antigravity_archive() -> Option<crate::archive_install::ArchivePin> {
     let (url, entry, sha512) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -1375,6 +1476,11 @@ impl AcpHarness {
         Self::with_spec(hermes_spec())
     }
 
+    /// Kilo Code (`kilo acp`) — the Kilo CLI's own ACP server.
+    pub fn kilo() -> Self {
+        Self::with_spec(kilo_spec()).with_model_discovery_timeout(KILO_DISCOVERY_TIMEOUT)
+    }
+
     /// google antigravity over its acp server (`agy_acp_server`).
     pub fn antigravity() -> Self {
         Self::with_spec(antigravity_spec())
@@ -1989,6 +2095,13 @@ impl AcpHarness {
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
+            if self.spec.id == HarnessId::Kilo {
+                models.retain(kilo_model_is_free);
+                for model in &mut models {
+                    let label = strip_kilo_gateway_label(&model.label).to_owned();
+                    model.label = label;
+                }
+            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -2201,6 +2314,27 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
             ))
         })
         .collect()
+}
+
+/// Kilo advertises its whole gateway catalog, including models that need
+/// credits. Its free rows are the `.../free` routers and the OpenRouter-style
+/// `:free` models; gateway names also carry a trailing "(free)" on those.
+/// Zeron keeps the picker on what the account can run without buying credits.
+fn kilo_model_is_free(model: &Model) -> bool {
+    let id = model.id.to_ascii_lowercase();
+    let label = model.label.to_ascii_lowercase();
+    id.ends_with(":free")
+        || id.ends_with("-free")
+        || id.ends_with("/free")
+        || label.ends_with(" (free)")
+        || label.ends_with("auto free")
+        || label.ends_with("free models router")
+}
+
+/// Kilo prefixes every gateway row with its provider name. The picker
+/// already sits under the Kilo harness, so the prefix is noise.
+fn strip_kilo_gateway_label(label: &str) -> &str {
+    label.strip_prefix("Kilo Gateway/").unwrap_or(label)
 }
 
 /// A session config option surfaced as a Traits-dropdown section. Mode is
@@ -3210,6 +3344,7 @@ fn prompt_turn(
     session_id: String,
     text: String,
     prompt_id: Option<String>,
+    stdin_nudge: Option<Duration>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     let mut params = json!({
         "sessionId": session_id,
@@ -3220,7 +3355,31 @@ fn prompt_turn(
     }
     // Written now, not on first poll: a steer's `session/cancel` issued in
     // the same loop iteration must reach the agent after this prompt.
-    client.request_now("session/prompt", params)
+    let turn = client.request_now("session/prompt", params);
+    let Some(period) = stdin_nudge else {
+        return turn;
+    };
+    Box::pin(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(turn);
+        loop {
+            tokio::select! {
+                result = &mut turn => return result,
+                _ = ticker.tick() => client.nudge(),
+            }
+        }
+    })
+}
+
+/// Kilo runs `git config --get remote.origin.url` through Bun Shell on every
+/// LLM request with stdin inherited. Under `kilo acp` that stdin is the
+/// JSON-RPC pipe, so on Windows the git child blocks until the client writes
+/// another line and the turn produces nothing at all (Kilo issue #10768,
+/// unfixed as of 7.8.17; `kilo run` is unaffected). Kilo ignores blank lines,
+/// so a periodic newline releases the child without touching the turn.
+fn prompt_stdin_nudge(harness: HarnessId) -> Option<Duration> {
+    (harness == HarnessId::Kilo).then_some(Duration::from_secs(1))
 }
 
 /// Answer a server→client request. Permission requests are auto-accepted with
@@ -4210,12 +4369,14 @@ async fn run_session(session: Session) {
     // The text of the prompt in flight (re-sent by a preempt when the agent
     // drops an unstarted cancelled prompt).
     let mut current_prompt_text = prompt_transform(request.reasoning, &request.prompt);
+    let stdin_nudge = prompt_stdin_nudge(harness);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
             session_id.clone(),
             current_prompt_text.clone(),
             current_prompt_id.clone(),
+            stdin_nudge,
         )
     });
     // Steers waiting for the turn boundary (agents without the extension, or
@@ -4536,6 +4697,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         current_prompt_text.clone(),
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if !steering_open {
                     break 'main;
@@ -4847,6 +5009,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         text,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 }
                 while let Some(next_text) = steer_backlog.pop_front() {
@@ -4897,6 +5060,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         text,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if turn.is_none() && !steering_open {
                     // Mailbox closed while the flush waited: nothing left.
@@ -4974,6 +5138,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         text,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if !steering_open {
                     // Mirror the normal turn-settled exit: mailbox closed
@@ -5102,6 +5267,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         text,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                     } else if steer_ext {
                         // Mid-turn injection via the `_session/steering`
@@ -5471,6 +5637,70 @@ mod tests {
         assert_eq!(
             AcpHarness::grok().model_discovery_timeout,
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn kilo_discovery_budget_outlasts_the_gateway_catalog_fetch() {
+        // Kilo aborts its own gateway request after 10s; the probe must not
+        // kill the child first and report the one-row static fallback.
+        let harness = AcpHarness::kilo();
+        assert_eq!(harness.model_discovery_timeout, Duration::from_secs(30));
+        assert_eq!(harness.handshake_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn kilo_free_rows_survive_the_gateway_catalog_filter() {
+        let model = |id: &str, label: &str| Model {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        };
+        assert!(kilo_model_is_free(&model(
+            "kilo/kilo-auto/free",
+            "Kilo Gateway/Auto Free"
+        )));
+        assert!(kilo_model_is_free(&model(
+            "kilo/openrouter/free",
+            "Kilo Gateway/OpenRouter Free Models Router"
+        )));
+        assert!(kilo_model_is_free(&model(
+            "kilo/nvidia/nemotron-3-super-120b-a12b:free",
+            "Kilo Gateway/NVIDIA: Nemotron 3 Super (free)"
+        )));
+        assert!(kilo_model_is_free(&model(
+            "kilo/reflection/beam-free",
+            "Kilo Gateway/Reflection: Beam 1.0 (free)"
+        )));
+        assert!(kilo_model_is_free(&model(
+            "kilo/stealth/glyph-cluster",
+            "Kilo Gateway/Stealth: Glyph Cluster (free)"
+        )));
+        assert!(!kilo_model_is_free(&model(
+            "kilo/anthropic/claude-sonnet-5",
+            "Kilo Gateway/Anthropic: Claude Sonnet 5"
+        )));
+        assert!(!kilo_model_is_free(&model(
+            "kilo/freeform/model",
+            "Kilo Gateway/Freeform"
+        )));
+    }
+
+    #[test]
+    fn kilo_gateway_prefix_is_not_part_of_the_picker_label() {
+        assert_eq!(
+            strip_kilo_gateway_label("Kilo Gateway/Auto Free"),
+            "Auto Free"
+        );
+        assert_eq!(
+            strip_kilo_gateway_label("Kilo Gateway/NVIDIA: Nemotron 3 Super (free)"),
+            "NVIDIA: Nemotron 3 Super (free)"
+        );
+        assert_eq!(
+            strip_kilo_gateway_label("Kilo Auto (Free)"),
+            "Kilo Auto (Free)"
         );
     }
 

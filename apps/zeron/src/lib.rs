@@ -107,6 +107,8 @@ pub fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("grok") => zeron_engine::HarnessId::Grok,
         Ok("hermes") => zeron_engine::HarnessId::Hermes,
         Ok("pi") => zeron_engine::HarnessId::Pi,
+        Ok("opencode") => zeron_engine::HarnessId::Opencode,
+        Ok("kilo") => zeron_engine::HarnessId::Kilo,
         Ok("antigravity") => zeron_engine::HarnessId::Antigravity,
         _ => zeron_engine::HarnessId::ClaudeCode,
     }

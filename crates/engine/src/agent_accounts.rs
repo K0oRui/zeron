@@ -2,7 +2,7 @@
 //! (feature-inventory §3.7 "Agent accounts"; port of zeron's
 //! `agent-accounts.ts`).
 //!
-//! Grok, Devin, OpenCode, Pi and Hermes live in [`stores`] (credential
+//! Grok, Devin, OpenCode, Kilo, Pi and Hermes live in [`stores`] (credential
 //! formats and detection), [`oauth`] (the sign-ins the engine drives itself)
 //! and [`usage`] (their quota probes); each module documents per provider
 //! what is supported and why. In short:
@@ -12,6 +12,7 @@
 //! | Grok     | yes    | yes    | `grok login --device-auth`     | yes   |
 //! | Devin    | yes    | yes    | ACP `authenticate` (loopback)  | yes   |
 //! | OpenCode | yes    | yes    | ChatGPT loopback, Copilot code | yes   |
+//! | Kilo     | yes    | yes    | ChatGPT loopback, Copilot code | yes   |
 //! | Pi       | yes    | yes    | ChatGPT loopback               | yes   |
 //! | Hermes   | yes    | no¹    | `hermes auth add` (device code) | yes  |
 //!
@@ -198,6 +199,9 @@ pub struct AgentAccountsConfig {
     /// OpenCode's `auth.json` (`$XDG_DATA_HOME/opencode/`, default
     /// `~/.local/share/opencode/`).
     pub opencode_auth_file: PathBuf,
+    /// Kilo's `auth.json` (`$XDG_DATA_HOME/kilo/`, default
+    /// `~/.local/share/kilo/`).
+    pub kilo_auth_file: PathBuf,
     /// Pi's agent dir (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`) —
     /// holds `auth.json`.
     pub pi_agent_dir: PathBuf,
@@ -237,6 +241,7 @@ impl AgentAccountsConfig {
             grok_home: stores::default_grok_home(),
             devin_credentials_file: stores::default_devin_credentials_file(),
             opencode_auth_file: stores::default_opencode_auth_file(),
+            kilo_auth_file: stores::default_kilo_auth_file(),
             pi_agent_dir: stores::default_pi_agent_dir(),
             hermes_home: stores::default_hermes_home(),
         }
@@ -258,6 +263,7 @@ impl AgentAccountsConfig {
             grok_home: root.join("grok"),
             devin_credentials_file: root.join("devin").join("credentials.toml"),
             opencode_auth_file: root.join("opencode").join("auth.json"),
+            kilo_auth_file: root.join("kilo").join("auth.json"),
             pi_agent_dir: root.join("pi"),
             hermes_home: root.join("hermes"),
         }
@@ -949,7 +955,7 @@ impl AgentAccounts {
         let mut detected_more: Vec<(HarnessId, Detected)> = Vec::new();
         detected_more.extend(self.detect_grok().map(|d| (HarnessId::Grok, d)));
         detected_more.extend(self.detect_devin().map(|d| (HarnessId::Devin, d)));
-        for harness in [HarnessId::Opencode, HarnessId::Pi] {
+        for harness in [HarnessId::Opencode, HarnessId::Kilo, HarnessId::Pi] {
             let (resolved, unresolved) = self.detect_keyed(harness).await;
             detected_more.extend(resolved.into_iter().map(|d| (harness, d)));
             for detected in unresolved {
@@ -979,6 +985,7 @@ impl AgentAccounts {
             HarnessId::Grok,
             HarnessId::Devin,
             HarnessId::Opencode,
+            HarnessId::Kilo,
             HarnessId::Pi,
         ]
         .into_iter()
@@ -1130,7 +1137,7 @@ impl AgentAccounts {
                 self.write_grok_entry(slot.store_key.as_deref(), &slot.credentials)?
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;
@@ -1227,7 +1234,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.detect_cursor().map(|d| d.account_key),
             HarnessId::Grok => self.detect_grok().map(|d| d.account_key),
             HarnessId::Devin => self.detect_devin().map(|d| d.account_key),
-            HarnessId::Opencode | HarnessId::Pi => self
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => self
                 .detect_keyed_entry(harness, store_key?)
                 .await
                 .flatten()
@@ -1241,7 +1248,7 @@ impl AgentAccounts {
     /// never replaced unasked.
     fn has_live_entry(&self, harness: HarnessId, store_key: Option<&str>) -> bool {
         match harness {
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 store_key.is_none_or(|key| self.live_keyed_entry(harness, key).is_some())
             }
             _ => false,
@@ -1269,7 +1276,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
             HarnessId::Grok => self.write_grok_entry(store_key, &slot.credentials)?,
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 if let Some(key) = store_key {
                     self.write_keyed_entry(slot.harness, key, Some(&slot.credentials))?;
                 }
@@ -1339,7 +1346,7 @@ impl AgentAccounts {
                 self.remove_grok_entry(&map_key)?;
             }
             HarnessId::Devin => remove_if_exists(&self.inner.config.devin_credentials_file)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 let key = store_key
                     .ok_or_else(|| EngineError::Other("That login names no provider.".into()))?;
                 self.write_keyed_entry(harness, key, None)?;
@@ -1465,12 +1472,9 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.start_antigravity_login(requester)?,
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
-            HarnessId::Opencode => match provider.unwrap_or("openai") {
-                "openai" => {
-                    self.start_openai_login(HarnessId::Opencode, "openai")
-                        .await?
-                }
-                "github-copilot" => self.start_copilot_login(HarnessId::Opencode).await?,
+            HarnessId::Opencode | HarnessId::Kilo => match provider.unwrap_or("openai") {
+                "openai" => self.start_openai_login(harness, "openai").await?,
+                "github-copilot" => self.start_copilot_login(harness).await?,
                 other => return Err(stores::unsupported_login(harness, other)),
             },
             HarnessId::Pi => match provider.unwrap_or("openai-codex") {
@@ -3061,7 +3065,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
-            HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
+            HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi | HarnessId::Hermes => {
                 self.keyed_usage(harness, slot).await
             }
             _ => Err(ProbeError::NoCredentials {
@@ -3511,7 +3515,7 @@ async fn antigravity_keychain_item(_account: &str) -> bool {
 fn provider_group(harness: HarnessId, store_key: Option<&str>) -> Option<String> {
     matches!(
         harness,
-        HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes
+        HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi | HarnessId::Hermes
     )
     .then(|| store_key.map(str::to_string))
     .flatten()
@@ -3527,6 +3531,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
+        HarnessId::Kilo => "kilo",
         HarnessId::Antigravity => "antigravity",
         HarnessId::Mock => "mock",
     }
@@ -3602,6 +3607,7 @@ fn codex_plan(plan: Option<&str>) -> Option<String> {
 /// primary (~18_000s) with a weekly secondary (604_800s). A bare "> 1 day =
 /// week" rule mislabeled the monthly window "Week"; thresholds in seconds
 /// leave the middle gaps to the nearest label rather than guessing a plan.
+#[cfg(test)]
 fn codex_window_label(span_seconds: i64) -> &'static str {
     zeron_proto::plan_usage::codex_window_label(span_seconds)
 }
@@ -3973,7 +3979,7 @@ fn usage_error_message(
         ProbeError::Unauthorized { .. }
             if matches!(
                 harness,
-                HarnessId::Codex | HarnessId::Opencode | HarnessId::Pi
+                HarnessId::Codex | HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi
             ) =>
         {
             "Session expired — switch to it to refresh".to_string()

@@ -52,6 +52,38 @@ pub(crate) fn context(
             let root = root("GROK_HOME", home.join(".grok"));
             vec![root.join("auth.json"), root.join("config.toml")]
         }
+        HarnessId::Kilo => {
+            let data = root("XDG_DATA_HOME", home.join(".local/share"));
+            let config = root("XDG_CONFIG_HOME", home.join(".config"));
+            let cwd = std::env::current_dir()?;
+            // Kilo reads its own files AND opencode's, so a model change in
+            // either one must invalidate the catalog.
+            let mut files = vec![
+                data.join("kilo/auth.json"),
+                config.join("kilo/kilo.json"),
+                config.join("kilo/kilo.jsonc"),
+                config.join("opencode/opencode.json"),
+                config.join("opencode/opencode.jsonc"),
+            ];
+            for dir in cwd.ancestors() {
+                for name in [
+                    "kilo.json",
+                    "kilo.jsonc",
+                    "opencode.json",
+                    "opencode.jsonc",
+                    ".kilo/kilo.json",
+                    ".kilo/kilo.jsonc",
+                    ".kilocode/kilo.json",
+                    ".kilocode/kilo.jsonc",
+                ] {
+                    files.push(dir.join(name));
+                }
+            }
+            if let Some(path) = std::env::var_os("KILO_CONFIG") {
+                files.push(path.into());
+            }
+            files
+        }
         HarnessId::Hermes => {
             let root = root("HERMES_HOME", home.join(".hermes"));
             vec![
@@ -100,6 +132,14 @@ pub(crate) fn context(
         HarnessId::Codex => &["CODEX_", "OPENAI_"],
         HarnessId::ClaudeCode => &["CLAUDE_", "ANTHROPIC_", "AWS_"],
         HarnessId::Opencode => &["OPENCODE_", "OPENAI_", "ANTHROPIC_", "GOOGLE_"],
+        HarnessId::Kilo => &[
+            "KILO_",
+            "KILOCODE_",
+            "OPENCODE_",
+            "OPENAI_",
+            "ANTHROPIC_",
+            "GOOGLE_",
+        ],
         HarnessId::Grok => &["GROK_", "XAI_"],
         HarnessId::Hermes => &["HERMES_", "OPENAI_", "ANTHROPIC_"],
         HarnessId::Pi => &["PI_", "OPENAI_", "ANTHROPIC_"],

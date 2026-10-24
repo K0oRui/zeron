@@ -27,6 +27,11 @@
 //!   and leaves every other provider byte-for-byte. OpenCode has no lock of
 //!   its own. API-key entries aren't accounts and are left alone.
 //!   Anthropic OAuth was removed from OpenCode upstream and is not offered.
+//! - **Kilo** — `$XDG_DATA_HOME/kilo/auth.json` (default
+//!   `~/.local/share/kilo/`, Windows `%LOCALAPPDATA%\kilo`): Kilo is an
+//!   OpenCode fork, so its store has the same per-provider shape and the
+//!   same `openai`/`github-copilot` OAuth entries zeron manages, in its own
+//!   file. A swap rewrites that one entry and leaves the rest untouched.
 //! - **Pi** — `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent`,
 //!   0600, guarded by proper-lockfile's `auth.json.lock` DIRECTORY): the
 //!   same per-provider shape (`openai-codex`, `anthropic`, `github-copilot`),
@@ -108,6 +113,24 @@ pub(super) fn default_opencode_auth_file() -> PathBuf {
     xdg_data_home().join("opencode").join("auth.json")
 }
 
+/// Kilo's data dir, resolved the way Kilo's own `xdg-basedir` does: `kilo/`
+/// under `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+pub(super) fn kilo_data_dir() -> PathBuf {
+    if let Some(dir) = env_dir("XDG_DATA_HOME") {
+        return dir.join("kilo");
+    }
+    if cfg!(windows) {
+        return env_dir("LOCALAPPDATA")
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("kilo");
+    }
+    home_dir().join(".local").join("share").join("kilo")
+}
+
+pub(super) fn default_kilo_auth_file() -> PathBuf {
+    kilo_data_dir().join("auth.json")
+}
+
 pub(super) fn default_pi_agent_dir() -> PathBuf {
     env_dir("PI_CODING_AGENT_DIR").unwrap_or_else(|| home_dir().join(".pi").join("agent"))
 }
@@ -136,6 +159,7 @@ pub(super) fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "grok",
         HarnessId::Devin => "devin",
         HarnessId::Opencode => "opencode",
+        HarnessId::Kilo => "kilo",
         HarnessId::Pi => "pi",
         HarnessId::Hermes => "hermes",
         HarnessId::Antigravity => "Antigravity",
@@ -331,6 +355,10 @@ pub(super) enum Upstream {
 pub(super) fn keyed_accounts(harness: HarnessId) -> &'static [(&'static str, Upstream)] {
     match harness {
         HarnessId::Opencode => &[
+            ("openai", Upstream::OpenAi),
+            ("github-copilot", Upstream::Copilot),
+        ],
+        HarnessId::Kilo => &[
             ("openai", Upstream::OpenAi),
             ("github-copilot", Upstream::Copilot),
         ],
@@ -826,6 +854,7 @@ impl AgentAccounts {
     fn keyed_file(&self, harness: HarnessId) -> PathBuf {
         match harness {
             HarnessId::Pi => self.inner.config.pi_agent_dir.join("auth.json"),
+            HarnessId::Kilo => self.inner.config.kilo_auth_file.clone(),
             _ => self.inner.config.opencode_auth_file.clone(),
         }
     }
