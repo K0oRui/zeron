@@ -5,12 +5,14 @@
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
 //! (254 = ENOENT, the zeronsh/comet#95 crash) that surfaced as an opaque
-//! "harness protocol error". Instead, pinned adapter packages are installed
+//! "harness protocol error". Instead, adapter packages are installed
 //! ONCE into a zeron-owned prefix (`~/.zeron/adapters/<pkg>/<version>` on
 //! Unix, the local app-data directory on Windows), with its own npm cache
 //! beside it, so a root-owned or read-only user cache cannot break us. Every
 //! subsequent launch spawns `node <entry>` directly — no npm anywhere near a
-//! chat turn.
+//! chat turn. A pin's version is a literal directory name; an unpinned package
+//! (`"<pkg>"`, version `latest`) resolves npm's current release at install
+//! time and then stays in `adapters/<pkg>/latest` until that dir is removed.
 //!
 //! Install is atomic: npm runs in a `.tmp-*` sibling which is renamed into
 //! place only after the bin entry resolves and a marker file is written, so a
@@ -26,7 +28,8 @@ use std::time::Duration;
 use crate::HarnessError;
 use crate::process::Stdio;
 
-/// A pinned npm package: `"@scope/name@1.2.3"` → name + version.
+/// An npm package spec: `"@scope/name@1.2.3"` → name + version. A bare
+/// `"@scope/name"` is unpinned and reports version `"latest"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NpmPin {
     pub name: &'static str,
@@ -35,7 +38,7 @@ pub(crate) struct NpmPin {
 
 impl NpmPin {
     /// Split a `name@version` pin at the LAST `@` (scoped names carry a
-    /// leading one).
+    /// leading one). No trailing `@version` means `latest`.
     pub(crate) fn parse(pin: &'static str) -> Self {
         match pin.rfind('@') {
             Some(at) if at > 0 => Self {
@@ -304,7 +307,7 @@ pub(crate) fn install_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Ensure the pinned package is installed; returns its bin entry. Failures
+/// Ensure the package named by `pin` is installed; returns its bin entry. Failures
 /// carry npm's own output — the whole point is that a dying npm stops being
 /// an undiagnosable one-liner.
 pub(crate) async fn ensure_installed(
@@ -624,6 +627,12 @@ mod tests {
         assert_eq!(pin.name, "example-adapter");
         assert_eq!(pin.version, "0.0.33");
         assert_eq!(pin.dir_name(), "example-adapter");
+
+        // A bare scoped name is unpinned: npm resolves `latest` at install.
+        let pin = NpmPin::parse("@xai-official/grok");
+        assert_eq!(pin.name, "@xai-official/grok");
+        assert_eq!(pin.version, "latest");
+        assert_eq!(pin.dir_name(), "xai-official__grok");
     }
 
     #[test]

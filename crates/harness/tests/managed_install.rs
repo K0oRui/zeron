@@ -1,5 +1,5 @@
 //! Real-world E2E for the managed adapter install: with no `grok`
-//! binary anywhere, `run()` must npm-install the pinned adapter into
+//! binary anywhere, `run()` must npm-install the latest Grok adapter into
 //! `$ZERON_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
 //! `npx -y` at chat time (zeronsh/comet#95).
@@ -16,7 +16,7 @@ use zeron_harness::{AcpHarness, Harness, RunControls};
 use zeron_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
-#[ignore = "network + npm; installs the pinned Grok CLI for real"]
+#[ignore = "network + npm; installs the latest Grok CLI for real"]
 async fn managed_install_reaches_session_started() {
     let adapters = tempfile::tempdir().unwrap();
     // SAFETY: single-test binary — nothing else reads env concurrently.
@@ -94,7 +94,7 @@ async fn managed_install_reaches_session_started() {
         .expect("managed install dir exists")
         .flatten()
         .next()
-        .expect("a pinned version dir")
+        .expect("a version dir")
         .path();
     assert!(version_dir.join(".zeron-install-ok").exists());
 }

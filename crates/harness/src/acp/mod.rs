@@ -225,7 +225,10 @@ fn grok_spec() -> AcpAgentSpec {
         // shared process via ~/.grok/leader.sock, so a wedged/stale leader
         // (the user's TUI) reads as total silent non-response in zeron.
         args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
-        npm_package: Some("@xai-official/grok@1.0.44"),
+        // Unpinned on purpose: xAI ships fixes faster than zeron releases, and
+        // `--no-auto-update` above freezes whatever version we install. A bare
+        // name makes npm resolve the current `latest` at install time.
+        npm_package: Some("@xai-official/grok"),
         archive: None,
         extra_paths: grok_install_paths,
         cli_executable: "grok",
@@ -233,14 +236,15 @@ fn grok_spec() -> AcpAgentSpec {
         install_hint: "grok (searched PATH, the login shell's PATH, ~/.local/bin, \
              ~/.grok/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
              fnm/nvm/volta/pnpm/bun install dirs; install with \
-             `curl -fsSL https://x.ai/cli/install.sh | bash` or \
+             `irm https://x.ai/cli/install.ps1 | iex` on Windows, \
+             `curl -fsSL https://x.ai/cli/install.sh | bash` on macOS/Linux, or \
              `npm install -g @xai-official/grok`; set GROK_EXECUTABLE to override)",
         models: || {
             vec![
                 Model {
                     id: "grok-4.7".into(),
                     label: "Grok 4.7".into(),
-                    description: Some("xAI's frontier coding model — 500k context".into()),
+                    description: Some("xAI's frontier coding model, up to 500k context".into()),
                     reasoning_levels: vec![
                         ReasoningLevel::Low,
                         ReasoningLevel::Medium,
@@ -252,7 +256,7 @@ fn grok_spec() -> AcpAgentSpec {
                 Model {
                     id: "grok-4.6".into(),
                     label: "Grok 4.6".into(),
-                    description: Some("xAI's coding model — 500k context".into()),
+                    description: Some("xAI's coding model, up to 500k context".into()),
                     reasoning_levels: vec![
                         ReasoningLevel::Low,
                         ReasoningLevel::Medium,
@@ -264,7 +268,7 @@ fn grok_spec() -> AcpAgentSpec {
                 Model {
                     id: "grok-4.5".into(),
                     label: "Grok 4.5".into(),
-                    description: Some("xAI's coding model — 500k context".into()),
+                    description: Some("xAI's coding model, up to 500k context".into()),
                     reasoning_levels: vec![
                         ReasoningLevel::Low,
                         ReasoningLevel::Medium,

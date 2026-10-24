@@ -184,13 +184,29 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
         )]
     };
     match harness {
-        "grok" => vec![model(
-            "grok-4.5",
-            "Grok 4.5",
-            "xAI's coding model — 500k context",
-            &["low", "medium", "high"],
-            vec![],
-        )],
+        "grok" => vec![
+            model(
+                "grok-4.7",
+                "Grok 4.7",
+                "xAI's frontier coding model, up to 500k context",
+                &["low", "medium", "high", "xhigh"],
+                vec![],
+            ),
+            model(
+                "grok-4.6",
+                "Grok 4.6",
+                "xAI's coding model, up to 500k context",
+                &["low", "medium", "high", "xhigh"],
+                vec![],
+            ),
+            model(
+                "grok-4.5",
+                "Grok 4.5",
+                "xAI's coding model, up to 500k context",
+                &["low", "medium", "high"],
+                vec![],
+            ),
+        ],
         "devin" => vec![
             model(
                 "swe-1-7-medium",
@@ -667,6 +683,18 @@ mod tests {
         assert_eq!(model_label("codex", "gpt-5.6-terra"), "GPT-5.6-Terra");
         assert_eq!(model_label("codex", "some-new-model"), "some-new-model");
         assert_eq!(harness_label("opencode"), "OpenCode");
+    }
+
+    #[test]
+    fn grok_fallback_mirrors_the_engine_catalog() {
+        let models = fallback_models("grok");
+        assert_eq!(models[0].id, "grok-4.7");
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert!(models.iter().any(|m| m.id == "grok-4.6"));
+        assert!(models.iter().any(|m| m.id == "grok-4.5"));
     }
 
     #[test]

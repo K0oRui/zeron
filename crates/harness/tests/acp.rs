@@ -711,7 +711,7 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
         .expect("grok-4.5");
     assert_eq!(
         grok45.description.as_deref(),
-        Some("xAI's coding model — 500k context"),
+        Some("xAI's coding model, up to 500k context"),
         "{grok45:?}"
     );
 }
