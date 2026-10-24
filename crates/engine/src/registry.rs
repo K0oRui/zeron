@@ -173,6 +173,8 @@ pub struct HarnessRegistry {
     run_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
     commit_credit: std::sync::OnceLock<Arc<crate::commit_credit::CommitCredit>>,
+    /// The device's Headroom proxy, when this runtime has one.
+    headroom: std::sync::OnceLock<Arc<crate::headroom::Headroom>>,
 }
 
 impl Default for HarnessRegistry {
@@ -257,6 +259,7 @@ impl HarnessRegistry {
             update_generation,
             run_environment: Mutex::new(None),
             commit_credit: std::sync::OnceLock::new(),
+            headroom: std::sync::OnceLock::new(),
         }
     }
 
@@ -277,6 +280,15 @@ impl HarnessRegistry {
         self.commit_credit.get()
     }
 
+    /// Attach the device's Headroom runtime (every non-test engine has one).
+    pub fn set_headroom(&self, headroom: Arc<crate::headroom::Headroom>) {
+        let _ = self.headroom.set(headroom);
+    }
+
+    pub fn headroom(&self) -> Option<&Arc<crate::headroom::Headroom>> {
+        self.headroom.get()
+    }
+
     /// Fill `request.env` for a spawn of `harness` (no-op without a provider),
     /// and credit Zeron in its commits when that's on.
     pub async fn prepare_run(
@@ -294,6 +306,9 @@ impl HarnessRegistry {
         }
         if let Some(credit) = self.commit_credit.get() {
             credit.apply(&mut request.env);
+        }
+        if let Some(headroom) = self.headroom.get() {
+            headroom.prepare(harness, &mut request.env).await;
         }
         Ok(())
     }

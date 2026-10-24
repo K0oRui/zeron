@@ -358,6 +358,23 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
     compose_path(cmd.as_std_mut(), std::iter::empty());
 }
 
+/// Resolve an executable the way harness adapters do: the process PATH, the
+/// login shell's PATH, and the known toolchain locations. Used by runtimes
+/// beside the harnesses (the Headroom proxy) that share the user's CLI installs.
+pub fn find_executable(name: &str) -> Option<std::path::PathBuf> {
+    executable::find_on_paths(name, Vec::new())
+}
+
+/// [`find_executable`] with extra directories searched first. The login-shell
+/// PATH is a boot-time snapshot, so a CLI installed while the engine runs is
+/// only visible through a directory the caller names.
+pub fn find_executable_in(
+    name: &str,
+    extra: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    executable::find_on_paths(name, extra)
+}
+
 /// Compose the child's PATH: the resolved executable's directory first, then
 /// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the

@@ -2357,7 +2357,7 @@ fn opencode_release_package(installed: &str) -> &'static str {
     }
 }
 
-fn version_is_newer(latest: &str, installed: &str) -> bool {
+pub(crate) fn version_is_newer(latest: &str, installed: &str) -> bool {
     match (version_numbers(latest), version_numbers(installed)) {
         (Some(mut latest), Some(mut installed)) => {
             let width = latest.len().max(installed.len());

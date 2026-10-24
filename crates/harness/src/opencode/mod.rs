@@ -105,6 +105,15 @@ const RETRY_ABORT_ATTEMPT: u64 = 8;
 const DEFAULT_STALL_BOUND: Duration = Duration::from_secs(60);
 const STALL_ENV: &str = "ZERON_OPENCODE_STALL_MS";
 
+/// Set by the engine when Headroom should route this run. Unlike the other
+/// agents, OpenCode takes no base-URL variable: the value is merged into the
+/// inline config below, and the transport plugin reads it from the child env.
+const HEADROOM_PROXY_ENV: &str = "HEADROOM_PROXY_URL";
+/// The engine resolves Headroom's transport plugin from the installed package
+/// and names the directory here. Absent means route only the providers whose
+/// base URL Headroom can override.
+const HEADROOM_PLUGIN_ENV: &str = "ZERON_HEADROOM_OPENCODE_PLUGIN";
+
 /// What a wedged/silent run usually means for opencode.
 const STALL_HINT: &str = "The model provider is likely unreachable or rejecting requests. \
      Check the model/provider setup (`opencode auth list`, opencode.json) or the opencode \
@@ -751,30 +760,39 @@ impl Server {
             .env("OPENCODE_PASSWORD", &password)
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
-        if let Some(mcp) = mcp {
-            // The config shape differs by generation. If even the cold probe
-            // can't tell, run without the Zeron MCP server rather than fail.
-            match opencode_version(exe).await {
-                Some(version) => {
-                    let protocol = if version.major >= 2 {
-                        Protocol::V2
-                    } else {
-                        Protocol::V1
-                    };
+        // The config shape differs by generation. If even the cold probe
+        // can't tell, run without the Zeron MCP server rather than fail.
+        // 2.x also needs the inline layer even without MCP: its todo tool is
+        // gated behind `experimental.todo` (off by default since 2.1.0).
+        let headroom = headroom_route(run_env);
+        let inherited = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+        match opencode_version(exe).await {
+            Some(version) => {
+                let protocol = if version.major >= 2 {
+                    Protocol::V2
+                } else {
+                    Protocol::V1
+                };
+                if mcp.is_some() || protocol == Protocol::V2 || headroom.is_some() {
                     cmd.env(
                         "OPENCODE_CONFIG_CONTENT",
-                        mcp_config(
-                            std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
-                            mcp,
-                            protocol,
-                        )?,
+                        run_config(inherited.as_deref(), mcp, protocol, headroom.as_ref())?,
                     );
                 }
-                None => tracing::warn!(
-                    binary_path = %exe.display(),
-                    "opencode version unknown; starting without the Zeron MCP server"
-                ),
             }
+            // The plugin key and provider blocks are version-agnostic, so
+            // routing still works when the probe can't name the generation.
+            None if headroom.is_some() => {
+                cmd.env(
+                    "OPENCODE_CONFIG_CONTENT",
+                    run_config(inherited.as_deref(), None, Protocol::V1, headroom.as_ref())?,
+                );
+            }
+            None if mcp.is_some() => tracing::warn!(
+                binary_path = %exe.display(),
+                "opencode version unknown; starting without the Zeron MCP server"
+            ),
+            None => {}
         }
         crate::compose_child_path(&mut cmd, exe);
         crate::apply_run_env(&mut cmd, run_env);
@@ -5090,12 +5108,93 @@ async fn opencode_version(exe: &std::path::Path) -> Option<semver::Version> {
     Some(version)
 }
 
+/// Headroom routing for one OpenCode spawn, resolved from the run environment.
+struct HeadroomRoute {
+    /// `http://127.0.0.1:<port>`, without a trailing slash.
+    proxy_url: String,
+    /// Headroom's transport plugin directory, when the engine found it.
+    plugin: Option<PathBuf>,
+}
+
+fn headroom_route(run_env: &std::collections::BTreeMap<String, String>) -> Option<HeadroomRoute> {
+    let proxy_url = run_env.get(HEADROOM_PROXY_ENV)?.trim_end_matches('/');
+    if proxy_url.is_empty() {
+        return None;
+    }
+    let plugin = run_env
+        .get(HEADROOM_PLUGIN_ENV)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    Some(HeadroomRoute {
+        proxy_url: proxy_url.to_owned(),
+        plugin,
+    })
+}
+
+/// Headroom routes OpenCode through config, not a base-URL variable. Two
+/// layers, matching Headroom's own wrapper: the built-in Anthropic and OpenAI
+/// providers get a proxy base URL, and the transport plugin (when the engine
+/// found it) tags every other provider's real upstream per request.
+fn apply_headroom(object: &mut serde_json::Map<String, Value>, headroom: &HeadroomRoute) {
+    let base = format!("{}/v1", headroom.proxy_url.trim_end_matches('/'));
+    if let Some(providers) = object
+        .entry("provider")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        for id in ["anthropic", "openai"] {
+            let Some(provider) = providers
+                .entry(id)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+            else {
+                continue;
+            };
+            let Some(options) = provider
+                .entry("options")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+            else {
+                continue;
+            };
+            // A base URL the user already set points at their own gateway; the
+            // plugin carries that upstream instead of overwriting it here.
+            options.entry("baseURL").or_insert_with(|| json!(base));
+        }
+    }
+    let Some(plugin) = &headroom.plugin else {
+        return;
+    };
+    let path = plugin.to_string_lossy().into_owned();
+    let plugins = object.entry("plugin").or_insert_with(|| json!([]));
+    if let Some(list) = plugins.as_array_mut()
+        && !list.iter().any(|entry| is_headroom_plugin(entry, &path))
+    {
+        // A directory path resolves to its `index.js`; 2.x migrates the 1.x
+        // `plugin` key. Keeping the path (instead of the npm name) makes the
+        // plugin offline and matched to the installed package.
+        list.push(json!(path));
+    }
+}
+
+/// Whether a `plugin` entry already loads Headroom, either by the path this
+/// run resolved or by the npm name a `headroom wrap` shell would have set.
+fn is_headroom_plugin(entry: &Value, path: &str) -> bool {
+    let name = match entry {
+        Value::String(name) => name.as_str(),
+        Value::Array(items) => items.first().and_then(Value::as_str).unwrap_or_default(),
+        _ => return false,
+    };
+    name == path || name == "headroom-opencode"
+}
+
 /// Inline config is the final user config layer. Preserve inherited overrides
 /// and other MCP servers; never write chat identity into a shared config file.
-fn mcp_config(
+fn run_config(
     inherited: Option<&str>,
-    mcp: &zeron_proto::McpServer,
+    mcp: Option<&zeron_proto::McpServer>,
     protocol: Protocol,
+    headroom: Option<&HeadroomRoute>,
 ) -> Result<String, HarnessError> {
     let mut config: Value = match inherited.filter(|s| !s.trim().is_empty()) {
         Some(raw) => deser_hjson::from_str(raw).map_err(|_| {
@@ -5106,6 +5205,22 @@ fn mcp_config(
     let object = config.as_object_mut().ok_or_else(|| {
         HarnessError::Protocol("OPENCODE_CONFIG_CONTENT must be an object".into())
     })?;
+    if let Some(headroom) = headroom {
+        apply_headroom(object, headroom);
+    }
+    if protocol == Protocol::V2 {
+        // 2.1.0 reintroduced `todowrite` but hides it behind this flag. Zeron
+        // renders todo lists for every other harness, so turn it on for the
+        // server we own. Older 2.x builds ignore the unknown key.
+        let experimental = object.entry("experimental").or_insert_with(|| json!({}));
+        let experimental = experimental.as_object_mut().ok_or_else(|| {
+            HarnessError::Protocol("OPENCODE_CONFIG_CONTENT.experimental must be an object".into())
+        })?;
+        experimental.insert("todo".into(), json!(true));
+    }
+    let Some(mcp) = mcp else {
+        return Ok(config.to_string());
+    };
     let servers = object.entry("mcp").or_insert_with(|| json!({}));
     let servers = if protocol == Protocol::V2 {
         servers
@@ -5321,13 +5436,15 @@ if (process.argv.includes('--version')) {{
                     r#"{"model":"keep", "mcp":{"servers":{"user":{"type":"remote","url":"https://example.test"}}}}"#
                 }
             };
-            let first: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
-                    .unwrap();
+            let first: Value = serde_json::from_str(
+                &run_config(Some(inherited), Some(&mcp), protocol, None).unwrap(),
+            )
+            .unwrap();
             mcp.env.insert("ZERON_CHAT_ID".into(), "second".into());
-            let second: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
-                    .unwrap();
+            let second: Value = serde_json::from_str(
+                &run_config(Some(inherited), Some(&mcp), protocol, None).unwrap(),
+            )
+            .unwrap();
             assert_eq!(first["model"], "keep");
             let pointer = if protocol == Protocol::V1 {
                 "/mcp"
@@ -5347,14 +5464,123 @@ if (process.argv.includes('--version')) {{
             );
             if protocol == Protocol::V1 {
                 assert_eq!(servers["zeron"]["enabled"], true);
+                assert!(first.get("experimental").is_none());
             } else {
                 assert_eq!(servers["zeron"]["disabled"], false);
                 assert!(servers["zeron"].get("enabled").is_none());
+                // 2.x's todo tool is opt-in; Zeron's server turns it on.
+                assert_eq!(first["experimental"]["todo"], true);
             }
             for invalid in ["[]", "{", r#"{"mcp":false}"#] {
-                assert!(mcp_config(Some(invalid), &mcp, protocol).is_err());
+                assert!(run_config(Some(invalid), Some(&mcp), protocol, None).is_err());
             }
             mcp.env.insert("ZERON_CHAT_ID".into(), "first".into());
         }
+    }
+
+    #[test]
+    fn v2_config_enables_todos_without_an_mcp_server() {
+        let config: Value = serde_json::from_str(
+            &run_config(Some(r#"{"model":"keep"}"#), None, Protocol::V2, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["model"], "keep");
+        assert_eq!(config["experimental"]["todo"], true);
+        assert!(config.get("mcp").is_none());
+
+        // v1 has no experimental todo gate and no reason to touch its config
+        // without an MCP server to inject.
+        assert_eq!(run_config(None, None, Protocol::V1, None).unwrap(), "{}");
+    }
+
+    #[test]
+    fn headroom_routes_opencode_through_config() {
+        let route = HeadroomRoute {
+            proxy_url: "http://127.0.0.1:8787".into(),
+            plugin: Some(PathBuf::from("/opt/headroom/opencode/_dist")),
+        };
+        let inherited = r#"{
+            "model": "keep",
+            "provider": {
+                "anthropic": {"options": {"timeout": 9}},
+                "deepseek": {"options": {"baseURL": "https://api.deepseek.com"}}
+            },
+            "plugin": ["existing-plugin"]
+        }"#;
+        let config: Value = serde_json::from_str(
+            &run_config(Some(inherited), None, Protocol::V1, Some(&route)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["model"], "keep");
+        // Built-in providers point at the proxy, keeping their own options.
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            "http://127.0.0.1:8787/v1"
+        );
+        assert_eq!(config["provider"]["anthropic"]["options"]["timeout"], 9);
+        assert_eq!(
+            config["provider"]["openai"]["options"]["baseURL"],
+            "http://127.0.0.1:8787/v1"
+        );
+        // A provider the user already pointed somewhere keeps its upstream;
+        // the transport plugin carries that URL instead.
+        assert_eq!(
+            config["provider"]["deepseek"]["options"]["baseURL"],
+            "https://api.deepseek.com"
+        );
+        // The plugin is appended once, beside any the user loaded.
+        assert_eq!(
+            config["plugin"],
+            json!(["existing-plugin", "/opt/headroom/opencode/_dist"])
+        );
+
+        // Re-running over its own output does not duplicate the plugin.
+        let again: Value = serde_json::from_str(
+            &run_config(Some(&config.to_string()), None, Protocol::V1, Some(&route)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["plugin"].as_array().unwrap().len(), 2);
+
+        // A shell already wrapped by Headroom names the npm package; the
+        // plugin must not load twice.
+        let wrapped: Value = serde_json::from_str(
+            &run_config(
+                Some(r#"{"plugin":[["headroom-opencode",{"proxyUrl":"http://127.0.0.1:8787"}]]}"#),
+                None,
+                Protocol::V1,
+                Some(&route),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wrapped["plugin"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn headroom_without_a_plugin_still_overrides_the_built_ins() {
+        let route = HeadroomRoute {
+            proxy_url: "http://127.0.0.1:8787/".into(),
+            plugin: None,
+        };
+        let config: Value =
+            serde_json::from_str(&run_config(None, None, Protocol::V1, Some(&route)).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["provider"]["openai"]["options"]["baseURL"],
+            "http://127.0.0.1:8787/v1"
+        );
+        assert!(config.get("plugin").is_none());
+    }
+
+    #[test]
+    fn headroom_route_reads_the_run_environment() {
+        let mut env = std::collections::BTreeMap::new();
+        assert!(headroom_route(&env).is_none());
+        env.insert(HEADROOM_PROXY_ENV.into(), "http://127.0.0.1:8787/".into());
+        let route = headroom_route(&env).unwrap();
+        assert_eq!(route.proxy_url, "http://127.0.0.1:8787");
+        // A path that does not exist is dropped, not passed to OpenCode.
+        env.insert(HEADROOM_PLUGIN_ENV.into(), "/nonexistent/plugin".into());
+        assert!(headroom_route(&env).unwrap().plugin.is_none());
     }
 }

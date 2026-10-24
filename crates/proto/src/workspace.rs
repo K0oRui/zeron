@@ -15,6 +15,10 @@ pub mod capabilities {
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
     pub const HARNESS_UPDATES_V1: &str = "harness-updates-v1";
+    /// The host installs and runs the Headroom proxy, and routes supported
+    /// providers' agent traffic through it (`GetHeadroom`,
+    /// `SetHeadroomEnabled`, `InstallHeadroom`).
+    pub const HEADROOM_V1: &str = "headroom-v1";
     /// The host creates a projectless chat's scratch folder
     /// (`crate::projectless`) when it runs; older hosts only know `~`.
     pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
@@ -43,6 +47,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
+        HEADROOM_V1,
         PROJECTLESS_SCRATCH_V1,
         SIDEBAR_SECTION_ORDER_V1,
         SIDEBAR_SECTION_PROJECTS_V1,
@@ -128,6 +133,7 @@ mod tests {
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
+                    "headroom-v1",
                     "projectless-scratch-v1",
                     "sidebar-section-order-v1",
                     "sidebar-section-projects-v1",

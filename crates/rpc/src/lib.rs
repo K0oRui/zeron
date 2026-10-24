@@ -56,6 +56,12 @@ pub mod methods {
     pub const GET_COMMIT_CREDIT: &str = "GetCommitCredit";
     pub const SET_COMMIT_CREDIT: &str = "SetCommitCredit";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
+    /// Device-local Headroom proxy (Settings → Providers):
+    /// `GetHeadroom` → `HeadroomStatus`; `SetHeadroomEnabled {enabled}`;
+    /// `InstallHeadroom` installs when missing and updates when present.
+    pub const GET_HEADROOM: &str = "GetHeadroom";
+    pub const SET_HEADROOM_ENABLED: &str = "SetHeadroomEnabled";
+    pub const INSTALL_HEADROOM: &str = "InstallHeadroom";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";

@@ -31,6 +31,7 @@ pub mod diff_sync;
 pub mod doc_host;
 mod fs_watch;
 pub mod harness_updates;
+pub mod headroom;
 pub(crate) mod home_index;
 mod http_error;
 pub mod instance_lock;
@@ -156,6 +157,8 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
+    /// Device-local Headroom proxy (install, preference, process).
+    pub headroom: Arc<headroom::Headroom>,
     pub device_id: String,
     /// Which app windows are focused (desktop banners hold back while one is).
     pub viewport_focus: desktop_notify::ViewportFocus,
@@ -338,6 +341,12 @@ impl EngineCore {
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();
+        // Headroom is device-local: load its preference, hand it to the
+        // registry (spawn-time env), and start the proxy when it was enabled
+        // on a previous boot.
+        let headroom = headroom::Headroom::open(data_dir);
+        registry.set_headroom(headroom.clone());
+        headroom.start_if_enabled();
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -366,6 +375,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             harness_updates,
+            headroom,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -509,6 +519,7 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_harness_updates(self.harness_updates.clone())
+        .with_headroom(self.headroom.clone())
         .with_viewport_focus(self.viewport_focus.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
@@ -575,6 +586,7 @@ impl EngineCore {
             .take();
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
+        self.headroom.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.

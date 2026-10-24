@@ -726,6 +726,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
+    headroom: Option<std::sync::Arc<crate::headroom::Headroom>>,
     local_import: Option<crate::local_import::LocalImporter>,
     /// Cloud runner only: vault grants (ListGithubRepos, credentialed CloneRepo).
     credentials: Option<crate::credentials::CredentialBroker>,
@@ -786,6 +787,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             harness_updates: None,
+            headroom: None,
             local_import: None,
             credentials: None,
             viewport_focus: Default::default(),
@@ -836,6 +838,12 @@ impl EngineRpc {
         self
     }
 
+    /// Attach the device-local Headroom runtime.
+    pub fn with_headroom(mut self, headroom: std::sync::Arc<crate::headroom::Headroom>) -> Self {
+        self.headroom = Some(headroom);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_github(mut self, github: GitHubCli) -> Self {
         self.github = github;
@@ -852,6 +860,12 @@ impl EngineRpc {
         self.auth
             .as_ref()
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+    }
+
+    fn headroom(&self) -> Result<&std::sync::Arc<crate::headroom::Headroom>, RpcError> {
+        self.headroom
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("headroom unavailable".into()))
     }
 
     /// The edge client the IPC-only Cloud / vault methods act through, as the
@@ -1924,6 +1938,13 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
+        // Install and update are the same provider mutation; both may download.
+        // The engine's own command budget is 15 minutes, so leave room for
+        // probing, proxy restart, and the relayed reply.
+        methods::INSTALL_HEADROOM => Duration::from_secs(20 * 60),
+        // Enabling may probe the runtime and wait for the proxy's first
+        // health check, which together can outlast the default deadline.
+        methods::SET_HEADROOM_ENABLED => Duration::from_secs(60),
         // A full fleet of enabled providers is checked two at a time; each
         // provider may need both a CLI probe and a network request.
         methods::CHECK_HARNESS_UPDATES => Duration::from_secs(4 * 60),
@@ -1962,6 +1983,9 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_COMMIT_CREDIT
             | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
+            | methods::GET_HEADROOM
+            | methods::SET_HEADROOM_ENABLED
+            | methods::INSTALL_HEADROOM
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
@@ -2443,6 +2467,25 @@ impl RpcService for EngineRpc {
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
+            }
+            methods::GET_HEADROOM => {
+                let headroom = self.headroom()?;
+                RpcReply::value(&headroom.status().await)
+            }
+            methods::SET_HEADROOM_ENABLED => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    enabled: bool,
+                }
+                let p: Params = parse_params(params)?;
+                let headroom = self.headroom()?;
+                RpcReply::value(&headroom.set_enabled(p.enabled).await)
+            }
+            methods::INSTALL_HEADROOM => {
+                let headroom = self.headroom()?;
+                // Install and update report failures in `status.error` rather
+                // than failing the call: the page always gets a settled view.
+                RpcReply::value(&headroom.install().await)
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
