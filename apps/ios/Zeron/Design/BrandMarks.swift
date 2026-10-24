@@ -8,7 +8,7 @@ import SwiftUI
 import UIKit
 
 enum BrandMark {
-    case claude, openai, cursor, devin, grok, hermes, pi, opencode, kilo, antigravity
+    case claude, openai, cursor, devin, grok, hermes, pi, opencode, antigravity, muse
 
     var viewBox: CGSize {
         switch self {
@@ -20,8 +20,8 @@ enum BrandMark {
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
         case .opencode: return CGSize(width: 24, height: 30)
-        case .kilo: return CGSize(width: 16, height: 16)
         case .antigravity: return CGSize(width: 24, height: 24)
+        case .muse: return CGSize(width: 287.56, height: 191)
         }
     }
 
@@ -29,7 +29,7 @@ enum BrandMark {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi, .opencode, .kilo, .antigravity: return true
+        case .hermes, .pi, .opencode, .antigravity: return true
         default: return false
         }
     }
@@ -55,11 +55,11 @@ enum BrandMark {
             // 45%-opacity inner fill this single-path renderer skips — the
             // mark reads identically at glyph sizes).
             return "M24 0H0V30H24V0ZM18 6H6V24H18V6Z"
-        case .kilo:
-            // kilo-mark.svg's pixel-"K" in a solid frame (16×16, even-odd).
-            return "M16 16H0V0H16V16ZM10.09 10.09H8.7V12.27L9.64 13.22H11.83V11.83H10.09L10.09 10.09ZM13.22 9.64L12.27 8.7H10.09V10.09H11.83L11.83 11.83H13.22L13.22 9.64ZM7.3 8.7H5.91V10.09H7.3V8.7ZM2.78 12.27L3.73 13.22H7.3V11.83H4.17V8.7H2.78L2.78 12.27ZM11.64 5.91V3.73L10.7 2.78H8.7V4.17H10.25V5.91H8.7V7.3H13.22V5.91H11.64ZM4.17 2.78H2.78V7.3H4.17V5.74H5.91V7.3H7.3V5.74L5.91 4.35H4.17V2.78ZM7.3 2.78H5.91L5.91 4.35H7.3V2.78Z"
         case .antigravity:
             return "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
+        case .muse:
+            // muse-mark.svg (Meta's infinity): its three paths in one.
+            return "M31.06,125.96c0,10.98 2.41,19.41 5.56,24.51 4.13,6.68 10.29,9.51 16.57,9.51 8.1,0 15.51-2.01 29.79-21.76 11.44-15.83 24.92-38.05 33.99-51.98l15.36-23.6c10.67-16.39 23.02-34.61 37.18-46.96 11.56-10.08 24.03-15.68 36.58-15.68 21.07,0 41.14,12.21 56.5,35.11 16.81,25.08 24.97,56.67 24.97,89.27 0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75l0-31.02c17.63,0 22.03-16.2 22.03-34.74 0-26.42-6.16-55.74-19.73-76.69-9.63-14.86-22.11-23.94-35.84-23.94-14.85,0-26.8,11.2-40.23,31.17-7.14,10.61-14.47,23.54-22.7,38.13l-9.06,16.05c-18.2,32.27-22.81,39.62-31.91,51.75-15.95,21.24-29.57,29.29-47.5,29.29-21.27,0-34.72-9.21-43.05-23.09-6.8-11.31-10.14-26.15-10.14-43.06z M24.49,37.3c14.24-21.95 34.79-37.3 58.36-37.3 13.65,0 27.22,4.04 41.39,15.61 15.5,12.65 32.02,33.48 52.63,67.81l7.39,12.32c17.84,29.72 27.99,45.01 33.93,52.22 7.64,9.26 12.99,12.02 19.94,12.02 17.63,0 22.03-16.2 22.03-34.74l27.4-.86c0,19.38-3.82,33.62-10.32,44.87-6.28,10.88-18.52,21.75-39.11,21.75-12.8,0-24.14-2.78-36.68-14.61-9.64-9.08-20.91-25.21-29.58-39.71l-25.79-43.08c-12.94-21.62-24.81-37.74-31.68-45.04-7.39-7.85-16.89-17.33-32.05-17.33-12.27,0-22.69,8.61-31.41,21.78z M82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78-12.33,18.61-19.88,46.33-19.88,72.95 0,10.98 2.41,19.41 5.56,24.51l-26.48,17.44c-6.8-11.31-10.14-26.15-10.14-43.06 0-30.75 8.44-62.8 24.49-87.55 14.24-21.95 34.79-37.3 58.36-37.3z"
         }
     }
 
@@ -72,8 +72,8 @@ enum BrandMark {
         case "hermes": return .hermes
         case "pi": return .pi
         case "opencode": return .opencode
-        case "kilo": return .kilo
         case "antigravity": return .antigravity
+        case "muse": return .muse
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }
@@ -82,6 +82,7 @@ enum BrandMark {
     static func brandTint(for harness: String) -> UIColor? {
         switch harness {
         case "claude-code", "mock": return UIColor(hex: 0xD97757)
+        case "muse": return UIColor(hex: 0x0081FB)
         default: return nil
         }
     }

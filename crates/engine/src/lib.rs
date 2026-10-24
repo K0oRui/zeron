@@ -41,6 +41,7 @@ mod model_catalogs;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;
+pub mod remote_terminals;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
@@ -149,6 +150,8 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    /// I/O routing for terminals on other devices (direct link or relay).
+    pub remote_terminals: remote_terminals::RemoteTerminals,
     pub project_actions: ProjectActionsStore,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
@@ -298,6 +301,10 @@ impl EngineCore {
             local_device_name(&device_id),
         )
         .map_err(|e| EngineError::Other(e.to_string()))?;
+        previews.serve_streams(
+            terminals::link::SERVICE_PREFIX,
+            Arc::new(terminals::link::Service::new(terminals.clone())),
+        );
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -338,6 +345,9 @@ impl EngineCore {
         // the P2P service, which serves it to that device alone.
         let agent_accounts =
             AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
+        registry.set_account_environment(Arc::new(agent_accounts::MuseRunEnvironment(
+            agent_accounts.clone(),
+        )));
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();
@@ -367,6 +377,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            remote_terminals: Default::default(),
             project_actions,
             previews,
             change_requests,
@@ -518,6 +529,7 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
+        .with_remote_terminals(self.remote_terminals.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_headroom(self.headroom.clone())
         .with_viewport_focus(self.viewport_focus.clone());
@@ -591,6 +603,16 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        // Decided here, from the auth state at the stop, so every way an
+        // engine goes down (headless, background, in-process) agrees.
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if auth.is_some_and(|auth| forgoes_revival(self.workspace_scope, &auth.state())) {
+            self.sessions.forgo_revival();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.sessions.stop_activity_projection().await;
@@ -1011,6 +1033,10 @@ impl Engine {
             let terminals = core.terminals.clone();
             Arc::new(move || !sessions.any_active() && !terminals.any_open())
         };
+        core.harness_updates.set_compatibility_feed(format!(
+            "{}/releases/harness-compatibility.json",
+            config.edge_url.trim_end_matches('/')
+        ));
         let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
         if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
             let updater_for_tokens = updater.clone();
@@ -1156,6 +1182,16 @@ impl Engine {
         runtime.shutdown().await;
         Ok(())
     }
+}
+
+/// Whether a stopping engine's cut-off turns stay ended rather than revive on
+/// the next boot ([`EngineCore::shutdown`] asks): a synced engine whose
+/// account is signed out by the time it stops, whichever stop reached it
+/// first — the auth watcher, or the app's StopEngine right after its SignOut.
+/// Sign-out is the user ending the session, like a Stop. A local engine is
+/// signed out as a matter of course.
+pub(crate) fn forgoes_revival(scope: WorkspaceScope, auth: &AuthState) -> bool {
+    scope == WorkspaceScope::Synced && matches!(auth, AuthState::SignedOut)
 }
 
 async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>) {
@@ -1708,5 +1744,37 @@ fn replace_empty_device_id(temp_path: &Path, path: &Path) -> std::io::Result<()>
             Err(err) => return Err(err),
         }
         std::fs::hard_link(temp_path, path)
+    }
+}
+
+#[cfg(test)]
+mod revival_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_signed_out_synced_engine_forgoes_revival() {
+        assert!(forgoes_revival(
+            WorkspaceScope::Synced,
+            &AuthState::SignedOut
+        ));
+        let user = AuthUser {
+            id: "u".into(),
+            email: "u@example.com".into(),
+            name: None,
+        };
+        assert!(!forgoes_revival(
+            WorkspaceScope::Synced,
+            &AuthState::SignedIn {
+                user: user.clone(),
+                org_id: Some("o".into()),
+            }
+        ));
+        assert!(!forgoes_revival(
+            WorkspaceScope::Synced,
+            &AuthState::NeedsOrganization { user }
+        ));
+        for scope in [WorkspaceScope::Local, WorkspaceScope::Development] {
+            assert!(!forgoes_revival(scope, &AuthState::SignedOut));
+        }
     }
 }

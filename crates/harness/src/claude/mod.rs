@@ -46,6 +46,7 @@
 pub mod catalog;
 mod discovery;
 mod normalize;
+pub mod refresh_lock;
 mod wire;
 
 use std::path::PathBuf;
@@ -56,7 +57,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -64,11 +65,12 @@ use zeron_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::process::{Child, ChildStdin, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::process::owned::Child;
+use crate::process::{ChildStdin, Command, Stdio};
+use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{apply_ultrathink, to_effort};
-use normalize::Normalizer;
-use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
+use normalize::{Normalizer, Transcript};
+use wire::{ControlRequestFrame, Frame, allow_response, control_error_line, control_response_line};
 
 /// Locate the device's installed Claude Code CLI: our own PATH, then the
 /// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
@@ -85,8 +87,67 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     }
     extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
     extra.push(PathBuf::from("/usr/local/bin/claude"));
-    crate::executable::find_on_paths("claude", extra)
+    let found = crate::executable::find_on_paths("claude", extra)?;
+    Some(native_beside_npm_shim(&found).unwrap_or(found))
 }
+
+/// npm installs Claude Code on Windows as a `claude.cmd` shim, and current
+/// packages carry the native CLI beside it. Launched directly, it skips a
+/// `cmd.exe` → node hop that mangles arguments (our JSON `--settings` and
+/// `--mcp-config` values) and outlives a killed parent.
+fn native_beside_npm_shim(shim: &std::path::Path) -> Option<PathBuf> {
+    let ext = shim.extension()?.to_str()?;
+    if !(ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")) {
+        return None;
+    }
+    let native = shim
+        .parent()?
+        .join("node_modules")
+        .join("@anthropic-ai")
+        .join("claude-code")
+        .join("bin")
+        .join("claude.exe");
+    native.is_file().then_some(native)
+}
+
+/// Claude's config root for a run: the run's own `CLAUDE_CONFIG_DIR` or
+/// `HOME` when its environment sets one, else ours.
+fn config_root(env: &std::collections::BTreeMap<String, String>) -> PathBuf {
+    if let Some(dir) = env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = env.get("HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(home).join(".claude");
+    }
+    crate::model_context::root(
+        "CLAUDE_CONFIG_DIR",
+        crate::executable::home_or_current_dir().join(".claude"),
+    )
+}
+
+/// An administrator's `managed-mcp.json` (at the paths Claude Code reads).
+/// While it exists the CLI refuses `--strict-mcp-config` and exits, and it
+/// already keeps every other MCP server out on its own.
+fn managed_mcp_config() -> bool {
+    let path = if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode/managed-mcp.json"
+    } else if cfg!(windows) {
+        r"C:\Program Files\ClaudeCode\managed-mcp.json"
+    } else {
+        "/etc/claude-code/managed-mcp.json"
+    };
+    std::path::Path::new(path).is_file()
+}
+
+/// The CLI's answer to `--resume` with a session it has no conversation
+/// for (it exits right after).
+fn no_conversation(text: &str) -> bool {
+    text.contains("No conversation found")
+}
+
+/// Shown when a chat's Claude session could not be restored.
+const SESSION_LOST: &str = "The previous Claude session could not be restored, so this chat \
+     continues in a new one without its earlier context.";
 
 /// The inline `--mcp-config` JSON for an injected server (the CLI accepts a
 /// JSON string as well as a file path).
@@ -268,8 +329,11 @@ impl ClaudeHarness {
         args
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    fn build_command(exe: &std::path::Path, request: &RunRequest, title_only: bool) -> Command {
         let mut cmd = Command::new(exe);
+        // Its own process group, so teardown reaches the MCP servers and
+        // tools it started; and no inherited Claude Code session markers.
+        crate::process::owned::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, exe);
         // Host-resolved environment (a Cloud device's `ANTHROPIC_API_KEY`
         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
@@ -279,6 +343,26 @@ impl ClaudeHarness {
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
+        if title_only {
+            cmd.args([
+                "--system-prompt",
+                crate::TITLE_INSTRUCTIONS,
+                "--tools",
+                "",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--setting-sources",
+                "",
+            ]);
+            if !managed_mcp_config() {
+                cmd.arg("--strict-mcp-config");
+            }
+        } else if let Some(mcp) = &request.mcp {
+            // Zeron's own server rides beside the user's configured servers
+            // (no `--strict-mcp-config`): the CLI merges an inline JSON
+            // config with settings-sourced ones.
+            cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -287,6 +371,42 @@ impl ClaudeHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         cmd
+    }
+
+    /// Start one CLI process for a run, with its stdio wired up.
+    fn launch(
+        exe: &std::path::Path,
+        request: &RunRequest,
+        title_only: bool,
+    ) -> Result<Runtime, HarnessError> {
+        let mut child = Self::build_command(exe, request, title_only)
+            .spawn()
+            .map_err(|e| {
+                let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
+                crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
+            })?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let child = Child::new(child);
+        let stdin =
+            stdin.ok_or_else(|| HarnessError::Protocol("claude child has no stdin".into()))?;
+        let stdout =
+            stdout.ok_or_else(|| HarnessError::Protocol("claude child has no stdout".into()))?;
+        let stderr_tail = crate::StderrTail::default();
+        if let Some(stderr) = stderr {
+            tokio::spawn(read_stderr(stderr, stderr_tail.clone()));
+        }
+        Ok(Runtime {
+            child,
+            stdout_lines: crate::lossy_lines::lossy_lines(stdout),
+            stdin: Stdin::new(
+                stdin,
+                request.resume.is_some(),
+                refresh_lock::config_dir_for(&request.env),
+            ),
+            stderr_tail,
+        })
     }
 
     /// Share the complete initialize response between model and command discovery.
@@ -317,6 +437,7 @@ impl ClaudeHarness {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
+        crate::process::owned::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
             "--print",
@@ -327,20 +448,31 @@ impl ClaudeHarness {
             // Mandatory with --print + stream-json output; without it the
             // CLI exits immediately with a usage error.
             "--verbose",
+            // Discovery runs on every catalog refresh and workspace open:
+            // the user's SessionStart hooks must not fire for it. MCP
+            // servers stay — their prompts are commands too.
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
         ]);
+        // Nor may it attach to (or install into) a running IDE.
+        cmd.env("CLAUDE_CODE_AUTO_CONNECT_IDE", "0")
+            .env("CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL", "1");
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
-        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            shutdown_child(&mut child, self.kill_grace).await;
+        let stdio = (child.stdin.take(), child.stdout.take());
+        let stderr_tail = crate::StderrTail::default();
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(read_stderr(stderr, stderr_tail.clone()));
+        }
+        let mut child = Child::new(child);
+        let (Some(mut stdin), Some(stdout)) = stdio else {
+            refresh_lock::settle(&refresh_lock::config_dir(), refresh_lock::SETTLE_MAX).await;
+            child.shutdown(self.kill_grace).await;
             return Err(HarnessError::Protocol("claude child has no stdio".into()));
         };
         const PROBE_ID: &str = "zeron-command-probe";
@@ -350,12 +482,21 @@ impl ClaudeHarness {
                 "request_id": PROBE_ID,
                 "request": { "subtype": "initialize" },
             });
-            stdin
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .map_err(HarnessError::Io)?;
-            stdin.flush().await.map_err(HarnessError::Io)?;
-            let mut lines = BufReader::new(stdout).lines();
+            // A CLI that fails on startup may exit before reading: the write
+            // then fails (EPIPE), and that is the same exit before answering
+            // — read on to its stdout's end and report its status and stderr.
+            let sent = match stdin.write_all(format!("{request}\n").as_bytes()).await {
+                Ok(()) => stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = sent {
+                tracing::debug!(
+                    target: "zeron_harness::claude",
+                    %error,
+                    "initialize request not delivered to the discovery probe"
+                );
+            }
+            let mut lines = crate::lossy_lines::lossy_lines(stdout);
             while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -374,18 +515,60 @@ impl ClaudeHarness {
                         .unwrap_or("initialize control request failed");
                     return Err(HarnessError::Protocol(msg.into()));
                 }
-                return Ok(response);
+                return Ok(Some(response));
             }
-            Err(HarnessError::Protocol(
-                "claude exited before answering the initialize control request".into(),
-            ))
+            Ok(None)
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
-        shutdown_child(&mut child, self.kill_grace).await;
-        match result {
-            Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("Claude initialize timed out".into())),
-        }
+        let result = tokio::time::timeout(PROBE_TIMEOUT, discovery).await;
+        let result = match result {
+            Ok(Ok(Some(response))) => Ok(response),
+            Ok(Ok(None)) => {
+                // Exited before answering: why is in its status and stderr.
+                let status = tokio::time::timeout(Duration::from_millis(200), child.wait())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                stderr_tail.wait_closed().await;
+                Err(HarnessError::Protocol(format!(
+                    "{} before answering the initialize control request",
+                    crate::crash_message("claude", status, &stderr_tail)
+                )))
+            }
+            Ok(Err(error)) => Err(error),
+            // A CLI stuck on its own startup (an auth prompt, a broken
+            // config) usually says so on stderr.
+            Err(_) => Err(HarnessError::Protocol(probe_timeout_message(
+                stderr_tail.snapshot(),
+            ))),
+        };
+        // A probe starts right when an expired login gets refreshed, and
+        // answers before that refresh is saved: retire it in the background
+        // once no refresh is in flight, stdin still open (EOF would make the
+        // CLI exit after waiting only 2s for the save — see `refresh_lock`).
+        let kill_grace = self.kill_grace;
+        let lock_dir = refresh_lock::config_dir();
+        tokio::spawn(async move {
+            refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
+            drop(stdin);
+            child.shutdown(kill_grace).await;
+        });
+        result
+    }
+}
+
+/// How long the discovery probe waits: a cold start on Windows or behind
+/// Bedrock can take well over 10s.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The discovery probe's timeout, with what the CLI printed (redacted).
+fn probe_timeout_message(stderr: Option<String>) -> String {
+    let timed_out = format!(
+        "Claude initialize timed out after {}s",
+        PROBE_TIMEOUT.as_secs()
+    );
+    match stderr {
+        Some(tail) => format!("{timed_out}: {}", crate::redact_secrets(&tail)),
+        None => timed_out,
     }
 }
 
@@ -583,73 +766,44 @@ impl Harness for ClaudeHarness {
 impl ClaudeHarness {
     async fn run_with_mode(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         controls: RunControls,
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
-        if title_only {
-            cmd.args([
-                "--system-prompt",
-                crate::TITLE_INSTRUCTIONS,
-                "--tools",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                "{\"mcpServers\":{}}",
-                "--setting-sources",
-                "",
-            ]);
-        } else if let Some(mcp) = &request.mcp {
-            // Zeron's own server rides beside the user's configured servers
-            // (no `--strict-mcp-config`): the CLI merges an inline JSON
-            // config with settings-sourced ones.
-            cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
-        }
-        let normalizer = if let Some(session_id) = &request.resume {
-            let config = crate::model_context::root(
-                "CLAUDE_CONFIG_DIR",
-                crate::executable::home_or_current_dir().join(".claude"),
-            );
-            Normalizer::for_resume(&config, session_id).await
-        } else {
-            Normalizer::new()
-        };
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("claude child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("claude child has no stdout".into()))?;
-        let stderr_tail = crate::StderrTail::default();
-        if let Some(stderr) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
-                    tail.push(&line);
+        // A session whose transcript holds no conversation cannot be
+        // resumed: the CLI says so and exits, every time. Start fresh
+        // instead — the chat's history is gone either way, and the user is
+        // told. A transcript not found here is still resumed: the CLI may
+        // keep it elsewhere, and says so when it does not.
+        let mut notice = None;
+        let normalizer = match request.resume.clone() {
+            Some(session_id) => {
+                let (normalizer, transcript) =
+                    Normalizer::for_resume(&config_root(&request.env), &session_id).await;
+                if transcript == Transcript::Empty {
+                    tracing::info!(
+                        target: "zeron_harness::claude",
+                        %session_id,
+                        "no conversation to resume; starting a new session"
+                    );
+                    request.resume = None;
+                    notice = Some(SESSION_LOST.to_owned());
                 }
-            });
-        }
+                normalizer
+            }
+            None => Normalizer::new(),
+        };
+        let Runtime {
+            child,
+            stdout_lines,
+            mut stdin,
+            stderr_tail,
+        } = Self::launch(&exe, &request, title_only)?;
 
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
-        tokio::spawn(stdin_writer(stdin, stdin_rx));
+        let lock_dir = refresh_lock::config_dir_for(&request.env);
         if !title_only {
-            let _ = stdin_tx.send(StdinMsg::Line(wire::initialize_request_line(
-                "zeron_initialize",
-            )));
+            stdin.line(wire::initialize_request_line("zeron_initialize"));
         }
 
         // The initial prompt as the first stdin user line (streaming-input
@@ -665,21 +819,27 @@ impl ClaudeHarness {
             &first_command,
             &images,
         );
-        let _ = stdin_tx.send(StdinMsg::Line(first));
+        stdin.line(first);
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+        if let Some(message) = notice {
+            let _ = event_tx.try_send(Ok(AgentEvent::Error { message }));
+        }
         tokio::spawn(run_session(Session {
             normalizer,
             title_only,
+            exe,
+            launched: request.clone(),
             child,
-            stdout_lines: BufReader::new(stdout).lines(),
+            stdout_lines,
             first_command,
-            stdin_tx,
+            stdin,
             event_tx,
             controls,
             config: request,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            lock_dir,
             stderr_tail,
         }));
 
@@ -690,6 +850,66 @@ impl ClaudeHarness {
     }
 }
 
+/// Forward a child's stderr to the debug log and the crash-message tail,
+/// and say when it closed: an exit's last lines land just after stdout's.
+async fn read_stderr(stderr: impl tokio::io::AsyncRead + Unpin, tail: crate::StderrTail) {
+    let mut lines = crate::lossy_lines::lossy_lines(stderr);
+    while let Ok(Some(line)) = lines.next_line().await {
+        tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
+        tail.push(&line);
+    }
+    tail.close();
+}
+
+/// One launched CLI process and its stdio.
+struct Runtime {
+    child: Child,
+    stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
+    stdin: Stdin,
+    stderr_tail: crate::StderrTail,
+}
+
+/// The run's stdin, through its writer task. Until the CLI reports its
+/// session, a resuming run keeps a copy of everything it wrote: when the
+/// session cannot be restored, the fresh process is told the same things.
+struct Stdin {
+    tx: mpsc::UnboundedSender<StdinMsg>,
+    replay: Option<Vec<StdinMsg>>,
+}
+
+impl Stdin {
+    fn new(stdin: ChildStdin, keep_for_replay: bool, lock_dir: PathBuf) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(stdin_writer(stdin, rx, lock_dir));
+        Self {
+            tx,
+            replay: keep_for_replay.then(Vec::new),
+        }
+    }
+
+    /// False once the writer is gone (the child died).
+    fn send(&mut self, msg: StdinMsg) -> bool {
+        if let Some(replay) = &mut self.replay {
+            replay.push(msg.clone());
+        }
+        self.tx.send(msg).is_ok()
+    }
+
+    fn line(&mut self, line: String) -> bool {
+        self.send(StdinMsg::Line(line))
+    }
+
+    /// Before the CLI's teardown: Windows' gives it its grace to exit on
+    /// stdin EOF, which the writer holds off while any sender (a pending
+    /// permission answer's) is alive. Unix teardown signals instead; its
+    /// order is unchanged.
+    fn close_for_teardown(&self) {
+        #[cfg(windows)]
+        let _ = self.tx.send(StdinMsg::Close);
+    }
+}
+
+#[derive(Clone)]
 enum StdinMsg {
     Line(String),
     /// Close stdin (end of steering input): the CLI finishes the current turn
@@ -771,8 +991,13 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
-/// tolerated and logged.
-async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
+/// tolerated and logged. EOF makes the CLI exit, so it waits out a login
+/// refresh in flight first (see [`refresh_lock`]).
+async fn stdin_writer(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<StdinMsg>,
+    lock_dir: PathBuf,
+) {
     while let Some(msg) = rx.recv().await {
         match msg {
             StdinMsg::Line(line) => {
@@ -787,6 +1012,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
                 }
             }
             StdinMsg::Close => {
+                refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                 let _ = stdin.shutdown().await;
                 return;
             }
@@ -797,11 +1023,15 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 struct Session {
     normalizer: Normalizer,
     title_only: bool,
+    /// What the process was launched from, for a fresh relaunch when its
+    /// session cannot be restored.
+    exe: PathBuf,
+    launched: RunRequest,
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
+    stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
     /// The uuid the opening prompt was written with.
     first_command: String,
-    stdin_tx: mpsc::UnboundedSender<StdinMsg>,
+    stdin: Stdin,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     /// The configuration the process runs with now: its launch request, then
@@ -809,6 +1039,9 @@ struct Session {
     config: RunRequest,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    /// Claude's credential dir: no signal lands mid-refresh (see
+    /// [`refresh_lock`]).
+    lock_dir: PathBuf,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
 }
@@ -819,16 +1052,19 @@ async fn run_session(session: Session) {
     let Session {
         normalizer: mut norm,
         title_only,
+        exe,
+        launched,
         mut child,
         mut stdout_lines,
         first_command,
-        stdin_tx,
+        mut stdin,
         event_tx,
         controls,
         mut config,
         interrupt_grace,
         kill_grace,
-        stderr_tail,
+        lock_dir,
+        mut stderr_tail,
     } = session;
     let RunControls {
         realtime: _,
@@ -849,7 +1085,28 @@ async fn run_session(session: Session) {
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
-    let mut any_done = false;
+    // A message of ours (or a background wake) began a turn that has not
+    // reported its end: the CLI dying now leaves it to us to end it.
+    let mut turn_open = true;
+    // A resumed session the CLI turns out to have no conversation for is
+    // relaunched fresh, once (see [`no_conversation`]).
+    let mut restore_fallback = launched.resume.is_some();
+    let mut relaunch = false;
+    // Our configuration requests the CLI has not answered yet (`set_model`,
+    // `apply_flag_settings`): what each asked for, and when we stop waiting.
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut pending_controls: std::collections::HashMap<
+        String,
+        (&'static str, Value, tokio::time::Instant),
+    > = std::collections::HashMap::new();
+    // A configuration request failed or went unanswered: the live process
+    // may not run what `config` says, so the next change re-sends it all.
+    let mut config_unsure = false;
+    // What the CLI last refused, per request kind. Every message carrying
+    // the same configuration asks again; its refusal was already shown, and
+    // is shown again only once the ask changes or has succeeded.
+    let mut refused: std::collections::HashMap<&'static str, Value> =
+        std::collections::HashMap::new();
     // A turn stop in flight (`TurnControl::stop_turn`): its request id, and
     // once the CLI has answered, how long a turn-ending `result` may still
     // take. The CLI answers a stop between turns without any result — the
@@ -885,9 +1142,49 @@ async fn run_session(session: Session) {
     // The runtime's process tree when its teardown began (see
     // [`crate::shutdown_agent`]).
     #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut torn_down: Vec<i32> = Vec::new();
+    let mut torn_down: Vec<crate::process::Tracked> = Vec::new();
 
     'main: loop {
+        if std::mem::take(&mut relaunch) {
+            // The CLI had no conversation for the session and exited
+            // without starting one. Everything written to it goes to a fresh
+            // process; its own init reports the new session id.
+            let replay = stdin.replay.take().unwrap_or_default();
+            if matches!(child.try_wait(), Ok(None)) {
+                refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
+            }
+            stdin.close_for_teardown();
+            child.shutdown(kill_grace).await;
+            let mut fresh = launched.clone();
+            fresh.resume = None;
+            match ClaudeHarness::launch(&exe, &fresh, title_only) {
+                Ok(runtime) => {
+                    child = runtime.child;
+                    stdout_lines = runtime.stdout_lines;
+                    stdin = runtime.stdin;
+                    stderr_tail = runtime.stderr_tail;
+                }
+                Err(error) => {
+                    let _ = event_tx.send(Err(error)).await;
+                    break 'main;
+                }
+            }
+            for msg in replay {
+                if !stdin.send(msg) {
+                    break;
+                }
+            }
+            if event_tx
+                .send(Ok(AgentEvent::Error {
+                    message: SESSION_LOST.to_owned(),
+                }))
+                .await
+                .is_err()
+            {
+                break 'main;
+            }
+        }
+        let control_deadline = pending_controls.values().map(|(_, _, at)| *at).min();
         tokio::select! {
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -905,26 +1202,64 @@ async fn run_session(session: Session) {
                             continue;
                         }
                     };
+                    if restore_fallback
+                        && !interrupted
+                        && !norm.started()
+                        && let Frame::Result(result) = &frame
+                        && result
+                            .errors
+                            .iter()
+                            .any(|e| e.as_str().is_some_and(no_conversation))
+                    {
+                        tracing::info!(
+                            target: "zeron_harness::claude",
+                            session = ?launched.resume,
+                            "session could not be restored; relaunching fresh"
+                        );
+                        restore_fallback = false;
+                        relaunch = true;
+                        continue;
+                    }
                     if let Frame::ControlResponse(response) = &frame {
-                        if stopping.as_deref() == Some(response.response.request_id.as_str()) {
+                        let response = &response.response;
+                        if stopping.as_deref() == Some(response.request_id.as_str()) {
                             stop_settle_at = Some(tokio::time::Instant::now() + STOP_SETTLE);
+                        }
+                        let error = response.error_message();
+                        if let Some((what, asked, _)) = pending_controls.remove(&response.request_id) {
+                            if let Some(error) = &error {
+                                config_unsure = true;
+                                if refused.get(what) != Some(&asked) {
+                                    refused.insert(what, asked);
+                                    if event_tx.send(Ok(AgentEvent::Error {
+                                        message: format!("Claude could not change its {what}: {error}"),
+                                    })).await.is_err() { break 'main; }
+                                }
+                            } else {
+                                refused.remove(what);
+                            }
+                        } else if let Some(error) = error {
+                            tracing::warn!(
+                                target: "zeron_harness::claude",
+                                request = %response.request_id,
+                                "control request failed: {error}"
+                            );
                         }
                         continue;
                     }
-                    if let Frame::System(system) = &frame
-                        && system.subtype == "background_tasks_changed"
-                    {
-                        turn.set_background(system.tasks.as_ref().map_or(0, Vec::len));
+                    if let Frame::System(system) = &frame {
+                        match system.subtype.as_str() {
+                            "background_tasks_changed" => {
+                                turn.set_background(system.tasks.as_ref().map_or(0, Vec::len));
+                            }
+                            // The first, or a background wake's: either way a
+                            // turn is running.
+                            "init" => turn_open = true,
+                            _ => {}
+                        }
                     }
                     if let Frame::ControlRequest(req) = frame {
-                        if title_only {
-                            let line = control_response_line(&req.request_id, serde_json::json!({
-                                "behavior": "deny", "message": "Tools are disabled for title generation"
-                            }));
-                            let _ = stdin_tx.send(StdinMsg::Line(line));
-                        } else {
-                            handle_control_request(req, &request_input, &stdin_tx);
-                        }
+                        handle_control_request(req, title_only, &request_input, &stdin.tx);
                         continue;
                     }
                     // Only the CLI confirms that a prompt joined its
@@ -972,7 +1307,7 @@ async fn run_session(session: Session) {
                         if event_tx.send(Ok(done)).await.is_err() {
                             break 'main;
                         }
-                        any_done = true;
+                        turn_open = false;
                     }
                     // The stopped turn reporting late: a result with nothing
                     // since the stop's Done. Judged on the frame, before it
@@ -990,7 +1325,13 @@ async fn run_session(session: Session) {
                         );
                         continue;
                     }
-                    for ev in norm.normalize(frame, interrupted || stopping.is_some()) {
+                    let events = norm.normalize(frame, interrupted || stopping.is_some());
+                    // The session is the CLI's now: nothing left to replay.
+                    if norm.started() {
+                        restore_fallback = false;
+                        stdin.replay = None;
+                    }
+                    for ev in events {
                         match &ev {
                             AgentEvent::ToolCall { id, .. } => {
                                 open_tools.insert(id.clone());
@@ -1043,7 +1384,7 @@ async fn run_session(session: Session) {
                             break 'main; // consumer gone — reap below
                         }
                         if is_done {
-                            any_done = true;
+                            turn_open = false;
                             if interrupted {
                                 done_after_interrupt = true;
                                 break 'main;
@@ -1051,7 +1392,19 @@ async fn run_session(session: Session) {
                         }
                     }
                 }
-                Ok(None) => break 'main, // stdout EOF: the CLI exited
+                // stdout EOF: the CLI exited. An older CLI says it has no
+                // conversation for the session on stderr alone.
+                Ok(None) => {
+                    if restore_fallback && !interrupted && !norm.started() {
+                        stderr_tail.wait_closed().await;
+                        if stderr_tail.snapshot().is_some_and(|tail| no_conversation(&tail)) {
+                            restore_fallback = false;
+                            relaunch = true;
+                            continue;
+                        }
+                    }
+                    break 'main;
+                }
                 Err(e) => {
                     let _ = event_tx.send(Err(HarnessError::Io(e))).await;
                     break 'main;
@@ -1066,19 +1419,21 @@ async fn run_session(session: Session) {
                     // the same stdin the CLI reads in order.
                     if let Some(next) = msg.config {
                         reconfigures += 1;
-                        if model_arg(&next) != model_arg(&config) {
-                            let line = wire::set_model_request_line(
-                                &format!("zeron_model_{reconfigures}"),
-                                model_arg(&next).as_deref(),
-                            );
-                            if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
+                        let resend = std::mem::take(&mut config_unsure);
+                        let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+                        if resend || model_arg(&next) != model_arg(&config) {
+                            let id = format!("zeron_model_{reconfigures}");
+                            let model = model_arg(&next);
+                            let line = wire::set_model_request_line(&id, model.as_deref());
+                            pending_controls.insert(id, ("model", Value::from(model), deadline));
+                            if !stdin.line(line) { break 'main; }
                         }
-                        if flag_settings(&next) != flag_settings(&config) {
-                            let line = wire::apply_flag_settings_line(
-                                &format!("zeron_settings_{reconfigures}"),
-                                flag_settings(&next),
-                            );
-                            if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
+                        if resend || flag_settings(&next) != flag_settings(&config) {
+                            let id = format!("zeron_settings_{reconfigures}");
+                            let settings = flag_settings(&next);
+                            let line = wire::apply_flag_settings_line(&id, settings.clone());
+                            pending_controls.insert(id, ("settings", settings, deadline));
+                            if !stdin.line(line) { break 'main; }
                         }
                         config = *next;
                     }
@@ -1092,13 +1447,14 @@ async fn run_session(session: Session) {
                     );
                     pending_steers.push_back(id.clone());
                     commands.written(id);
-                    if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
+                    turn_open = true;
+                    if !stdin.line(line) { break 'main; }
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish
                     // after the current turn.
                     steering_open = false;
-                    let _ = stdin_tx.send(StdinMsg::Close);
+                    stdin.send(StdinMsg::Close);
                 }
             },
 
@@ -1114,7 +1470,7 @@ async fn run_session(session: Session) {
                 stopping = Some(id.clone());
                 stop_settle_at = None;
                 stop_done_at = None;
-                if stdin_tx.send(StdinMsg::Line(wire::stop_turn_request_line(&id))).is_err() {
+                if !stdin.line(wire::stop_turn_request_line(&id)) {
                     break 'main;
                 }
                 // A turn end held for steer replays is that turn's real end:
@@ -1144,7 +1500,7 @@ async fn run_session(session: Session) {
                     if event_tx.send(Ok(done)).await.is_err() {
                         break 'main;
                     }
-                    any_done = true;
+                    turn_open = false;
                     stop_done_at = Some(tokio::time::Instant::now());
                     active_since_stop = false;
                 }
@@ -1158,15 +1514,19 @@ async fn run_session(session: Session) {
                 if let Some(pid) = child.id() {
                     torn_down = crate::process::descendants(pid).await;
                 }
-                let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line("int_1")));
+                stdin.line(wire::interrupt_request_line("int_1"));
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
-                // then SIGKILL. Aborted once the child is reaped.
+                // then SIGKILL — neither while a login refresh is being
+                // saved. Aborted once the child is reaped.
                 if let Some(pid) = crate::process::signal_target(&child) {
+                    let lock_dir = lock_dir.clone();
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
+                        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                         send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
+                        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                         send_signal(&pid, Signal::Kill);
                     }));
                 }
@@ -1187,7 +1547,22 @@ async fn run_session(session: Session) {
                 if event_tx.send(Ok(done)).await.is_err() {
                     break 'main;
                 }
-                any_done = true;
+                turn_open = false;
+            },
+
+            // A configuration request the CLI never answered: assume the
+            // worst, so the next change re-sends everything.
+            _ = tokio::time::sleep_until(control_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if control_deadline.is_some() => {
+                let now = tokio::time::Instant::now();
+                pending_controls.retain(|id, (_, _, at)| {
+                    let waiting = *at > now;
+                    if !waiting {
+                        tracing::warn!(target: "zeron_harness::claude", request = %id, "control request unanswered");
+                    }
+                    waiting
+                });
+                config_unsure = true;
             },
 
             _ = event_tx.closed() => break 'main,
@@ -1199,7 +1574,7 @@ async fn run_session(session: Session) {
         && !event_tx.is_closed()
         && event_tx.send(Ok(done)).await.is_ok()
     {
-        any_done = true;
+        turn_open = false;
     }
 
     // Terminal bookkeeping: never end the stream without a Done unless the
@@ -1214,8 +1589,24 @@ async fn run_session(session: Session) {
                     session_id: norm.session_id.clone(),
                 }))
                 .await;
-        } else if !interrupted && !any_done {
-            let status = child.try_wait().ok().flatten();
+        } else if !interrupted && turn_open {
+            // The CLI died mid-turn — the first or any later one. Its
+            // tools and MCP servers are traced while it can still be; its
+            // exit status and last stderr lines land just after stdout
+            // closes, and say why.
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                for pid in crate::process::descendants(pid).await {
+                    if !torn_down.contains(&pid) {
+                        torn_down.push(pid);
+                    }
+                }
+            }
+            let status = tokio::time::timeout(Duration::from_millis(200), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            stderr_tail.wait_closed().await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -1227,7 +1618,14 @@ async fn run_session(session: Session) {
         }
     }
 
-    crate::shutdown_agent(&mut child, torn_down, kill_grace).await;
+    // Its whole process group goes with it, and whatever was traced
+    // before — on every exit path, not only an interrupt; never while a
+    // login refresh is being saved.
+    if matches!(child.try_wait(), Ok(None)) {
+        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
+    }
+    stdin.close_for_teardown();
+    child.shutdown_with(torn_down, kill_grace).await;
     if let Some(handle) = escalation {
         handle.abort();
     }
@@ -1335,8 +1733,12 @@ type RequestInputFn = Box<
 /// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
 /// (in a subtask so the frame loop keeps flowing), and hand them back keyed
 /// by question text, as the tool expects.
+///
+/// Any other request is answered with an error: the CLI waits for a reply to
+/// every request it sends, and one left unanswered would stall the run.
 fn handle_control_request(
     req: ControlRequestFrame,
+    title_only: bool,
     request_input: &Arc<RequestInputFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
@@ -1345,6 +1747,21 @@ fn handle_control_request(
             target: "zeron_harness::claude",
             "unhandled control_request subtype: {}", req.request.subtype
         );
+        let line = control_error_line(
+            &req.request_id,
+            &format!("unsupported control request: {}", req.request.subtype),
+        );
+        let _ = stdin_tx.send(StdinMsg::Line(line));
+        return;
+    }
+    if title_only {
+        let line = control_response_line(
+            &req.request_id,
+            serde_json::json!({
+                "behavior": "deny", "message": "Tools are disabled for title generation"
+            }),
+        );
+        let _ = stdin_tx.send(StdinMsg::Line(line));
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
@@ -1451,6 +1868,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn probe_timeout_says_what_the_cli_printed_without_its_secrets() {
+        let message = probe_timeout_message(Some(
+            "Invalid API key sk-ant-secret-value\nPlease run /login".into(),
+        ));
+        assert!(
+            message.starts_with("Claude initialize timed out after"),
+            "{message}"
+        );
+        assert!(message.contains("Please run /login"), "{message}");
+        assert!(!message.contains("secret-value"), "{message}");
+        assert_eq!(
+            probe_timeout_message(None),
+            format!(
+                "Claude initialize timed out after {}s",
+                PROBE_TIMEOUT.as_secs()
+            )
+        );
+    }
+
+    #[test]
     fn parses_questions_tolerantly() {
         let input = json!({
             "questions": [
@@ -1486,6 +1923,38 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    #[test]
+    fn an_npm_shim_resolves_to_the_native_cli_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("claude.cmd");
+        std::fs::write(&shim, b"@echo off").unwrap();
+        // An older package without the native binary: keep the shim.
+        assert_eq!(native_beside_npm_shim(&shim), None);
+        let bin = dir
+            .path()
+            .join("node_modules/@anthropic-ai/claude-code/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("claude.exe"), b"MZ").unwrap();
+        assert_eq!(native_beside_npm_shim(&shim), Some(bin.join("claude.exe")));
+        // Only shims are redirected.
+        assert_eq!(native_beside_npm_shim(&dir.path().join("claude.exe")), None);
+        assert_eq!(native_beside_npm_shim(&dir.path().join("claude")), None);
+    }
+
+    #[test]
+    fn a_runs_own_config_dir_wins() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("HOME".to_owned(), "/home/cloud".to_owned());
+        assert_eq!(config_root(&env), PathBuf::from("/home/cloud/.claude"));
+        env.insert("CLAUDE_CONFIG_DIR".to_owned(), "/cfg".to_owned());
+        assert_eq!(config_root(&env), PathBuf::from("/cfg"));
     }
 }
 

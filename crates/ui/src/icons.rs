@@ -236,6 +236,8 @@ icon_assets![
     // Settings → Billing (drawn to the Solar linear set's 1.5 stroke).
     (WALLET, "wallet"),
     (ANTIGRAVITY_MARK, "antigravity-mark"),
+    // Muse Code's mark (Meta's infinity), tinted its brand blue at call sites.
+    (MUSE_MARK, "muse-mark"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity
@@ -261,6 +263,11 @@ impl AssetSource for Assets {
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()
+}
+
+/// The Muse Code mark's brand blue (`#0081FB`), kept like Claude's orange.
+pub fn muse_brand() -> Hsla {
+    gpui::rgb(0x0081FB).into()
 }
 
 /// An icon element for an embedded asset path. Size and colour are set by the

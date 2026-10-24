@@ -6370,6 +6370,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Kilo Code's pixel-"K", monochrome like opencode's mark.
         HarnessId::Kilo => (crate::icons::KILO_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+        HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
     }
 }
 

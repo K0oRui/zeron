@@ -5,14 +5,12 @@
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
 //! (254 = ENOENT, the zeronsh/comet#95 crash) that surfaced as an opaque
-//! "harness protocol error". Instead, adapter packages are installed
+//! "harness protocol error". Instead, pinned adapter packages are installed
 //! ONCE into a zeron-owned prefix (`~/.zeron/adapters/<pkg>/<version>` on
 //! Unix, the local app-data directory on Windows), with its own npm cache
 //! beside it, so a root-owned or read-only user cache cannot break us. Every
 //! subsequent launch spawns `node <entry>` directly — no npm anywhere near a
-//! chat turn. A pin's version is a literal directory name; an unpinned package
-//! (`"<pkg>"`, version `latest`) resolves npm's current release at install
-//! time and then stays in `adapters/<pkg>/latest` until that dir is removed.
+//! chat turn.
 //!
 //! Install is atomic: npm runs in a `.tmp-*` sibling which is renamed into
 //! place only after the bin entry resolves and a marker file is written, so a
@@ -28,8 +26,7 @@ use std::time::Duration;
 use crate::HarnessError;
 use crate::process::Stdio;
 
-/// An npm package spec: `"@scope/name@1.2.3"` → name + version. A bare
-/// `"@scope/name"` is unpinned and reports version `"latest"`.
+/// A pinned npm package: `"@scope/name@1.2.3"` → name + version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NpmPin {
     pub name: &'static str,
@@ -38,7 +35,7 @@ pub(crate) struct NpmPin {
 
 impl NpmPin {
     /// Split a `name@version` pin at the LAST `@` (scoped names carry a
-    /// leading one). No trailing `@version` means `latest`.
+    /// leading one).
     pub(crate) fn parse(pin: &'static str) -> Self {
         match pin.rfind('@') {
             Some(at) if at > 0 => Self {
@@ -181,7 +178,7 @@ fn find_npm_with(
 pub(crate) fn find_npm() -> Option<PathBuf> {
     find_npm_with(
         &|key| std::env::var_os(key),
-        crate::shell_env::login_shell_path().map(OsString::from),
+        crate::shell_env::user_path(),
         crate::executable::Platform::current(),
     )
 }
@@ -307,7 +304,49 @@ pub(crate) fn install_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Ensure the package named by `pin` is installed; returns its bin entry. Failures
+const RENAME_RETRIES: u32 = 20;
+const RENAME_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Move a finished install into place. On Windows a just-written tree is
+/// briefly held open by the malware scanner or by the verify process that
+/// just exited, and the rename fails with a sharing error that clears on
+/// its own: retry those for ~2s before reporting failure.
+pub(crate) async fn rename_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_retrying(from, to, crate::executable::Platform::current()).await
+}
+
+async fn rename_retrying(
+    from: &Path,
+    to: &Path,
+    platform: crate::executable::Platform,
+) -> std::io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            // An existing destination also reads as access denied on
+            // Windows; that is a lost race, not a held handle.
+            Err(error)
+                if platform == crate::executable::Platform::Windows
+                    && retries < RENAME_RETRIES
+                    && windows_handle_busy(&error)
+                    && !to.exists() =>
+            {
+                retries += 1;
+                tokio::time::sleep(RENAME_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION: what
+/// Windows reports while another process still has the file open.
+pub(crate) fn windows_handle_busy(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Ensure the pinned package is installed; returns its bin entry. Failures
 /// carry npm's own output — the whole point is that a dying npm stops being
 /// an undiagnosable one-liner.
 pub(crate) async fn ensure_installed(
@@ -357,12 +396,12 @@ pub(crate) async fn ensure_installed(
     if let Some(parent) = final_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::rename(&tmp_dir, &final_dir).is_err() {
+    if rename_into_place(&tmp_dir, &final_dir).await.is_err() {
         // Lost a cross-process race (or a stale dir): keep whatever is in
         // place if it's complete, else replace it.
         if installed_entry(&pin, bin_name).is_none() {
             let _ = std::fs::remove_dir_all(&final_dir);
-            std::fs::rename(&tmp_dir, &final_dir)?;
+            rename_into_place(&tmp_dir, &final_dir).await?;
         } else {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
@@ -458,12 +497,12 @@ pub(crate) async fn ensure_installed_shim(
     if let Some(parent) = final_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::rename(&tmp_dir, &final_dir).is_err() {
+    if rename_into_place(&tmp_dir, &final_dir).await.is_err() {
         // Lost a cross-process race (or a stale dir): keep whatever is in
         // place if it's complete, else replace it.
         if !final_dir.join(OK_MARKER).exists() {
             let _ = std::fs::remove_dir_all(&final_dir);
-            std::fs::rename(&tmp_dir, &final_dir)?;
+            rename_into_place(&tmp_dir, &final_dir).await?;
         } else {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
@@ -608,6 +647,40 @@ mod tests {
 
     use std::collections::HashMap;
 
+    #[test]
+    fn windows_sharing_errors_are_the_retryable_ones() {
+        for code in [5, 32, 33] {
+            assert!(windows_handle_busy(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND / ERROR_ALREADY_EXISTS.
+        for code in [2, 3, 183] {
+            assert!(!windows_handle_busy(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!windows_handle_busy(&std::io::Error::other("busy")));
+    }
+
+    #[tokio::test]
+    async fn install_rename_moves_into_place_and_fails_fast_when_not_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join(".tmp-x"), dir.path().join("x"));
+        std::fs::create_dir(&from).unwrap();
+        rename_retrying(&from, &to, crate::executable::Platform::Windows)
+            .await
+            .unwrap();
+        assert!(to.is_dir() && !from.exists());
+        let started = std::time::Instant::now();
+        assert!(
+            rename_retrying(&from, &to, crate::executable::Platform::Windows)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < RENAME_RETRY_DELAY);
+    }
+
     fn env(values: &[(&str, OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
         let values: HashMap<String, OsString> = values
             .iter()
@@ -627,12 +700,6 @@ mod tests {
         assert_eq!(pin.name, "example-adapter");
         assert_eq!(pin.version, "0.0.33");
         assert_eq!(pin.dir_name(), "example-adapter");
-
-        // A bare scoped name is unpinned: npm resolves `latest` at install.
-        let pin = NpmPin::parse("@xai-official/grok");
-        assert_eq!(pin.name, "@xai-official/grok");
-        assert_eq!(pin.version, "latest");
-        assert_eq!(pin.dir_name(), "xai-official__grok");
     }
 
     #[test]

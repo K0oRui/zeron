@@ -2191,6 +2191,7 @@ impl Render for AccountsPage {
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Kilo => (crate::icons::KILO_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+            HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),

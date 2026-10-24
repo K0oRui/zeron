@@ -177,6 +177,25 @@ final class MainTabController: UIViewController, AppRouter {
         nav.popToRootViewController(animated: false)
     }
 
+    /// The split's open session, handed over as it is when the window
+    /// narrows (iPhone Duo folding): same page, scroll position and draft.
+    func adoptSession(_ session: SessionViewController) {
+        nav.popToRootViewController(animated: false)
+        nav.pushViewController(session, animated: false)
+    }
+
+    /// The pushed session, taken off the stack for the split's main column
+    /// when the window widens; nil when none is open. It comes back marked
+    /// `relocating`, for the split to clear once it's placed.
+    func releaseSession() -> SessionViewController? {
+        guard let session = nav.viewControllers.last(where: { $0 is SessionViewController }) as? SessionViewController else {
+            return nil
+        }
+        session.relocating = true
+        nav.popToRootViewController(animated: false)
+        return session
+    }
+
     func showSessionOpenError() {
         if presentedViewController != nil { dismiss(animated: false) }
         view.endEditing(true)

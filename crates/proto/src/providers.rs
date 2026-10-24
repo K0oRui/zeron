@@ -19,6 +19,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::Kilo, "Kilo Code", "kilo auth login"),
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
+    (HarnessId::Muse, "Muse Code", "muse login"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.

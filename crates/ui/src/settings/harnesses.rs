@@ -25,8 +25,10 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 
-use zeron_proto::headroom::HeadroomStatus;
-use zeron_proto::{HarnessId, HarnessUpdatePhase, HarnessUpdatePolicy, HarnessUpdateStatus};
+use zeron_proto::{
+    HarnessId, HarnessUpdateFailureKind, HarnessUpdatePhase, HarnessUpdatePolicy,
+    HarnessUpdateStatus,
+};
 
 use zeron_rpc::methods;
 
@@ -106,27 +108,6 @@ fn install_label(name: &str) -> String {
     format!("Installing {name}…")
 }
 
-/// The provider names Headroom routes, in the engine's order.
-fn headroom_provider_labels(providers: &[HarnessId]) -> String {
-    providers
-        .iter()
-        .map(|harness| match harness {
-            HarnessId::ClaudeCode => "Claude Code",
-            HarnessId::Codex => "Codex",
-            HarnessId::Cursor => "Cursor",
-            HarnessId::Devin => "Devin",
-            HarnessId::Grok => "Grok",
-            HarnessId::Hermes => "Hermes",
-            HarnessId::Pi => "Pi",
-            HarnessId::Opencode => "OpenCode",
-            HarnessId::Kilo => "Kilo Code",
-            HarnessId::Antigravity => "Antigravity",
-            HarnessId::Mock => "Mock",
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn install_params(harness: HarnessId, target: &Option<String>) -> serde_json::Value {
     serde_json::json!({"harness": harness, "targetDeviceId": target})
 }
@@ -142,10 +123,19 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
-        HarnessId::Kilo => "kilo",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
     }
+}
+
+/// The failure was the update itself (its release is still known, so it can
+/// be retried), not a failed check.
+fn install_failed(status: &HarnessUpdateStatus) -> bool {
+    status
+        .error
+        .as_ref()
+        .is_some_and(|error| error.kind == HarnessUpdateFailureKind::Install)
 }
 
 /// A provider's version line: the installed version, plus only what the
@@ -163,6 +153,29 @@ fn harness_update_label(status: &HarnessUpdateStatus, theme: &Theme) -> (SharedS
         None => detail.to_owned(),
     };
     let version_only = || installed.clone().unwrap_or_default();
+    // An installed release this Zeron can't run explains failing runs: it
+    // outranks everything but an update in flight.
+    if let Some(compatibility) = &status.compatibility
+        && matches!(
+            status.phase,
+            HarnessUpdatePhase::Dormant
+                | HarnessUpdatePhase::Checking
+                | HarnessUpdatePhase::Current
+                | HarnessUpdatePhase::Available
+                | HarnessUpdatePhase::ManualActionRequired
+                | HarnessUpdatePhase::Failed
+        )
+    {
+        return (compatibility.message.clone().into(), theme.danger_muted);
+    }
+    if status.phase == HarnessUpdatePhase::Current
+        && let Some(held) = &status.held_back
+    {
+        return (
+            with(&format!("v{} held back: not supported yet", held.version)).into(),
+            theme.text_muted.opacity(0.75),
+        );
+    }
     let label = match status.phase {
         HarnessUpdatePhase::Dormant
         | HarnessUpdatePhase::Checking
@@ -185,6 +198,7 @@ fn harness_update_label(status: &HarnessUpdateStatus, theme: &Theme) -> (SharedS
         HarnessUpdatePhase::Installing => with("Installing…"),
         HarnessUpdatePhase::Verifying => with("Verifying…"),
         HarnessUpdatePhase::Updated => with("Updated"),
+        HarnessUpdatePhase::Failed if install_failed(status) => with("Update failed"),
         HarnessUpdatePhase::Failed => with("Couldn't check for updates"),
     };
     let color = match status.phase {
@@ -212,16 +226,6 @@ pub struct HarnessesPage {
     pending_toggle: Option<(HarnessId, bool)>,
     installing: Option<HarnessId>,
     install_task: Option<Task<()>>,
-
-    /// The target device's Headroom runtime (install state, proxy health).
-    headroom: Loadable<HeadroomStatus>,
-    headroom_task: Option<Task<()>>,
-    headroom_action_task: Option<Task<()>>,
-    headroom_install_task: Option<Task<()>>,
-    /// A toggle the engine hasn't answered yet: the switch shows it at once.
-    pending_headroom_toggle: Option<bool>,
-    /// An install/update is running: the button says so until the RPC lands.
-    installing_headroom: bool,
 
     expanded_harness: Option<HarnessId>,
     /// A transcript's "Log in": open this provider and start its sign-in
@@ -263,13 +267,6 @@ impl HarnessesPage {
             installing: None,
             install_task: None,
 
-            headroom: Loadable::Idle,
-            headroom_task: None,
-            headroom_action_task: None,
-            headroom_install_task: None,
-            pending_headroom_toggle: None,
-            installing_headroom: false,
-
             expanded_harness: None,
             pending_sign_in: None,
             accounts_page: None,
@@ -306,8 +303,6 @@ impl HarnessesPage {
             .then(|| std::mem::replace(&mut self.harnesses, Loadable::Idle));
         let painted_updates = matches!(self.updates, Loadable::Ready(_))
             .then(|| std::mem::replace(&mut self.updates, Loadable::Idle));
-        let painted_headroom = matches!(self.headroom, Loadable::Ready(_))
-            .then(|| std::mem::replace(&mut self.headroom, Loadable::Idle));
         self.load(cx);
         if let Some(painted) = painted {
             self.harnesses = painted;
@@ -315,11 +310,6 @@ impl HarnessesPage {
         if let Some(painted) = painted_updates.filter(|_| matches!(self.updates, Loadable::Loading))
         {
             self.updates = painted;
-        }
-        if let Some(painted) =
-            painted_headroom.filter(|_| matches!(self.headroom, Loadable::Loading))
-        {
-            self.headroom = painted;
         }
         cx.notify();
     }
@@ -566,318 +556,6 @@ impl HarnessesPage {
         )
     }
 
-    /// Whether the target device's engine knows about Headroom. Cloud is a
-    /// vault of accounts, not a device, so it has no runtime to configure.
-    fn supports_headroom(&self, cx: &Context<Self>) -> bool {
-        if self.targets_cloud() {
-            return false;
-        }
-        let state = self.state.read(cx);
-        let Some(engine) = state.engine() else {
-            return false;
-        };
-        self.target_device.as_deref().map_or_else(
-            || {
-                engine
-                    .engine_info()
-                    .supports(zeron_proto::capabilities::HEADROOM_V1)
-            },
-            |device| state.device_supports(device, zeron_proto::capabilities::HEADROOM_V1),
-        )
-    }
-
-    /// Read the target device's Headroom runtime, keeping the painted card
-    /// until the answer lands.
-    fn load_headroom(&mut self, cx: &mut Context<Self>) {
-        if !self.supports_headroom(cx) {
-            self.headroom = Loadable::Idle;
-            self.headroom_task = None;
-            return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let params = self.with_target(serde_json::json!({}));
-        let target = self.target_device.clone();
-        self.headroom = Loadable::Loading;
-        self.headroom_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::GET_HEADROOM, params).await;
-            this.update(cx, |page, cx| {
-                if page.target_device != target {
-                    return;
-                }
-                page.headroom = match result {
-                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
-                        Ok(status) => Loadable::Ready(status),
-                        Err(error) => Loadable::Error(error.to_string()),
-                    },
-                    Err(error) => Loadable::Error(error.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// An action that never settled: surface the failure, then re-read the
-    /// runtime so the card is not left mid-load.
-    fn headroom_failed(&mut self, error: String, cx: &mut Context<Self>) {
-        self.error = Some(error);
-        self.load_headroom(cx);
-    }
-
-    fn set_headroom_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if !self.supports_headroom(cx) {
-            return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let params = self.with_target(serde_json::json!({ "enabled": enabled }));
-        let target = self.target_device.clone();
-        self.error = None;
-        self.pending_headroom_toggle = Some(enabled);
-        // A probe started before this write would repaint stale state.
-        self.headroom_task = None;
-        self.headroom_action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SET_HEADROOM_ENABLED, params)
-                .await;
-            this.update(cx, |page, cx| {
-                if page.target_device != target {
-                    return;
-                }
-                page.pending_headroom_toggle = None;
-                match result {
-                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
-                        Ok(status) => page.headroom = Loadable::Ready(status),
-                        Err(error) => page.headroom_failed(error.to_string(), cx),
-                    },
-                    Err(error) => page.headroom_failed(error.to_string(), cx),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Install when missing, update when present. The engine reports failures
-    /// in `status.error`, so the call itself always settles the card.
-    fn install_headroom(&mut self, cx: &mut Context<Self>) {
-        if !self.supports_headroom(cx) || self.installing_headroom {
-            return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let params = self.with_target(serde_json::json!({}));
-        let target = self.target_device.clone();
-        self.error = None;
-        self.installing_headroom = true;
-        self.headroom_task = None;
-        self.headroom_install_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::INSTALL_HEADROOM, params)
-                .await;
-            this.update(cx, |page, cx| {
-                if page.target_device != target {
-                    return;
-                }
-                page.installing_headroom = false;
-                match result {
-                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
-                        Ok(status) => page.headroom = Loadable::Ready(status),
-                        Err(error) => page.headroom_failed(error.to_string(), cx),
-                    },
-                    Err(error) => page.headroom_failed(error.to_string(), cx),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// The device's Headroom proxy: install/update, on/off, and what it
-    /// routes. Hidden on Cloud (no runtime there) and on older engines.
-    fn render_headroom(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.supports_headroom(cx) {
-            return None;
-        }
-        let Some(status) = self.headroom.ready() else {
-            let mut card = widgets::section_card(theme).child(
-                widgets::card_row(theme, true).child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(widgets::row_title(theme, "Headroom"))
-                        .child(widgets::meta_line(
-                            theme,
-                            vec![
-                                div()
-                                    .child(SharedString::from(if self.headroom.is_loading() {
-                                        "Checking…"
-                                    } else {
-                                        "Unavailable"
-                                    }))
-                                    .into_any_element(),
-                            ],
-                        )),
-                ),
-            );
-            if let Some(message) = self.headroom.error() {
-                card = card.child(
-                    div()
-                        .px(px(16.0))
-                        .pb(px(12.0))
-                        .child(widgets::error_strip(theme, message.to_string())),
-                );
-            }
-            return Some(card.into_any_element());
-        };
-
-        let installing = self.installing_headroom || status.installing;
-        let installed = status.installed;
-        let enabled = self.pending_headroom_toggle.unwrap_or(status.enabled);
-        let running = status.running;
-        let port = status.port;
-
-        let mut meta: Vec<AnyElement> = Vec::new();
-        if installing {
-            meta.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(crate::loaders::ring_spinner(
-                        "headroom-install-spinner",
-                        12.0,
-                        theme.text_muted,
-                    ))
-                    .child(SharedString::from("Installing…"))
-                    .into_any_element(),
-            );
-        } else if let Some(version) = status.version.as_deref() {
-            meta.push(
-                div()
-                    .child(SharedString::from(format!("v{version}")))
-                    .into_any_element(),
-            );
-        }
-        if !installed && !installing {
-            meta.push(
-                div()
-                    .text_color(theme.text_muted.opacity(0.75))
-                    .child(SharedString::from("Not installed"))
-                    .into_any_element(),
-            );
-        } else if installed {
-            let proxy = if running {
-                format!("Proxy on 127.0.0.1:{port}")
-            } else if enabled {
-                "Proxy starts on the next run".to_string()
-            } else {
-                "Proxy stopped".to_string()
-            };
-            meta.push(div().child(SharedString::from(proxy)).into_any_element());
-        }
-        let providers = headroom_provider_labels(&status.providers);
-        if !providers.is_empty() {
-            meta.push(
-                div()
-                    .child(SharedString::from(format!("Routes {providers}")))
-                    .into_any_element(),
-            );
-        }
-
-        // Install when missing, update only when the check found a newer
-        // release. Unknown state never earns a button.
-        let action = (!installed || status.update_available || installing).then(|| {
-            widgets::ghost_action(theme)
-                .id("headroom-install")
-                .flex_none()
-                .when(installing, |el| el.opacity(0.6))
-                .when(!installing, |el| {
-                    el.on_click(cx.listener(|page, _, _, cx| page.install_headroom(cx)))
-                })
-                .child(if installing {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(crate::loaders::ring_spinner(
-                            "headroom-install-button-spinner",
-                            12.0,
-                            theme.text_muted,
-                        ))
-                        .child(SharedString::from("Installing…"))
-                        .into_any_element()
-                } else {
-                    SharedString::from(if installed { "Update" } else { "Install" })
-                        .into_any_element()
-                })
-        });
-
-        let toggle = widgets::toggle_switch(theme, enabled, "headroom-switch")
-            .id("headroom-toggle")
-            .when(self.pending_headroom_toggle.is_some() || installing, |el| {
-                el.opacity(0.6)
-            })
-            .when(!installing, |el| {
-                el.cursor_pointer()
-                    .tab_index(0)
-                    .role(gpui::Role::Switch)
-                    .aria_label("Headroom")
-                    .aria_toggled(if enabled {
-                        gpui::Toggled::True
-                    } else {
-                        gpui::Toggled::False
-                    })
-                    .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                    .on_click(cx.listener(move |page, _, _, cx| {
-                        page.set_headroom_enabled(!enabled, cx);
-                    }))
-            });
-
-        let mut label = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(widgets::row_title(theme, "Headroom"));
-        if !meta.is_empty() {
-            label = label.child(widgets::meta_line(theme, meta));
-        }
-
-        let mut card = widgets::section_card(theme).child(
-            widgets::card_row(theme, true)
-                .child(label)
-                .children(action)
-                .child(toggle),
-        );
-        let message = status.error.as_deref().map(|message| {
-            match (installed, status.manual_command.as_deref()) {
-                (false, Some(command)) => format!("{message}. Install with `{command}`"),
-                _ => message.to_string(),
-            }
-        });
-        if let Some(message) = message {
-            card = card.child(
-                div()
-                    .px(px(16.0))
-                    .pb(px(12.0))
-                    .child(widgets::error_strip(theme, message)),
-            );
-        }
-        Some(card.into_any_element())
-    }
-
     fn can_control_updates(&self, cx: &Context<Self>) -> bool {
         self.supports_updates(cx)
             && matches!(self.updates, Loadable::Ready(_))
@@ -902,12 +580,6 @@ impl HarnessesPage {
         self.install_task = None;
         self.policy_selects.clear();
         self.target_device = target;
-        self.headroom = Loadable::Idle;
-        self.headroom_task = None;
-        self.headroom_action_task = None;
-        self.headroom_install_task = None;
-        self.pending_headroom_toggle = None;
-        self.installing_headroom = false;
         if let Some(accounts) = &self.accounts_page {
             accounts.update(cx, |page, cx| {
                 page.set_target_device(self.target_device.clone(), cx)
@@ -930,7 +602,6 @@ impl HarnessesPage {
     /// `ListHarnesses` against the target device (installed probe + enabled
     /// set both come from where the CLIs actually live).
     fn load(&mut self, cx: &mut Context<Self>) {
-        self.load_headroom(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1521,6 +1192,11 @@ impl HarnessesPage {
                         {
                             ("harness-update", "Update", true)
                         }
+                        HarnessUpdatePhase::Failed
+                            if status.can_apply && install_failed(status) =>
+                        {
+                            ("harness-update", "Retry update", true)
+                        }
                         HarnessUpdatePhase::WaitingForIdle
                         | HarnessUpdatePhase::Preparing
                         | HarnessUpdatePhase::Downloading => {
@@ -1870,7 +1546,6 @@ impl Render for HarnessesPage {
                                         .child(toolbar),
                                 )
                                 .children(update_error)
-                                .children(self.render_headroom(&theme, cx))
                                 .child(body),
                         ),
                 )
@@ -2098,22 +1773,6 @@ fn account_counts_read_naturally() {
 
 #[cfg(test)]
 #[test]
-fn headroom_provider_labels_join_in_engine_order() {
-    assert_eq!(
-        headroom_provider_labels(&[
-            HarnessId::ClaudeCode,
-            HarnessId::Codex,
-            HarnessId::Grok,
-            HarnessId::Opencode,
-            HarnessId::Antigravity,
-        ]),
-        "Claude Code, Codex, Grok, OpenCode, Antigravity"
-    );
-    assert_eq!(headroom_provider_labels(&[]), "");
-}
-
-#[cfg(test)]
-#[test]
 fn install_visibility_and_hint_follow_target_capabilities() {
     for id in [
         HarnessId::Antigravity,
@@ -2124,7 +1783,6 @@ fn install_visibility_and_hint_follow_target_capabilities() {
         HarnessId::Pi,
         HarnessId::Grok,
         HarnessId::Hermes,
-        HarnessId::Kilo,
         HarnessId::Devin,
         HarnessId::Mock,
     ] {

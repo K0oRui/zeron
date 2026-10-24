@@ -26,6 +26,9 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// Meta's Muse Code agent, driven natively over the Muse Session Protocol
+    /// (MSP: `muse` speaking JSON-RPC on stdio).
+    Muse,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -43,6 +46,7 @@ impl HarnessId {
         HarnessId::Opencode,
         HarnessId::Kilo,
         HarnessId::Antigravity,
+        HarnessId::Muse,
         HarnessId::Mock,
     ];
 
@@ -59,6 +63,7 @@ impl HarnessId {
             HarnessId::Opencode => "opencode",
             HarnessId::Kilo => "kilo",
             HarnessId::Antigravity => "antigravity",
+            HarnessId::Muse => "muse",
             HarnessId::Mock => "mock",
         }
     }
@@ -133,6 +138,21 @@ pub struct HarnessUpdateFailure {
     pub message: String,
     #[serde(default)]
     pub retryable: bool,
+    /// What failed: looking for a release, or installing one. An engine that
+    /// predates the field only ever reported failed checks.
+    #[serde(default)]
+    pub kind: HarnessUpdateFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdateFailureKind {
+    /// The version probe or release lookup failed; checking again retries.
+    #[default]
+    Check,
+    /// The updater or its verification failed; the release is still known,
+    /// so the update itself can be retried.
+    Install,
 }
 
 /// One row in the device-local harness-update stream.
@@ -165,6 +185,38 @@ pub struct HarnessUpdateStatus {
     /// Provider command shown when mutation cannot be safely automated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_command: Option<String>,
+    /// The installed release is known not to work with (or isn't supported
+    /// by) this engine's zeron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<HarnessCompatibility>,
+    /// A newer release exists, but zeron won't install it: it is known not
+    /// to work. Such a release is never reported as available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_back: Option<HarnessCompatibility>,
+}
+
+/// How well a CLI release works with this zeron (see the engine's
+/// compatibility policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessCompatibilityStatus {
+    Supported,
+    /// Outside the releases this zeron was built and tested against.
+    Unsupported,
+    /// Known not to work with this zeron.
+    Broken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCompatibility {
+    pub status: HarnessCompatibilityStatus,
+    /// The release this is about.
+    pub version: String,
+    /// One line for the user, naming the release to use instead when known.
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_version: Option<String>,
 }
 
 impl HarnessUpdateStatus {
@@ -732,6 +784,15 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// The subscription's usage as the provider reported it mid-run (Muse's
+    /// `usage/changed`): the engine records it on the account the run used,
+    /// for the Providers meters. Never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    PlanUsage {
+        windows: Vec<crate::AgentUsageWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_label: Option<String>,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
@@ -966,8 +1027,12 @@ mod tests {
             error: None,
             can_apply: true,
             manual_command: Some("claude update".into()),
+            compatibility: None,
+            held_back: None,
         };
         let json = serde_json::to_value(&status).unwrap();
+        // Older peers neither send nor expect the compatibility fields.
+        assert!(json.get("compatibility").is_none() && json.get("heldBack").is_none());
         assert_eq!(json["harness"], "claude-code");
         assert_eq!(json["installedVersion"], "1.0.0");
         assert_eq!(json["policy"], "auto-when-idle");
