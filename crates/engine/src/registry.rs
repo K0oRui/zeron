@@ -1052,7 +1052,6 @@ mod tests {
                 HarnessId::Kilo,
                 HarnessId::Antigravity,
                 HarnessId::Muse
->>>>>>> upstream/main
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());

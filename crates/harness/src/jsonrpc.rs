@@ -500,6 +500,7 @@ mod tests {
             writer,
             closed: Arc::new(AtomicBool::new(false)),
             voice_router: Arc::default(),
+            close_stdin: Arc::default(),
         };
         client.nudge();
         assert_eq!(receiver.try_recv().unwrap(), "");

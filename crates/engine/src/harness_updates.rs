@@ -1489,7 +1489,7 @@ impl HarnessUpdateCoordinator {
         // silent downgrade. Nothing runs it now: the exclusive lease is held.
         if let Some(latest) = current.latest_version.as_deref()
             && let Ok(installed) =
-                run_version_command(harness, &executable, provider(harness).version_args).await
+                installed_version_for(harness, &executable, provider(harness).version_args).await
             && !version_is_newer(latest, &installed)
         {
             drop(lease);
