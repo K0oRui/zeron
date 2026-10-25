@@ -109,8 +109,22 @@ pub(super) fn default_devin_credentials_file() -> PathBuf {
         .unwrap_or(primary)
 }
 
+/// OpenCode's data dir, resolved the way OpenCode's own `xdg-basedir` does: `opencode/`
+/// under `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+pub(super) fn opencode_data_dir() -> PathBuf {
+    if let Some(dir) = env_dir("XDG_DATA_HOME") {
+        return dir.join("opencode");
+    }
+    if cfg!(windows) {
+        return env_dir("LOCALAPPDATA")
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("opencode");
+    }
+    home_dir().join(".local").join("share").join("opencode")
+}
+
 pub(super) fn default_opencode_auth_file() -> PathBuf {
-    xdg_data_home().join("opencode").join("auth.json")
+    opencode_data_dir().join("auth.json")
 }
 
 /// Kilo's data dir, resolved the way Kilo's own `xdg-basedir` does: `kilo/`
