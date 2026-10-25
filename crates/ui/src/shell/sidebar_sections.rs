@@ -373,18 +373,37 @@ impl Shell {
 
     fn archive_sidebar_section(&mut self, id: &str, cx: &mut Context<Self>) {
         self.section_menu = None;
-        let Some(section) = self
-            .active_sidebar_sections(cx)
-            .into_iter()
-            .find(|s| s.id == id)
-        else {
+        let sections = self.active_sidebar_sections(cx);
+        let Some(section) = sections.iter().find(|s| s.id == id) else {
             return;
         };
+        let by_project = self.settings.sidebar_organization == SidebarOrganization::ByProject;
+        // A session explicitly placed in another section keeps that row: the
+        // explicit placement wins over a project placement in
+        // `render_active_rows`, so "Archive all" must not reach across.
+        let explicit_elsewhere: std::collections::HashSet<&str> = sections
+            .iter()
+            .filter(|other| other.id != section.id)
+            .flat_map(|other| other.session_ids.iter().map(String::as_str))
+            .collect();
+        let placed_projects: std::collections::HashSet<&str> =
+            section.project_keys.iter().map(String::as_str).collect();
         let state = self.state.read(cx);
         let ids: Vec<_> = state
             .chats
             .iter()
-            .filter(|chat| !chat.archived && section.session_ids.contains(&chat.id))
+            .filter(|chat| !chat.archived)
+            .filter(|chat| {
+                if section.session_ids.contains(&chat.id) {
+                    return true;
+                }
+                if !by_project || explicit_elsewhere.contains(chat.id.as_str()) {
+                    return false;
+                }
+                state.space_for_chat(chat).is_some_and(|space| {
+                    placed_projects.contains(zeron_proto::view::project_key(space).as_str())
+                })
+            })
             .map(|chat| chat.id.clone())
             .collect();
         if ids.is_empty() {
@@ -406,7 +425,8 @@ impl Shell {
             if failed > 0 {
                 let _ = this.update(cx, |this, cx| {
                     if this.state.read(cx).engine().is_some_and(|current| current.same_connection(&engine)) {
-                        this.show_notice(crate::toast::ToastKind::Error, format!("Could not archive {failed} sessions. Try again."), cx);
+                        let noun = if failed == 1 { "session" } else { "sessions" };
+                        this.show_notice(crate::toast::ToastKind::Error, format!("Could not archive {failed} {noun}. Try again."), cx);
                         cx.notify();
                     }
                 });
@@ -434,12 +454,17 @@ impl Shell {
             .is_some_and(|drag| drag.target.as_deref() == Some(id.as_str()));
         // The slots measured by the last paint, in natural section order. The
         // preview never moves these: offsets are painted inside each slot.
-        let natural_slots: Vec<(String, f32, f32)> = self
-            .sidebar_section_project_bounds
-            .borrow()
-            .get(&id)
-            .cloned()
-            .unwrap_or_default();
+        // Only a live project drag reads them; skip the clone per section per
+        // frame otherwise.
+        let natural_slots: Vec<(String, f32, f32)> = if self.sidebar_project_drag.is_some() {
+            self.sidebar_section_project_bounds
+                .borrow()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let moving_key = self
             .sidebar_project_drag
             .as_ref()
@@ -516,12 +541,16 @@ impl Shell {
                 slide_frames.insert(key.clone(), (slide.from, slide.to, slide.epoch));
             }
         }
-        let anchors: Vec<String> = section
-            .project_keys
-            .iter()
-            .filter(|key| moving_key.as_ref() != Some(key))
-            .cloned()
-            .collect();
+        let anchors: Vec<String> = if insert.is_some() {
+            section
+                .project_keys
+                .iter()
+                .filter(|key| moving_key.as_ref() != Some(key))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let insert_before = insert.and_then(|index| anchors.get(index).cloned());
         let insert_after_last = insert.is_some_and(|index| index >= anchors.len());
         let last_anchor = anchors.last().cloned();
@@ -1563,11 +1592,15 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let mut overlays = Vec::new();
-        if let Some((id, position)) = self.section_menu.clone() {
-            if !self.active_sidebar_sections(cx).iter().any(|s| s.id == id) {
-                self.section_menu = None;
-                return overlays;
-            }
+        let menu = self.section_menu.clone().filter(|(id, _)| {
+            self.active_sidebar_sections(cx)
+                .iter()
+                .any(|section| &section.id == id)
+        });
+        if menu.is_none() {
+            self.section_menu = None;
+        }
+        if let Some((id, position)) = menu {
             let mut card = popover::popover_card(&theme)
                 .w(px(180.0))
                 .flex()
@@ -2151,10 +2184,7 @@ mod tests {
             2
         );
         // An empty section has one place to land.
-        assert_eq!(
-            project_drop_index(None, 50.0, "a", None, false, None),
-            0
-        );
+        assert_eq!(project_drop_index(None, 50.0, "a", None, false, None), 0);
         // The dead band holds the last slot until a header midline is clearly
         // crossed: midlines at 24 and 96 for a dragged b.
         assert_eq!(
@@ -2190,7 +2220,14 @@ mod tests {
             1
         );
         assert_eq!(
-            project_drop_index(Some(slots.as_slice()), 24.0, "b", Some(1), true, Some(false)),
+            project_drop_index(
+                Some(slots.as_slice()),
+                24.0,
+                "b",
+                Some(1),
+                true,
+                Some(false)
+            ),
             0
         );
     }
@@ -2313,11 +2350,40 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 prepare(shell, cx);
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
                 shell.assign_sidebar_section("regular", Some("a"), cx);
-                shell.assign_sidebar_section("other", Some("a"), cx);
+                // A placed project contributes its sessions to "Archive all"
+                // even though they are not explicit section members.
+                let space = zeron_proto::Space {
+                    id: "space".into(),
+                    device_id: "local".into(),
+                    path: "/project".into(),
+                    name: None,
+                    git_detected: true,
+                    git_checked_at: None,
+                    checkout_id: Some("checkout".into()),
+                    repository_id: None,
+                    github_repo: None,
+                    created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                };
+                let project_key = zeron_proto::view::project_key(&space);
+                shell.state.update(cx, |state, _| {
+                    state.spaces = vec![space];
+                    state
+                        .chats
+                        .iter_mut()
+                        .find(|chat| chat.id == "other")
+                        .unwrap()
+                        .space_id = Some("space".into());
+                    state.set_test_engine(engine);
+                });
                 shell
-                    .state
-                    .update(cx, |state, _| state.set_test_engine(engine));
+                    .settings
+                    .sidebar_sections_by_profile
+                    .get_mut("local")
+                    .unwrap()[0]
+                    .project_keys
+                    .push(project_key);
                 shell.archive_sidebar_section("a", cx);
             })
             .unwrap();
@@ -2351,12 +2417,17 @@ mod tests {
                     shell
                         .sidebar_notice
                         .as_ref()
-                        .is_some_and(|text| text.contains("1 sessions"))
+                        .is_some_and(|text| text.contains("1 session"))
                 );
                 assert_eq!(
                     shell.active_sidebar_sections(cx)[0].session_ids.len(),
-                    2,
-                    "Archiving preserves section membership"
+                    1,
+                    "Archiving preserves explicit section membership"
+                );
+                assert_eq!(
+                    shell.active_sidebar_sections(cx)[0].project_keys.len(),
+                    1,
+                    "Archiving preserves placed projects"
                 );
                 assert_eq!(shell.state.read(cx).chats.len(), 3);
             })
@@ -2421,16 +2492,33 @@ mod tests {
                     id: 1,
                     profile_key: key.clone(),
                     engine: engine.clone(),
-                    queue: std::collections::VecDeque::from([pin.clone()]),
+                    queue: std::collections::VecDeque::from([
+                        pin.clone(),
+                        zeron_proto::SidebarPinChange::Section {
+                            change: SidebarSectionChange::Collapse {
+                                id: "a".into(),
+                                collapsed: true,
+                            },
+                        },
+                    ]),
                     unconfirmed: false,
                 });
                 assert!(shell.active_sidebar_sections(cx)[0].session_ids.is_empty());
+                assert!(
+                    shell.active_sidebar_sections(cx)[0].collapsed,
+                    "queued changes preview together"
+                );
                 assert_eq!(shell.active_sidebar_pins(cx), vec!["regular".to_string()]);
                 shell.finish_sidebar_pin_write(1, Err("rejected".into()), cx);
                 assert_eq!(
                     shell.active_sidebar_sections(cx)[0].session_ids,
                     vec!["regular".to_string()]
                 );
+                assert!(
+                    !shell.active_sidebar_sections(cx)[0].collapsed,
+                    "a rejected write drops the edits queued behind it"
+                );
+                assert!(shell.sidebar_pin_write.is_none());
                 assert!(shell.active_sidebar_pins(cx).is_empty());
                 shell.sidebar_pin_write = Some(super::super::sidebar_pins::PendingSidebarPins {
                     id: 2,

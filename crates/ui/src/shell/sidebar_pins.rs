@@ -85,7 +85,9 @@ impl Shell {
         if let Some(pending) = &mut self.sidebar_pin_write {
             if pending.unconfirmed {
                 self.set_pin_write_notice(
-                    "Waiting for the engine to confirm the previous sidebar change.".into(), cx);
+                    "Waiting for the engine to confirm the previous sidebar change.".into(),
+                    cx,
+                );
                 cx.notify();
                 return false;
             }
@@ -174,6 +176,7 @@ impl Shell {
         } else {
             None
         };
+        let failed = result.is_err();
         match result {
             Ok(value) => {
                 self.clear_pin_write_notice();
@@ -184,7 +187,10 @@ impl Shell {
                 });
             }
             Err(error) => {
-                self.set_pin_write_notice(format!("Couldn't save sidebar changes: {error}").into(), cx);
+                self.set_pin_write_notice(
+                    format!("Couldn't save sidebar changes: {error}").into(),
+                    cx,
+                );
             }
         }
         if let Some(profile) = imported_profile {
@@ -193,7 +199,13 @@ impl Shell {
             self.schedule_save(cx);
         }
         let pending = self.sidebar_pin_write.as_mut().unwrap();
-        pending.queue.pop_front();
+        if failed {
+            // Later edits were computed against a base the engine rejected, so
+            // replaying them would show changes that can never land.
+            pending.queue.clear();
+        } else {
+            pending.queue.pop_front();
+        }
         let next = pending.queue.front().cloned();
         if next.is_none() {
             // Removing the overlay reveals the latest watch/ack, not a stale
