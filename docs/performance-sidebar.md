@@ -167,8 +167,7 @@ New tests:
   session status, pending send, the second bucket) and does not invalidate on a
   field it never reads (`selected_chat`).
 
-The first two pass in the CI run described below; the cache tests were added
-after it and are covered by the same suite on the next run.
+All four pass in the CI run described below.
 
 There is no Rust toolchain in the authoring sandbox, so this was compiled and
 tested on the pull request's CI instead (`crates/ui` only; the harness, engine
@@ -176,20 +175,23 @@ and app crates are untouched):
 
 - **Linux `UI tests`** (`cargo nextest run --config-file scripts/ci/nextest.toml
   --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry`):
-  `zeron-ui` compiles and 1949 of 1952 tests pass. The three failures —
+  `zeron-ui` compiles and `1954 tests run: 1951 passed (1 flaky), 3 failed, 1
+  skipped` — the 1952 of the previous run plus the two cache tests. The three
+  failures are the pre-existing ones —
   `pickers::tests::typed_windows_paths_resolve_on_any_client`,
   `settings::accounts::tests::per_provider_agents_offer_one_sign_in_per_provider`
   and `pinned_session_tests::sidebar_optimistic_writes_preserve_newer_edits_and_watch_state_on_failure`
-  — fail identically in the Windows serial run and none of them reach the row
-  model, the ordering or the pin-write path this change touches.
+  — and they fail identically in the Windows serial run; none of them reaches
+  the row model, the ordering or the pin-write path this change touches.
 - **Windows `UI tests`**: the release build of `zeron-ui` and the app compile and
-  the suite runs; the same three tests fail.
+  the suite runs (`1873 passed; 3 failed; 5 ignored` — the 1871 of the previous
+  run plus the two cache tests); the same three tests fail.
 - **`core-tests`** (harness/engine/sync/update/doc/preview) is red on `main`
   itself: `crates/harness/tests/acp_hardening.rs` builds `RunControls` without
   the `user_message_id` field the struct requires, so that suite does not
   compile at `f626e78`. Unrelated to this change.
-- **`linux-browser`** stopped in the CI action's `apt` step (`download failed`),
-  before it built the browser fixture.
+- **`linux-browser`** passed in this run; the previous run's failure was the CI
+  action's `apt` step (`download failed`), before it built the browser fixture.
 
 Locally, the edited files were only checked against tree-sitter's Rust grammar
 (no parse errors). To rerun the suite by hand:
