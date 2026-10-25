@@ -1,614 +1,8 @@
-//! Terminals on other devices: their I/O takes a direct peer-to-peer link
-//! ([`crate::terminals::link`]) whenever the two devices can reach each other,
-//! and the device-room relay only when they cannot.
-//!
-//! - Subscribe opens the direct link when one is already up; otherwise it
-//!   starts on the relay and keeps trying to pair, then moves the live stream
-//!   onto the direct link mid-session by re-attaching after the last seq it
-//!   delivered (no gap, no repeat). A direct link that dies falls back to the
-//!   relay the same way, without ending the viewer's stream.
-//! - Writes and resizes return at once and stay in typed order: an attached
-//!   direct link carries them; otherwise a per-terminal queue forwards them over
-//!   the relay one at a time. Writes only move onto a fresh direct link once the
-//!   relay queue has drained.
-//! - Input is numbered and held until the host acknowledges it. Whichever path
-//!   takes over after another dies replays what is unacknowledged, and the host
-//!   applies each number once, so a network change neither drops nor repeats
-//!   a keystroke.
+//! Terminals on other devices: the hub lives in `zeron-term-link` (the
+//! phone runs the same one); this engine supplies its relay and its direct
+//! peers.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
-
-use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::BoxStream;
-use tokio::sync::mpsc;
-use zeron_preview::mux::BoxIo;
-use zeron_proto::TerminalEvent;
-use zeron_rpc::{RpcError, methods};
-
-use crate::terminals::link::{self, Link, Outgoing};
-
-/// How long a subscribe waits on an already-open direct connection before it
-/// settles for the relay.
-const DIRECT_ATTACH_BUDGET: Duration = Duration::from_secs(3);
-/// Retry pacing for upgrading a relayed terminal to a direct link.
-const UPGRADE_RETRY_MIN: Duration = Duration::from_secs(15);
-const UPGRADE_RETRY_MAX: Duration = Duration::from_secs(300);
-/// A relay write queue with nothing to send retires after this long.
-const RELAY_QUEUE_IDLE: Duration = Duration::from_secs(60);
-/// Recently closed or exited terminals remembered, so writes to them fail
-/// like a local write would instead of vanishing into a queue.
-const ENDED_MEMORY: usize = 256;
-
-/// The relay path: ordinary device-addressed RPC forwarding.
-#[async_trait]
-pub trait Relay: Send + Sync + 'static {
-    async fn call(
-        &self,
-        target: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcError>;
-    async fn subscribe(
-        &self,
-        target: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<BoxStream<'static, serde_json::Value>, RpcError>;
-}
-
-/// The direct path: peer-to-peer streams to another device.
-#[async_trait]
-pub trait Direct: Send + Sync + 'static {
-    /// A direct connection to `device` is open right now.
-    async fn ready(&self, device: &str) -> bool;
-    /// Open `service` on `device`, pairing first when needed.
-    async fn open(&self, device: &str, service: &str) -> anyhow::Result<BoxIo>;
-}
-
-#[async_trait]
-impl Direct for zeron_preview::PreviewService {
-    async fn ready(&self, device: &str) -> bool {
-        self.peer_ready(device).await
-    }
-    async fn open(&self, device: &str, service: &str) -> anyhow::Result<BoxIo> {
-        Ok(Box::new(self.open_peer_stream(device, service).await?))
-    }
-}
-
-type Key = (String, String);
-
-/// What a viewer asks of a remote terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Write {
-    Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
-}
-
-/// Unacknowledged input kept for replay after a path change. Past this the
-/// oldest is dropped: a path down that long has bigger problems, and the
-/// bound keeps a dead link from holding a paste forever.
-const MAX_UNACKED_BYTES: usize = 256 * 1024;
-
-#[derive(Default)]
-struct Entry {
-    /// Writers of attached direct links, each tagged with the subscription
-    /// that owns it (two views of one terminal each attach their own).
-    direct: Vec<(u64, mpsc::UnboundedSender<Outgoing>)>,
-    /// Ordered relay writer, spawned on first use.
-    relay: Option<mpsc::UnboundedSender<Outgoing>>,
-    /// Relay writes queued or in flight.
-    relay_pending: Arc<AtomicUsize>,
-    /// Last input seq handed out. Never reset while this engine runs: the
-    /// host drops any seq it has already applied from this client.
-    next_input: u64,
-    /// Input the host hasn't acknowledged yet, oldest first.
-    unacked: std::collections::VecDeque<(u64, Vec<u8>)>,
-    unacked_bytes: usize,
-}
-
-impl Entry {
-    fn live_direct(&mut self) -> Option<&mpsc::UnboundedSender<Outgoing>> {
-        self.direct.retain(|(_, tx)| !tx.is_closed());
-        self.direct.first().map(|(_, tx)| tx)
-    }
-
-    fn ack(&mut self, seq: u64) {
-        while self.unacked.front().is_some_and(|(s, _)| *s <= seq) {
-            if let Some((_, bytes)) = self.unacked.pop_front() {
-                self.unacked_bytes -= bytes.len();
-            }
-        }
-    }
-
-    fn replay(&self) -> Vec<Outgoing> {
-        self.unacked
-            .iter()
-            .map(|(seq, bytes)| Outgoing::Input {
-                seq: *seq,
-                bytes: bytes.clone(),
-            })
-            .collect()
-    }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-#[derive(Clone)]
-pub struct RemoteTerminals {
-    /// This engine's identity as a remote viewer; input seqs are per client.
-    client: Arc<str>,
-    entries: Arc<Mutex<HashMap<Key, Entry>>>,
-    ended: Arc<Mutex<std::collections::VecDeque<Key>>>,
-    pumps: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl Default for RemoteTerminals {
-    fn default() -> Self {
-        Self {
-            client: crate::new_id().into(),
-            entries: Default::default(),
-            ended: Default::default(),
-            pumps: Default::default(),
-        }
-    }
-}
-
-impl RemoteTerminals {
-    /// Queue `write` for the remote terminal; never waits on the network.
-    /// Fails only for a terminal this device saw close or exit.
-    pub fn send(
-        &self,
-        relay: &Arc<dyn Relay>,
-        target: &str,
-        terminal_id: &str,
-        write: Write,
-    ) -> Result<(), RpcError> {
-        let key = (target.to_owned(), terminal_id.to_owned());
-        if lock(&self.ended).contains(&key) {
-            return Err(RpcError::Failed("Terminal has exited".into()));
-        }
-        let mut entries = lock(&self.entries);
-        let entry = entries.entry(key.clone()).or_default();
-        let out = match write {
-            Write::Input(bytes) => {
-                entry.next_input += 1;
-                let seq = entry.next_input;
-                entry.unacked_bytes += bytes.len();
-                entry.unacked.push_back((seq, bytes.clone()));
-                while entry.unacked_bytes > MAX_UNACKED_BYTES && entry.unacked.len() > 1 {
-                    if let Some((_, dropped)) = entry.unacked.pop_front() {
-                        entry.unacked_bytes -= dropped.len();
-                    }
-                }
-                Outgoing::Input { seq, bytes }
-            }
-            Write::Resize { cols, rows } => Outgoing::Resize { cols, rows },
-        };
-        self.route(entry, relay, &key, vec![out]);
-        Ok(())
-    }
-
-    /// Hand `outs` to the attached direct link, or to the relay queue while
-    /// there is none or the relay still has earlier writes to deliver.
-    fn route(&self, entry: &mut Entry, relay: &Arc<dyn Relay>, key: &Key, outs: Vec<Outgoing>) {
-        if entry.relay_pending.load(Ordering::Acquire) == 0
-            && let Some(direct) = entry.live_direct()
-            && outs.iter().all(|out| direct.send(out.clone()).is_ok())
-        {
-            return;
-        }
-        let pending = entry.relay_pending.clone();
-        let queue = entry.relay.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(relay_writer(
-                self.clone(),
-                key.clone(),
-                relay.clone(),
-                pending.clone(),
-                rx,
-            ));
-            tx
-        });
-        for out in outs {
-            pending.fetch_add(1, Ordering::AcqRel);
-            if queue.send(out).is_err() {
-                pending.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-    }
-
-    fn ack(&self, key: &Key, seq: u64) {
-        if let Some(entry) = lock(&self.entries).get_mut(key) {
-            entry.ack(seq);
-        }
-    }
-
-    /// A path just took over: send it whatever the host hasn't acknowledged
-    /// (input a dying link may have swallowed). The host applies each seq
-    /// once, so a replay of input that did land is harmless.
-    fn replay(&self, key: &Key, relay: &Arc<dyn Relay>) {
-        let mut entries = lock(&self.entries);
-        if let Some(entry) = entries.get_mut(key) {
-            let outs = entry.replay();
-            if !outs.is_empty() {
-                self.route(entry, relay, key, outs);
-            }
-        }
-    }
-
-    /// The terminal closed or exited: detach its link, refuse further writes.
-    pub fn ended(&self, target: &str, terminal_id: &str) {
-        let key = (target.to_owned(), terminal_id.to_owned());
-        lock(&self.entries).remove(&key);
-        let mut ended = lock(&self.ended);
-        if !ended.contains(&key) {
-            if ended.len() == ENDED_MEMORY {
-                ended.pop_front();
-            }
-            ended.push_back(key);
-        }
-    }
-
-    fn attach_writer(&self, key: &Key, pump: u64, writer: mpsc::UnboundedSender<Outgoing>) {
-        let mut entries = lock(&self.entries);
-        if lock(&self.ended).contains(key) {
-            return;
-        }
-        let entry = entries.entry(key.clone()).or_default();
-        if entry
-            .direct
-            .iter()
-            .any(|(owner, tx)| *owner == pump && tx.same_channel(&writer))
-        {
-            return; // already attached
-        }
-        // Replay first, on the new link itself: it carries them ahead of
-        // anything typed from now on.
-        for out in entry.replay() {
-            let _ = writer.send(out);
-        }
-        entry.direct.push((pump, writer));
-    }
-
-    fn detach_writer(&self, key: &Key, pump: u64) {
-        if let Some(entry) = lock(&self.entries).get_mut(key) {
-            entry.direct.retain(|(owner, _)| *owner != pump);
-        }
-    }
-
-    /// The terminal's events after `after_seq`, over the best path available
-    /// now and the better one once it opens. Errors only when no path reaches
-    /// the terminal at all.
-    pub async fn subscribe(
-        &self,
-        relay: Arc<dyn Relay>,
-        direct: Option<Arc<dyn Direct>>,
-        target: &str,
-        terminal_id: &str,
-        after_seq: u64,
-        host_replies: bool,
-    ) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
-        let key = (target.to_owned(), terminal_id.to_owned());
-        let mut first = None;
-        if let Some(direct) = &direct
-            && direct.ready(target).await
-        {
-            match tokio::time::timeout(
-                DIRECT_ATTACH_BUDGET,
-                attach_direct(
-                    direct.as_ref(),
-                    target,
-                    terminal_id,
-                    after_seq,
-                    &self.client,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(link)) => first = Some(Source::Direct(link)),
-                Ok(Err(error)) => tracing::debug!(%error, "direct terminal attach failed"),
-                Err(_) => tracing::debug!("direct terminal attach timed out"),
-            }
-        }
-        let first = match first {
-            Some(source) => source,
-            None => Source::Relay(
-                relay_subscribe(relay.as_ref(), target, terminal_id, after_seq, host_replies)
-                    .await?,
-            ),
-        };
-        let (out, events) = mpsc::unbounded_channel();
-        let id = self.pumps.fetch_add(1, Ordering::Relaxed);
-        // Writes issued right after this returns must already take the link.
-        if let Source::Direct(link) = &first {
-            self.attach_writer(&key, id, link.outgoing.clone());
-        }
-        tokio::spawn(
-            Pump {
-                id,
-                hub: self.clone(),
-                key,
-                relay,
-                direct,
-                out,
-                last_seq: after_seq,
-                host_replies,
-            }
-            .run(first),
-        );
-        Ok(futures::stream::unfold(events, |mut events| async move {
-            events.recv().await.map(|event| (event, events))
-        })
-        .boxed())
-    }
-}
-
-async fn attach_direct(
-    direct: &dyn Direct,
-    target: &str,
-    terminal_id: &str,
-    after_seq: u64,
-    client: &str,
-) -> anyhow::Result<Link> {
-    let io = direct.open(target, &link::service_id(terminal_id)).await?;
-    link::attach(io, after_seq, client).await
-}
-
-/// A direct link always leaves queries to the host (only engines with host
-/// replies open one); over the relay the viewer's choice travels along.
-async fn relay_subscribe(
-    relay: &dyn Relay,
-    target: &str,
-    terminal_id: &str,
-    after_seq: u64,
-    host_replies: bool,
-) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
-    relay
-        .subscribe(
-            target,
-            methods::SUBSCRIBE_TERMINAL,
-            serde_json::json!({
-                "terminalId": terminal_id,
-                "afterSeq": after_seq,
-                "targetDeviceId": target,
-                "hostReplies": host_replies,
-            }),
-        )
-        .await
-}
-
-/// Forwards relayed writes one at a time, in order.
-async fn relay_writer(
-    hub: RemoteTerminals,
-    key: Key,
-    relay: Arc<dyn Relay>,
-    pending: Arc<AtomicUsize>,
-    mut rx: mpsc::UnboundedReceiver<Outgoing>,
-) {
-    loop {
-        let out = match tokio::time::timeout(RELAY_QUEUE_IDLE, rx.recv()).await {
-            Ok(Some(out)) => out,
-            Ok(None) => return,
-            Err(_) => {
-                // Retire under the lock so no write lands in a dead queue.
-                let mut entries = lock(&hub.entries);
-                if let Ok(out) = rx.try_recv() {
-                    drop(entries);
-                    forward_one(&hub, &key, relay.as_ref(), out).await;
-                    pending.fetch_sub(1, Ordering::AcqRel);
-                    continue;
-                }
-                if let Some(entry) = entries.get_mut(&key) {
-                    entry.relay = None;
-                }
-                return;
-            }
-        };
-        forward_one(&hub, &key, relay.as_ref(), out).await;
-        pending.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-async fn forward_one(hub: &RemoteTerminals, key: &Key, relay: &dyn Relay, out: Outgoing) {
-    use base64::Engine as _;
-    let (target, terminal_id) = key;
-    let (method, params, seq) = match out {
-        Outgoing::Input { seq, bytes } => (
-            methods::WRITE_TERMINAL,
-            serde_json::json!({
-                "terminalId": terminal_id,
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                "targetDeviceId": target,
-                "clientId": &*hub.client,
-                "inputSeq": seq,
-            }),
-            Some(seq),
-        ),
-        Outgoing::Resize { cols, rows } => (
-            methods::RESIZE_TERMINAL,
-            serde_json::json!({
-                "terminalId": terminal_id,
-                "cols": cols,
-                "rows": rows,
-                "targetDeviceId": target,
-            }),
-            None,
-        ),
-    };
-    match relay.call(target, method, params).await {
-        Ok(_) => {
-            if let Some(seq) = seq {
-                hub.ack(key, seq);
-            }
-        }
-        // Unacknowledged input stays queued for the next path to replay.
-        Err(error) => tracing::debug!(%error, method, "relayed terminal write failed"),
-    }
-}
-
-enum Source {
-    Direct(Link),
-    Relay(BoxStream<'static, serde_json::Value>),
-}
-
-/// Why a source stopped delivering.
-enum Ended {
-    /// The terminal exited, the viewer went away, or the relay itself
-    /// dropped (the viewer resubscribes with its own backoff, so a relay
-    /// that keeps failing is never redialed in a tight loop).
-    Done,
-    /// The direct link died; resume on the relay at once.
-    Lost,
-    /// A direct link opened while relaying: switch to it.
-    Upgrade(Link),
-}
-
-struct Pump {
-    /// Owner tag for this subscription's direct writer.
-    id: u64,
-    hub: RemoteTerminals,
-    key: Key,
-    relay: Arc<dyn Relay>,
-    direct: Option<Arc<dyn Direct>>,
-    out: mpsc::UnboundedSender<serde_json::Value>,
-    last_seq: u64,
-    /// Carried to relay subscriptions (a direct link implies it).
-    host_replies: bool,
-}
-
-impl Pump {
-    async fn run(mut self, mut source: Source) {
-        loop {
-            let ended = match source {
-                Source::Direct(link) => self.pump_direct(link).await,
-                Source::Relay(stream) => self.pump_relay(stream).await,
-            };
-            source = match ended {
-                Ended::Done => break,
-                Ended::Upgrade(link) => Source::Direct(link),
-                Ended::Lost => {
-                    // Ending here would make the viewer resubscribe after a
-                    // pause; resuming on the relay right away keeps typing
-                    // alive through a network change.
-                    let (target, terminal_id) = &self.key;
-                    match relay_subscribe(
-                        self.relay.as_ref(),
-                        target,
-                        terminal_id,
-                        self.last_seq,
-                        self.host_replies,
-                    )
-                    .await
-                    {
-                        Ok(stream) => {
-                            self.hub.replay(&self.key, &self.relay);
-                            Source::Relay(stream)
-                        }
-                        Err(error) => {
-                            tracing::debug!(%error, "terminal relay resume failed");
-                            break;
-                        }
-                    }
-                }
-            };
-        }
-        self.hub.detach_writer(&self.key, self.id);
-    }
-
-    /// Deliver one event; `false` once the stream is over.
-    fn deliver(&mut self, event: &TerminalEvent, value: serde_json::Value) -> bool {
-        let (seq, exit) = match event {
-            TerminalEvent::Data { seq, .. } => (*seq, false),
-            TerminalEvent::Exit { seq, .. } => (*seq, true),
-        };
-        if seq <= self.last_seq {
-            return true; // already delivered over the previous path
-        }
-        self.last_seq = seq;
-        if exit {
-            self.hub.ended(&self.key.0, &self.key.1);
-        }
-        self.out.send(value).is_ok() && !exit
-    }
-
-    async fn pump_direct(&mut self, link: Link) -> Ended {
-        let Link {
-            outgoing,
-            mut events,
-            mut acks,
-        } = link;
-        self.hub.attach_writer(&self.key, self.id, outgoing);
-        let ended = loop {
-            tokio::select! {
-                event = events.recv() => {
-                    let Some(event) = event else { break Ended::Lost };
-                    let Ok(value) = serde_json::to_value(&event) else { continue };
-                    if !self.deliver(&event, value) {
-                        break Ended::Done;
-                    }
-                }
-                Some(seq) = acks.recv() => self.hub.ack(&self.key, seq),
-                _ = self.out.closed() => break Ended::Done,
-            }
-        };
-        self.hub.detach_writer(&self.key, self.id);
-        ended
-    }
-
-    async fn pump_relay(&mut self, mut stream: BoxStream<'static, serde_json::Value>) -> Ended {
-        let (target, terminal_id) = (self.key.0.clone(), self.key.1.clone());
-        let direct = self.direct.clone();
-        // Pairing runs beside the relay; a resolved direct stream is attached
-        // only between relay events, so the attach point is exact.
-        let mut upgrade: futures::future::BoxFuture<'static, BoxIo> = Box::pin(async move {
-            let Some(direct) = direct else {
-                return futures::future::pending::<BoxIo>().await;
-            };
-            let mut retry = UPGRADE_RETRY_MIN;
-            loop {
-                match direct.open(&target, &link::service_id(&terminal_id)).await {
-                    Ok(io) => return io,
-                    Err(error) => {
-                        tracing::debug!(%error, "direct terminal link unavailable; staying on the relay")
-                    }
-                }
-                tokio::time::sleep(retry).await;
-                retry = (retry * 2).min(UPGRADE_RETRY_MAX);
-            }
-        });
-        loop {
-            tokio::select! {
-                item = stream.next() => {
-                    let Some(value) = item else { return Ended::Done };
-                    let Ok(event) = serde_json::from_value::<TerminalEvent>(value.clone()) else {
-                        continue;
-                    };
-                    if !self.deliver(&event, value) {
-                        return Ended::Done;
-                    }
-                }
-                io = &mut upgrade => {
-                    match link::attach(io, self.last_seq, &self.hub.client).await {
-                        Ok(link) => return Ended::Upgrade(link),
-                        Err(error) => {
-                            tracing::debug!(%error, "direct terminal attach failed; staying on the relay");
-                            // Leave the relay in charge; no further upgrades
-                            // this session (the host refused the link).
-                            upgrade = Box::pin(futures::future::pending());
-                        }
-                    }
-                }
-                _ = self.out.closed() => return Ended::Done,
-            }
-        }
-    }
-}
+pub use zeron_term_link::remote::*;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -616,7 +10,26 @@ mod tests {
     use base64::Engine as _;
     use std::sync::atomic::AtomicBool;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zeron_term_link::remote::TerminalPath;
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use zeron_preview::mux::BoxIo;
+    use zeron_proto::TerminalEvent;
+    use zeron_rpc::{RpcError, methods};
+
     use crate::terminals::Terminals;
+    use crate::terminals::link;
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// One remote device: real PTYs behind a switchable direct path and an
     /// always-up relay, counting which path carried each write.
@@ -838,10 +251,7 @@ mod tests {
         host.set_direct(true);
         // The upgrade lands between relay events; wait until writes take it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while lock(&viewer.hub.entries)
-            .get(&("host".to_owned(), viewer.id.clone()))
-            .is_none_or(|entry| entry.direct.is_empty())
-        {
+        while !viewer.hub.direct_attached("host", &viewer.id) {
             assert!(tokio::time::Instant::now() < deadline, "never upgraded");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -869,10 +279,7 @@ mod tests {
         // Writes queue on the relay once the link is gone; the stream itself
         // carries on without the viewer resubscribing.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while lock(&viewer.hub.entries)
-            .get(&("host".to_owned(), viewer.id.clone()))
-            .is_some_and(|entry| !entry.direct.is_empty())
-        {
+        while viewer.hub.direct_attached("host", &viewer.id) {
             assert!(tokio::time::Instant::now() < deadline, "loss not noticed");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -923,5 +330,262 @@ mod tests {
                 .send(&relay, "host", &viewer.id, Write::Input(b"x".to_vec()))
                 .is_err()
         );
+    }
+
+    /// The phone's side of a real WebRTC pair: a viewer's peers that serve
+    /// nothing, whose network can be "changed" (every connection dropped).
+    struct PeerDirect {
+        peers: zeron_preview::peer::Peers,
+        changes: tokio::sync::watch::Sender<u64>,
+    }
+
+    struct Refuse;
+
+    #[async_trait]
+    impl zeron_preview::mux::Connector for Refuse {
+        async fn connect(&self, _service: &str) -> anyhow::Result<BoxIo> {
+            anyhow::bail!("viewers serve nothing")
+        }
+    }
+
+    #[async_trait]
+    impl Direct for PeerDirect {
+        async fn ready(&self, device: &str) -> bool {
+            self.peers.ready(device).await.is_some()
+        }
+        async fn open(&self, device: &str, service: &str) -> anyhow::Result<BoxIo> {
+            Ok(Box::new(self.peers.open(device, service, false).await?))
+        }
+        async fn changed(&self) {
+            let mut changes = self.changes.subscribe();
+            let _ = changes.changed().await;
+        }
+    }
+
+    /// The whole direct path for real: a terminal on a host reached over an
+    /// actual WebRTC pair (host candidates on loopback), moving onto the
+    /// direct link, back to the relay when the viewer's network changes, and
+    /// onto a fresh direct link at the next wake — every keystroke run once,
+    /// every output seq delivered once, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_terminal_rides_a_real_webrtc_pair_through_a_network_change() {
+        let host = Host::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (mut host_peers, mut host_out) = zeron_preview::peer::Peers::new(
+            "host".into(),
+            Arc::new(link::Service::new(host.terminals.clone())),
+            stop.clone(),
+        );
+        let (mut phone_peers, mut phone_out) =
+            zeron_preview::peer::Peers::new("phone".into(), Arc::new(Refuse), stop.clone());
+        host_peers.set_ice_servers(Vec::new()).unwrap();
+        phone_peers.set_ice_servers(Vec::new()).unwrap();
+        host_peers
+            .set_udp_addrs(vec!["127.0.0.1:0".into()])
+            .unwrap();
+        phone_peers
+            .set_udp_addrs(vec!["127.0.0.1:0".into()])
+            .unwrap();
+        // Signaling, in process: each side's messages reach the other.
+        let to_phone = phone_peers.clone();
+        let forward_host = tokio::spawn(async move {
+            while let Some(message) = host_out.recv().await {
+                let _ = to_phone.signal("host", message.signal).await;
+            }
+        });
+        let to_host = host_peers.clone();
+        let forward_phone = tokio::spawn(async move {
+            while let Some(message) = phone_out.recv().await {
+                let _ = to_host.signal("phone", message.signal).await;
+            }
+        });
+        let direct = Arc::new(PeerDirect {
+            peers: phone_peers.clone(),
+            changes: tokio::sync::watch::channel(0).0,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = host
+            .terminals
+            .open_with_shell(dir.path().to_str().unwrap(), 80, 24, Some("/bin/sh"))
+            .unwrap();
+        let hub = RemoteTerminals::default();
+        let relay: Arc<dyn Relay> = host.clone();
+        let (stream, mut path) = hub
+            .subscribe_tracked(
+                relay.clone(),
+                Some(direct.clone() as Arc<dyn Direct>),
+                "host",
+                &session.id,
+                0,
+                true,
+            )
+            .await
+            .unwrap();
+        let mut viewer = Viewer {
+            hub: hub.clone(),
+            host: host.clone(),
+            id: session.id.clone(),
+            stream,
+            seqs: Vec::new(),
+            text: String::new(),
+        };
+        let wait_path = |path: &mut tokio::sync::watch::Receiver<TerminalPath>,
+                         want: TerminalPath| {
+            let mut path = path.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(15), path.wait_for(|p| *p == want))
+                    .await
+                    .unwrap_or_else(|_| panic!("never reached {want:?}"))
+                    .unwrap();
+            }
+        };
+
+        // Not paired yet: the relay starts it, pairing upgrades it.
+        wait_path(&mut path, TerminalPath::Direct).await;
+        let relayed = host.relay_writes.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        viewer.type_line("echo pe''er-$((1+1))\n");
+        viewer.until("peer-2").await;
+        assert_eq!(
+            host.relay_writes.load(Ordering::SeqCst),
+            relayed,
+            "typing rides the WebRTC link"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // The phone's network changes: its connections are gone. The stream
+        // carries on over the relay, then the wake re-pairs it directly.
+        phone_peers.clear().await;
+        wait_path(&mut path, TerminalPath::Relay).await;
+        viewer.type_line("echo du''ring-$((2+2))\n");
+        viewer.until("during-4").await;
+        direct.changes.send_modify(|n| *n += 1);
+        wait_path(&mut path, TerminalPath::Direct).await;
+        viewer.type_line("echo ag''ain-$((3+3))\n");
+        viewer.until("again-6").await;
+
+        for marker in ["peer-2", "during-4", "again-6"] {
+            assert_eq!(
+                viewer.text.matches(marker).count(),
+                1,
+                "{marker} ran once: {:?}",
+                viewer.text
+            );
+        }
+        viewer.assert_contiguous();
+        stop.cancel();
+        host_peers.clear().await;
+        phone_peers.clear().await;
+        forward_host.abort();
+        forward_phone.abort();
+    }
+
+    /// Keystroke → echo through the whole hub (link framing, the host's PTY
+    /// and batcher, a real shell): direct over an actual WebRTC pair
+    /// (loopback), and over the in-process relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark"]
+    async fn bench_keystroke_echo() {
+        let host = Host::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let (mut host_peers, mut host_out) = zeron_preview::peer::Peers::new(
+            "host".into(),
+            Arc::new(link::Service::new(host.terminals.clone())),
+            stop.clone(),
+        );
+        let (mut phone_peers, mut phone_out) =
+            zeron_preview::peer::Peers::new("phone".into(), Arc::new(Refuse), stop.clone());
+        for peers in [&mut host_peers, &mut phone_peers] {
+            peers.set_ice_servers(Vec::new()).unwrap();
+            peers.set_udp_addrs(vec!["127.0.0.1:0".into()]).unwrap();
+        }
+        let to_phone = phone_peers.clone();
+        tokio::spawn(async move {
+            while let Some(m) = host_out.recv().await {
+                let _ = to_phone.signal("host", m.signal).await;
+            }
+        });
+        let to_host = host_peers.clone();
+        tokio::spawn(async move {
+            while let Some(m) = phone_out.recv().await {
+                let _ = to_host.signal("phone", m.signal).await;
+            }
+        });
+        let direct = Arc::new(PeerDirect {
+            peers: phone_peers.clone(),
+            changes: tokio::sync::watch::channel(0).0,
+        });
+        for (label, path) in [
+            ("relay", None),
+            ("direct", Some(direct.clone() as Arc<dyn Direct>)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = host
+                .terminals
+                .open_with_shell(dir.path().to_str().unwrap(), 80, 24, Some("/bin/sh"))
+                .unwrap();
+            let hub = RemoteTerminals::default();
+            let relay: Arc<dyn Relay> = host.clone();
+            let (stream, mut rx) = hub
+                .subscribe_tracked(relay.clone(), path.clone(), "host", &session.id, 0, true)
+                .await
+                .unwrap();
+            if path.is_some() {
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    rx.wait_for(|p| *p == TerminalPath::Direct),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let mut viewer = Viewer {
+                hub: hub.clone(),
+                host: host.clone(),
+                id: session.id.clone(),
+                stream,
+                seqs: Vec::new(),
+                text: String::new(),
+            };
+            viewer.type_line("echo ready\n");
+            viewer.until("ready").await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut times = Vec::new();
+            for i in 0..40 {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let before = viewer.text.matches('Q').count();
+                let t = std::time::Instant::now();
+                viewer.type_line("Q");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while viewer.text.matches('Q').count() <= before {
+                        let value = viewer.stream.next().await.unwrap();
+                        if let TerminalEvent::Data { data, .. } =
+                            serde_json::from_value(value).unwrap()
+                        {
+                            viewer.text.push_str(&String::from_utf8_lossy(
+                                &base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    data,
+                                )
+                                .unwrap(),
+                            ));
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                if i % 10 == 9 {
+                    viewer.type_line("\u{15}");
+                }
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "ECHO {label} p50={:.2} p90={:.2} min={:.2}",
+                times[20], times[36], times[0]
+            );
+        }
+        stop.cancel();
     }
 }

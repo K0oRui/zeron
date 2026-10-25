@@ -26,7 +26,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::emulator::{CursorSnapshot, Emulator};
+use crate::emulator::{CursorSnapshot, Emulator};
 
 /// Echo time above which predictions start showing…
 const SHOW_ABOVE: Duration = Duration::from_millis(30);

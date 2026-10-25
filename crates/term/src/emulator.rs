@@ -19,8 +19,7 @@
 //! - Query responses (DSR/DA/…) surface as `Event::PtyWrite` on the listener;
 //!   [`Emulator::feed`] returns them so the panel can write them back.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -176,15 +175,19 @@ pub struct CursorSnapshot {
 }
 
 /// Captures `Term` callbacks. Interior-mutable because `EventListener::send_event`
-/// takes `&self`; single-threaded (the emulator lives inside a gpui entity).
+/// takes `&self`; `Send` so an emulator can live behind a mutex shared by a
+/// network task and a UI thread (the mobile core).
 #[derive(Default, Clone)]
 struct EventCapture {
-    events: Rc<RefCell<Vec<Event>>>,
+    events: Arc<Mutex<Vec<Event>>>,
 }
 
 impl EventListener for EventCapture {
     fn send_event(&self, event: Event) {
-        self.events.borrow_mut().push(event);
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
     }
 }
 
@@ -242,7 +245,13 @@ impl Emulator {
 
     fn drain_events(&mut self) -> Vec<u8> {
         let mut responses = Vec::new();
-        for event in self.capture.events.borrow_mut().drain(..) {
+        for event in self
+            .capture
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
             match event {
                 Event::PtyWrite(text) => responses.extend_from_slice(text.as_bytes()),
                 Event::Title(title) => self.title = Some(title),
@@ -507,6 +516,56 @@ impl Emulator {
             row: row as usize,
             col: column.0,
         })
+    }
+
+    /// The selection's viewport bounds — `((row, col), (row, col))`, clamped
+    /// to what's on screen — for placing a touch edit menu beside it.
+    pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let range = self.selection_range()?;
+        let offset = self.display_offset() as i32;
+        let last = self.rows() as i32 - 1;
+        let row = |line: Line| (line.0 + offset).clamp(0, last) as usize;
+        Some((
+            (row(range.start.line), range.start.column.0),
+            (row(range.end.line), range.end.column.0),
+        ))
+    }
+
+    /// Plain text of the viewport (`all`: the whole scrollback and screen),
+    /// trailing spaces and blank edge lines dropped.
+    pub fn text(&self, all: bool) -> String {
+        let grid = self.term.grid();
+        let offset = self.display_offset() as i32;
+        let (top, bottom) = if all {
+            (-(self.history_lines() as i32), self.rows() as i32)
+        } else {
+            (-offset, self.rows() as i32 - offset)
+        };
+        let mut lines: Vec<String> = (top..bottom)
+            .map(|l| {
+                let row = &grid[Line(l)];
+                let mut s: String = (0..self.cols())
+                    .map(|c| &row[Column(c)])
+                    .filter(|cell| {
+                        !cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                    })
+                    .map(|cell| if cell.c == '\0' { ' ' } else { cell.c })
+                    .collect();
+                s.truncate(s.trim_end().len());
+                s
+            })
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        let first = lines
+            .iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(lines.len());
+        lines.drain(..first);
+        lines.join("\n")
     }
 
     /// Test/diagnostic helper: a viewport row as trimmed text (wide-char
@@ -884,6 +943,19 @@ mod tests {
         e.start_selection(SelectionType::Simple, e.grid_point(0, 2), Side::Left);
         assert_eq!(e.selection_text(), None);
         assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn text_covers_the_view_or_the_whole_scrollback() {
+        let mut e = emu(10, 3);
+        for i in 1..=6 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        e.scroll(2);
+        assert_eq!(e.text(false), "line3\nline4\nline5");
+        assert!(e.text(true).starts_with("line1\nline2"));
+        e.start_selection(SelectionType::Semantic, e.grid_point(0, 1), Side::Left);
+        assert_eq!(e.selection_bounds(), Some(((0, 0), (0, 4))));
     }
 
     #[test]
