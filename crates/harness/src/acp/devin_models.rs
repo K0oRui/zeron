@@ -2,6 +2,11 @@
 //! `models list` waits for the account catalog before writing JSON, so use it
 //! instead of racing `session/new` against `config_option_update` notifications.
 //!
+//! `models list` enumerates every model Devin sells, including rows the
+//! signed-in plan cannot run. `session/new` advertises only the plan's models
+//! (a Free account gets one), so each refresh intersects the two and falls back
+//! to the session rows when the slower catalog command does not answer in time.
+//!
 //! Since CLI 3000.11 the catalog's variant ids (`swe-2-medium`, …) are not
 //! what the ACP session selects: it advertises ONE id per group of variants
 //! and exposes effort as the `thought_level` option and fast mode as `speed`
@@ -10,15 +15,17 @@
 //! group's effort levels and a Fast option; a run selects whichever member the
 //! session advertises and then sets effort and speed.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
+use zeron_proto::{HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
 use crate::HarnessError;
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -114,6 +121,12 @@ pub(super) struct Catalog {
     latest: Mutex<Option<(Instant, Vec<Model>, Vec<Group>)>>,
 }
 
+/// How long the native catalog may enrich a plan list before the picker
+/// settles for the session's own rows. The command enumerates every model
+/// Devin sells and has been seen to take a minute on a slow link, while the
+/// session answers in a fraction of a second.
+const CATALOG_ENRICH_GRACE: Duration = Duration::from_secs(5);
+
 impl Catalog {
     pub(super) async fn refresh(
         &self,
@@ -127,40 +140,29 @@ impl Catalog {
         {
             return Ok(models.clone());
         }
-        let mut cmd = Command::new(exe);
-        cmd.args(["models", "list", "--format", "json"]);
-        crate::compose_child_path(&mut cmd, exe);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let result = tokio::time::timeout(timeout, async {
-            let (status, _, _) = tokio::try_join!(
-                child.wait(),
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err)
-            )?;
-            Ok::<_, std::io::Error>(status)
-        })
-        .await;
-        // In particular, timeout must reap the probe before its registry
-        // execution lease can be released to an installer.
-        crate::shutdown_child(&mut child, Duration::from_millis(250)).await;
-        let status = result
-            .map_err(|_| HarnessError::Protocol("Devin model discovery timed out".into()))??;
-        if !status.success() {
-            return Err(HarnessError::Protocol(format!(
-                "Devin models list failed ({}): {}",
-                status,
-                String::from_utf8_lossy(&err).trim()
-            )));
-        }
-        let (models, groups) = parse_catalog(&out)?;
+        // The session lists what the signed-in plan can actually run (a Free
+        // account gets one row), so it decides the picker even when the
+        // catalog command is slow or unavailable.
+        let plan = session_models(exe, timeout)
+            .await
+            .ok()
+            .filter(|models| !models.is_empty());
+        let budget = if plan.is_some() {
+            timeout.min(CATALOG_ENRICH_GRACE)
+        } else {
+            timeout
+        };
+        let (models, groups) = match (fetch_catalog(exe, budget).await, plan) {
+            (Ok((models, groups)), Some(plan)) => {
+                let allowed: Vec<String> = plan.iter().map(|model| model.id.clone()).collect();
+                // Nothing in the catalog matched the plan's ids: show the
+                // plan's own rows instead of paid ones.
+                plan_models(&models, &groups, &allowed).unwrap_or((plan, Vec::new()))
+            }
+            (Ok(catalog), None) => catalog,
+            (Err(_), Some(plan)) => (plan, Vec::new()),
+            (Err(error), None) => return Err(error),
+        };
         *latest = Some((Instant::now(), models.clone(), groups));
         Ok(models)
     }
@@ -211,6 +213,140 @@ impl Catalog {
             })
         })
     }
+}
+
+/// The models the signed-in account's plan may actually select. The catalog
+/// command lists every model Devin sells (a Free account still sees the paid
+/// rows), while `session/new` advertises only what the plan can run — for a
+/// Free account, one model. The session is therefore the availability oracle,
+/// and it answers in well under a second.
+///
+/// The probe runs on each catalog refresh rather than caching a plan across
+/// login changes.
+async fn session_models(exe: &Path, timeout: Duration) -> Result<Vec<Model>, HarnessError> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("acp");
+    crate::compose_child_path(&mut cmd, exe);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        crate::shutdown_child(&mut child, Duration::from_millis(250)).await;
+        return Err(HarnessError::Protocol(
+            "Devin availability probe has no stdio".into(),
+        ));
+    };
+    let (client, incoming) = RpcClient::new(stdin, stdout);
+    let drain = tokio::spawn(super::drain_discovery_incoming(client.clone(), incoming));
+    let probe = async {
+        client
+            .request("initialize", super::initialize_params(HarnessId::Devin))
+            .await?;
+        let session = client
+            .request(
+                "session/new",
+                json!({ "cwd": crate::executable::home_or_current_dir(), "mcpServers": [] }),
+            )
+            .await?;
+        let models = super::models_from_session(&session, &[]);
+        // Best effort: a probe session should not linger in the CLI's history.
+        if let Some(session_id) = session.get("sessionId").and_then(serde_json::Value::as_str) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.request("session/delete", json!({ "sessionId": session_id })),
+            )
+            .await;
+        }
+        Ok::<_, HarnessError>(models)
+    };
+    let result = tokio::time::timeout(timeout, probe).await;
+    drain.abort();
+    client.close_stdin_for_teardown();
+    crate::shutdown_child(&mut child, Duration::from_millis(250)).await;
+    result.map_err(|_| HarnessError::Protocol("Devin availability probe timed out".into()))?
+}
+
+/// `devin models list`: the whole family/variant catalog with labels, costs
+/// and effort variants. It hits the network, so callers bound it.
+async fn fetch_catalog(
+    exe: &Path,
+    timeout: Duration,
+) -> Result<(Vec<Model>, Vec<Group>), HarnessError> {
+    let mut cmd = Command::new(exe);
+    cmd.args(["models", "list", "--format", "json"]);
+    crate::compose_child_path(&mut cmd, exe);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = tokio::time::timeout(timeout, async {
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err)
+        )?;
+        Ok::<_, std::io::Error>(status)
+    })
+    .await;
+    // In particular, timeout must reap the probe before its registry
+    // execution lease can be released to an installer.
+    crate::shutdown_child(&mut child, Duration::from_millis(250)).await;
+    let status =
+        result.map_err(|_| HarnessError::Protocol("Devin model discovery timed out".into()))??;
+    if !status.success() {
+        return Err(HarnessError::Protocol(format!(
+            "Devin models list failed ({}): {}",
+            status,
+            String::from_utf8_lossy(&err).trim()
+        )));
+    }
+    parse_catalog(&out)
+}
+
+/// Drop the catalog rows the plan cannot run. Picker rows and run-time groups
+/// shrink together, so a saved id that the plan dropped no longer resolves to
+/// a group. `None` when nothing matched.
+fn plan_models(
+    models: &[Model],
+    groups: &[Group],
+    allowed: &[String],
+) -> Option<(Vec<Model>, Vec<Group>)> {
+    let allowed: HashSet<String> = allowed.iter().map(|id| super::norm_id(id)).collect();
+    let kept_groups: Vec<Group> = groups
+        .iter()
+        .filter(|group| {
+            group
+                .members
+                .iter()
+                .any(|member| allowed.contains(&super::norm_id(&member.id)))
+        })
+        .cloned()
+        .collect();
+    let members: HashSet<String> = kept_groups
+        .iter()
+        .flat_map(|group| group.members.iter())
+        .map(|member| super::norm_id(&member.id))
+        .collect();
+    let has_pair = kept_groups.iter().any(|group| group.pair.is_some());
+    let kept_models: Vec<Model> = models
+        .iter()
+        .filter(|model| {
+            if model.id == FUSION {
+                has_pair
+            } else {
+                members.contains(&super::norm_id(&model.id))
+            }
+        })
+        .cloned()
+        .collect();
+    (!kept_models.is_empty() && !kept_groups.is_empty()).then_some((kept_models, kept_groups))
 }
 
 #[derive(Deserialize)]
@@ -713,6 +849,43 @@ mod tests {
                 .selection(exe, Duration::from_secs(1), "unknown", &Default::default())
                 .await
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn plan_filter_keeps_only_models_the_account_can_run() {
+        let (models, groups) = parse_catalog(LIVE_SHAPES.as_bytes()).unwrap();
+        let (models, groups) = plan_models(&models, &groups, &["gpt-6-sol-none".into()]).unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-6-sol-medium"]
+        );
+        // The whole effort group survives, so effort still selects a member.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 3);
+    }
+
+    #[test]
+    fn plan_filter_keeps_fusion_when_one_pair_is_offered() {
+        let (models, groups) = parse_catalog(LIVE_SHAPES.as_bytes()).unwrap();
+        let (models, _) = plan_models(
+            &models,
+            &groups,
+            &["fusion-gpt-6-sol-high-sidekick-gpt-6-luna-high".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [FUSION]
+        );
+    }
+
+    #[test]
+    fn an_unmatched_plan_filter_reports_nothing() {
+        let (models, groups) = parse_catalog(LIVE_SHAPES.as_bytes()).unwrap();
+        assert!(
+            plan_models(&models, &groups, &["swe-1-6-slow".into()]).is_none(),
+            "a plan model the catalog does not know must not keep paid rows"
         );
     }
 

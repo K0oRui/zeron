@@ -204,9 +204,9 @@ fn typed_call(update: &Value) -> ToolCall {
                     }
                 } else {
                     ToolCall::EditFile {
-                        path: diff.path,
-                        old_string: None,
-                        new_string: None,
+                        path: diff.path.clone(),
+                        old_string: diff.old_text.clone(),
+                        new_string: Some(diff.new_text.clone()),
                     }
                 }
             } else {
@@ -261,9 +261,9 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             } else {
                 ToolCall::EditFile {
-                    path: diff.path,
-                    old_string: None,
-                    new_string: None,
+                    path: diff.path.clone(),
+                    old_string: diff.old_text.clone(),
+                    new_string: Some(diff.new_text.clone()),
                 }
             }
         }
@@ -587,8 +587,8 @@ mod tests {
                 id: "t2".into(),
                 call: ToolCall::EditFile {
                     path: "/w/src/main.rs".into(),
-                    old_string: None,
-                    new_string: None,
+                    old_string: Some("fn old() {}".into()),
+                    new_string: Some("fn new() {}".into()),
                 },
             }
         );

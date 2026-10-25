@@ -20,12 +20,13 @@ struct Saved {
 
 fn location(root: &Path, harness: &dyn Harness, context: &ModelContext) -> PathBuf {
     let id = serde_json::to_value(harness.id()).unwrap();
-    // Kilo now persists only free gateway rows. The new name keeps the
-    // previous unfiltered catalog from being served once during an upgrade.
-    let name = if harness.id() == zeron_proto::HarnessId::Kilo {
-        format!("free-{}.json", context.hash)
-    } else {
-        format!("{}.json", context.hash)
+    // Kilo persists only free gateway rows; Devin persists only the rows its
+    // signed-in plan can run. The new names keep a previous unfiltered catalog
+    // from being served once during an upgrade.
+    let name = match harness.id() {
+        zeron_proto::HarnessId::Kilo => format!("free-{}.json", context.hash),
+        zeron_proto::HarnessId::Devin => format!("plan-{}.json", context.hash),
+        _ => format!("{}.json", context.hash),
     };
     root.join("model-catalogs")
         .join(id.as_str().unwrap())
@@ -176,7 +177,13 @@ async fn list_inner(
         Some(Ok(Ok(catalog))) if !catalog.models.is_empty() => catalog,
         Some(Ok(Err(error))) if !CatalogFailure::classify(&error).allows_stale() => {
             // Claude intentionally offers its manifest even while logged out.
-            if harness.id() == zeron_proto::HarnessId::ClaudeCode
+            // OpenCode also needs fallback models when not signed in.
+            let is_fallback_eligible = matches!(
+                harness.id(),
+                zeron_proto::HarnessId::ClaudeCode
+                    | zeron_proto::HarnessId::Opencode
+            );
+            if is_fallback_eligible
                 && CatalogFailure::classify(&error) == CatalogFailureCode::AuthRequired
             {
                 ModelCatalog {
