@@ -1475,14 +1475,10 @@ mod pinned_session_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
-        let mut chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
-            "id": "chat-a",
-            "title": "Fix the sidebar\nrender",
-            "deviceId": "laptop",
-            "archived": false,
-            "createdAt": "2026-09-20T00:00:00Z",
-        }))
-        .unwrap();
+        let mut chat = pin_test_chat("chat-a");
+        chat.device_id = "laptop".into();
+        // The row normalizes the title at draw time, so the model keeps it raw.
+        chat.title = Some("Fix the sidebar\nrender".into());
         chat.last_message_at = Some(chat.created_at + chrono::Duration::minutes(5));
         chat.source_context = Some(zeron_proto::ConversationSourceContext {
             checkout_id: "co".into(),
@@ -5835,7 +5831,7 @@ impl Shell {
     /// sorting the whole chat list per render.
     /// `chats_sorted` must already be in [`compare_sidebar_chats`] order.
     fn order_sidebar_ids(
-        chats_sorted: &[(ChatIndicator, zeron_proto::Chat)],
+        chats_sorted: &[(ChatIndicator, &zeron_proto::Chat)],
         pinned_order: &[String],
         custom_sections: &[zeron_proto::SidebarSection],
         organization: SidebarOrganization,
@@ -5843,9 +5839,11 @@ impl Shell {
         pinned_open: bool,
         state: &AppState,
     ) -> Vec<String> {
-        let (pinned_chats, chats): (Vec<&(_, _)>, Vec<&(_, _)>) = chats_sorted
-            .iter()
-            .partition(|(_, chat)| pinned_order.contains(&chat.id));
+        let (pinned_chats, chats): (Vec<&zeron_proto::Chat>, Vec<&zeron_proto::Chat>) =
+            chats_sorted
+                .iter()
+                .map(|(_, chat)| *chat)
+                .partition(|chat| pinned_order.contains(&chat.id));
         // Section order wins: custom sections list their sessions manually,
         // so follow the section's own order, not recency. A project placed in
         // a section claims its sessions there, ahead of the loose rows.
@@ -5875,7 +5873,7 @@ impl Shell {
                     .collect();
                 chats
                     .iter()
-                    .filter_map(|(_, chat)| {
+                    .filter_map(|chat| {
                         let key = space_keys.get(chat.space_id.as_deref()?)?;
                         Some((chat.id.as_str(), key.clone()))
                     })
@@ -5910,10 +5908,7 @@ impl Shell {
             })
         }
         let mut custom_order = Vec::new();
-        let listed: HashSet<&str> = chats
-            .iter()
-            .map(|(_, chat)| chat.id.as_str())
-            .collect();
+        let listed: HashSet<&str> = chats.iter().map(|chat| chat.id.as_str()).collect();
         let mut placed: HashSet<&str> = HashSet::new();
         if claims_chats {
             for section in custom_sections {
@@ -5921,7 +5916,7 @@ impl Shell {
                     continue;
                 }
                 for key in &section.project_keys {
-                    for (_, chat) in chats.iter().copied() {
+                    for chat in chats.iter().copied() {
                         let belongs =
                             section_of(chat, &explicit_owner, &project_owner, &project_keys)
                                 .is_some_and(|owner| owner.id == section.id)
@@ -5943,10 +5938,10 @@ impl Shell {
                 }
             }
         }
-        let chats: Vec<&(_, _)> = if claims_chats {
+        let chats: Vec<&zeron_proto::Chat> = if claims_chats {
             chats
                 .into_iter()
-                .filter(|(_, chat)| {
+                .filter(|chat| {
                     section_of(chat, &explicit_owner, &project_owner, &project_keys).is_none()
                 })
                 .collect()
@@ -5955,7 +5950,7 @@ impl Shell {
         };
         let ordered = if organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<&zeron_proto::Chat>)> = Vec::new();
-            for (_, chat) in chats {
+            for chat in chats {
                 let key = Some((
                     if organization == SidebarOrganization::ByProject {
                         project_keys
@@ -5985,14 +5980,11 @@ impl Shell {
                 .map(|chat| chat.id.clone())
                 .collect::<Vec<_>>()
         } else {
-            chats
-                .into_iter()
-                .map(|(_, chat)| chat.id.clone())
-                .collect()
+            chats.into_iter().map(|chat| chat.id.clone()).collect()
         };
         let ordered = pinned_chats
             .into_iter()
-            .map(|(_, chat)| chat.id.clone())
+            .map(|chat| chat.id.clone())
             .chain(custom_order.iter().cloned())
             .chain(ordered)
             .collect::<Vec<_>>();
@@ -6027,14 +6019,15 @@ impl Shell {
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let custom_sections = self.active_sidebar_sections(cx);
         let state = self.state.read(cx);
-        let mut chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
-            .into_iter()
-            .map(|(status, chat)| (status, chat.clone()))
-            .collect();
-        chats_sorted.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-        });
+        // Borrowed: ordering only reads ids and metadata, so cycling and the
+        // hover card do not clone every session to sort them.
+        let mut chats_sorted: Vec<(ChatIndicator, &zeron_proto::Chat)> =
+            state.sidebar_chats(Utc::now(), filter.as_deref());
+        if self.settings.sidebar_sort != SidebarSort::LastUpdated {
+            chats_sorted.sort_by(|left, right| {
+                compare_sidebar_chats(self.settings.sidebar_sort, left.1, right.1)
+            });
+        }
         Self::order_sidebar_ids(
             &chats_sorted,
             pinned_order,
@@ -6885,7 +6878,7 @@ impl Shell {
                             })
                             .into_any_element()
                     } else {
-                        self.render_sidebar_gap_row(element, &chat.id, &drag_group, group_index)
+                        self.render_sidebar_gap_row(element, &id, &drag_group, group_index)
                     }
                 };
                 // The hit region stays at the natural slot while its content slides;
@@ -6913,9 +6906,9 @@ impl Shell {
                             }
                         }
                     })
-                    .id(SharedString::from(format!("session-slot-{}", chat.id)))
+                    .id(SharedString::from(format!("session-slot-{}", id)))
                     .debug_selector({
-                        let id = chat.id.clone();
+                        let id = id.clone();
                         move || format!("session-slot-{id}")
                     })
                     .h(px(slot_height.max(0.0)))
@@ -6956,7 +6949,7 @@ impl Shell {
                         },
                     ))
                     .into_any_element();
-                let keyed_row = (format!("c:{}", chat.id), slot_height, element);
+                let keyed_row = (format!("c:{id}"), slot_height, element);
                 if in_project_block {
                     let project_key = row_project.clone().unwrap_or_default();
                     match project_rows
@@ -6965,7 +6958,7 @@ impl Shell {
                     {
                         Some((_, _, rows)) => rows.push(keyed_row),
                         None => {
-                            project_rows.push((project_key, Some(chat.id.clone()), vec![keyed_row]))
+                            project_rows.push((project_key, Some(id.clone()), vec![keyed_row]))
                         }
                     }
                 } else {
