@@ -1120,7 +1120,15 @@ fn sidebar_marquee_label(
     label: impl IntoElement,
 ) -> impl IntoElement {
     let mut map = rows.borrow_mut();
-    let row = map.entry(chat_id.to_owned()).or_default();
+    // The map tracks exactly the rows on screen, so the key is nearly always
+    // present: probe before inserting instead of allocating a String key per
+    // row on every paint.
+    if !map.contains_key(chat_id) {
+        map.insert(chat_id.to_owned(), TitleMarqueeRow::default());
+    }
+    let row = map
+        .get_mut(chat_id)
+        .expect("a marquee row is present after the probe above");
     let scroll = row.scroll.clone();
     let content = div().flex_none().whitespace_nowrap().child(label);
     let track = div()
@@ -2132,6 +2140,20 @@ impl Render for SidebarPane {
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
         };
+        // A collapsed (or width-fitted-away) column paints nothing, so the
+        // session list is not built at all — every ancestor notification used
+        // to rebuild the whole row model behind a zero-width clip. The resort
+        // baselines are dropped with it so a glide never replays on return.
+        let column_width = shell.read(cx).sidebar_now();
+        if column_width <= 0.5 {
+            shell.update(cx, |shell, cx| {
+                shell.dismiss_session_card(cx);
+                shell.sidebar_prev_order.clear();
+                shell.sidebar_resort.clear();
+                shell.sidebar_new_keys.clear();
+            });
+            return div().into_any_element();
+        }
         let inner = shell.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
             shell.render_chat_sidebar(&theme, cx)
@@ -9067,13 +9089,6 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        let pr_device = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let pr_surface = if search_query.is_some() {
             crate::change_requests::ChangeRequestBadgeSurface::Sidebar
@@ -9081,6 +9096,9 @@ impl Shell {
             crate::change_requests::ChangeRequestBadgeSurface::SessionRow
         };
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
+        // The device the row belongs to. One lookup, shared by the remote glyph
+        // and the change-request badge — this used to scan the whole chat table
+        // twice for the same value on every row, every paint.
         let host = self
             .state
             .read(cx)
@@ -9088,6 +9106,7 @@ impl Shell {
             .iter()
             .find(|chat| chat.id == id)
             .map(|chat| chat.device_id.clone());
+        let pr_device = host.clone();
         let remote = host
             .as_deref()
             .is_some_and(|host| self.state.read(cx).local_device_id.as_deref() != Some(host));

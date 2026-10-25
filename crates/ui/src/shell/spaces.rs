@@ -1445,6 +1445,26 @@ mod pinned_session_tests {
         );
     }
 
+    /// The sidebar orders its rows with a stable sort on a computed pin key
+    /// instead of rebuilding an ordered id vector per paint; that key must
+    /// reproduce [`project_pinned_first`] exactly.
+    #[test]
+    fn stable_pin_key_matches_pinned_first_order() {
+        let recency = ids(&["newest", "p2", "middle", "p1", "oldest"]);
+        let pinned = ids(&["p1", "p2"]);
+        let mut pin_rank: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(pinned.len());
+        for (index, id) in pinned.iter().enumerate() {
+            pin_rank.entry(id.as_str()).or_insert(index);
+        }
+        let mut rows = recency.clone();
+        rows.sort_by_key(|id| match pin_rank.get(id.as_str()) {
+            Some(index) => (0u8, *index),
+            None => (1u8, 0usize),
+        });
+        assert_eq!(rows, project_pinned_first(&recency, &pinned));
+    }
+
     #[gpui::test]
     fn active_sessions_virtualize_rows_outside_the_viewport(cx: &mut gpui::TestAppContext) {
         use super::*;
@@ -6159,11 +6179,17 @@ impl Shell {
         status: ChatIndicator,
         chat: zeron_proto::Chat,
         state: &AppState,
-        project_by_chat: Option<&std::collections::HashMap<String, (String, String)>>,
+        project_by_space: Option<&std::collections::HashMap<String, (String, String)>>,
     ) -> ActiveChatRow {
+        // The chat's space entry, one hash lookup by space id — the row model
+        // used to hold a key and label cloned from every chat.
+        let space_entry = chat
+            .space_id
+            .as_deref()
+            .and_then(|id| project_by_space.and_then(|m| m.get(id)));
         // Line 1 is "project @ device" (t3code's project row); project-less
         // sessions name only their device — no project, no folder.
-        let project = match project_by_chat.and_then(|m| m.get(&chat.id)) {
+        let project = match space_entry {
             Some((_key, label)) => Some(label.clone()),
             None => {
                 let space = state.space_for_chat(&chat);
@@ -6186,21 +6212,29 @@ impl Shell {
             (None, false) => String::new(),
         };
         // The branch shows whenever the engine has stamped one —
-        // main-checkout sessions included, not just worktrees.
-        let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(str::to_string)
-            .filter(|_| self.settings.sidebar_show_branch);
-        let change_request = state
-            .change_request_for_chat(&chat)
-            .cloned()
-            .filter(|_| self.settings.sidebar_show_pull_request);
+        // main-checkout sessions included, not just worktrees. Hidden metadata
+        // is skipped before it is copied: the settings gate used to sit after
+        // the allocation, so a hidden branch or badge was still built for every
+        // chat on every paint.
+        let branch = self
+            .settings
+            .sidebar_show_branch
+            .then(|| {
+                crate::change_requests::conversation_branch(&chat, &state.spaces)
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+            })
+            .flatten();
+        let change_request = self
+            .settings
+            .sidebar_show_pull_request
+            .then(|| state.change_request_for_chat(&chat).cloned())
+            .flatten();
         let group = match self.settings.sidebar_organization {
             SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
             SidebarOrganization::ByProject => {
-                let key = project_by_chat
-                    .and_then(|m| m.get(&chat.id))
+                let key = space_entry
                     .map(|(key, _)| key.clone())
                     .unwrap_or_else(|| {
                         state
@@ -6282,20 +6316,21 @@ impl Shell {
         };
         let local_device_id = self.state.read(cx).local_device_id.clone();
         let state = self.state.read(cx);
-        // Build chat -> (project_key, label) once so every row avoids a
-        // per-chat linear scan of spaces (space_for_chat + representative_space).
-        let space_by_id: std::collections::HashMap<&str, &zeron_proto::Space> = state
+        // Build space -> (project_key, label) once. Each row looks its label up
+        // by the chat's space id, so the model no longer clones a key and a
+        // label per chat — there are far fewer spaces than chats — and no row
+        // pays for a `space_for_chat` linear scan.
+        let project_by_space: std::collections::HashMap<String, (String, String)> = state
             .spaces
             .iter()
-            .map(|space| (space.id.as_str(), space))
-            .collect();
-        let project_by_chat: std::collections::HashMap<String, (String, String)> = state
-            .chats
-            .iter()
-            .filter_map(|chat| {
-                let space = chat.space_id.as_deref().and_then(|id| space_by_id.get(id).copied())?;
-                let key = zeron_proto::view::project_key(space);
-                Some((chat.id.clone(), (key, space.display_name().to_string())))
+            .map(|space| {
+                (
+                    space.id.clone(),
+                    (
+                        zeron_proto::view::project_key(space),
+                        space.display_name().to_string(),
+                    ),
+                )
             })
             .collect();
         let mut chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = state
@@ -6303,13 +6338,17 @@ impl Shell {
             .into_iter()
             .map(|(status, chat)| (status, chat.clone()))
             .collect();
-        chats_sorted.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-        });
-        // Jump chips read the same order the rows draw, built from the same
-        // fetch — one clone and sort per render, not one per list plus one
-        // for the slots.
-        let visible_slots: std::collections::HashMap<_, _> = {
+        // `sidebar_chats` already returns recency order with the id tiebreak —
+        // exactly the LastUpdated order — so only the other sort needs a pass.
+        if self.settings.sidebar_sort != SidebarSort::LastUpdated {
+            chats_sorted.sort_by(|left, right| {
+                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+            });
+        }
+        // Jump chips read the same order the rows draw. Only the hint overlay
+        // reads this table, so it is built while the modifier is held: the
+        // ordering pass allocates per chat and used to run on every paint.
+        let visible_slots: std::collections::HashMap<String, usize> = if self.jump_hints {
             let state = self.state.read(cx);
             Self::order_sidebar_ids(
                 &chats_sorted,
@@ -6324,13 +6363,15 @@ impl Shell {
             .enumerate()
             .map(|(index, id)| (id, index))
             .collect()
+        } else {
+            std::collections::HashMap::new()
         };
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             chats_sorted
                 .into_iter()
                 .map(|(status, chat)| {
-                    self.sidebar_chat_data(status, chat, &state, Some(&project_by_chat))
+                    self.sidebar_chat_data(status, chat, &state, Some(&project_by_space))
                 })
                 .collect()
         };
@@ -6340,27 +6381,27 @@ impl Shell {
         self.title_marquee
             .borrow_mut()
             .retain(|id, _| visible.contains(id.as_str()));
-        let base_ids: Vec<String> = rows.iter().map(|row| row.chat.id.clone()).collect();
-        let ordered_ids = project_pinned_first(&base_ids, pinned_order);
-        let rank: std::collections::HashMap<&str, usize> = ordered_ids
-            .iter()
-            .enumerate()
-            .map(|(ix, id)| (id.as_str(), ix))
-            .collect();
-        rows.sort_by_key(|row| {
-            rank.get(row.chat.id.as_str())
-                .copied()
-                .unwrap_or(usize::MAX)
+        // The list's size, kept for the section counts below (the row list is
+        // split into pinned/regular/custom further down).
+        let total_rows = rows.len();
+        // Pins lead, in the user's own order; every other row keeps the recency
+        // order it arrived in. Sorting on a computed key avoids the id vector
+        // clones, the second ordering pass and the rank table this used to
+        // build over the whole list on every paint.
+        let mut pin_rank: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(pinned_order.len());
+        for (ix, id) in pinned_order.iter().enumerate() {
+            pin_rank.entry(id.as_str()).or_insert(ix);
+        }
+        rows.sort_by_key(|row| match pin_rank.get(row.chat.id.as_str()) {
+            Some(ix) => (0u8, *ix),
+            None => (1u8, 0usize),
         });
-        let active: HashSet<&str> = base_ids.iter().map(String::as_str).collect();
+        let active: HashSet<&str> = rows.iter().map(|row| row.chat.id.as_str()).collect();
         self.sidebar_row_extents
             .borrow_mut()
             .retain(|id, _| active.contains(id.as_str()));
-        let pinned_count = pinned_order
-            .iter()
-            .filter(|id| active.contains(id.as_str()))
-            .collect::<HashSet<_>>()
-            .len();
+        let pinned_count = pin_rank.keys().filter(|id| active.contains(*id)).count();
         let regular_rows = rows.split_off(pinned_count);
         let pinned_rows = rows;
         self.sidebar_pinned_heights = pinned_rows
@@ -6401,11 +6442,17 @@ impl Shell {
             })
             .collect();
         let mut regular_groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
+        // Chat -> explicit section, resolved once: the old form rescanned every
+        // section's session list for every row on every paint.
+        let mut section_of_session: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (index, section) in custom_sections.iter().enumerate() {
+            for id in &section.session_ids {
+                section_of_session.entry(id.as_str()).or_insert(index);
+            }
+        }
         for row in regular_rows {
-            if let Some(index) = custom_sections
-                .iter()
-                .position(|section| section.session_ids.contains(&row.chat.id))
-            {
+            if let Some(index) = section_of_session.get(row.chat.id.as_str()).copied() {
                 custom_groups[index].1.push(row);
                 continue;
             }
@@ -6647,16 +6694,10 @@ impl Shell {
                 } else {
                     None
                 };
-                let drag = (self.settings.sidebar_pinned_open || slot >= pinned_count)
-                    .then(|| {
-                        profile_key.as_ref().map(|profile_key| SidebarSessionDrag {
-                            chat_id: chat.id.clone(),
-                            visible_ids: visible_pinned_ids.clone(),
-                            filter: filter.clone(),
-                            profile_key: profile_key.clone(),
-                        })
-                    })
-                    .flatten();
+                // Only a drawn row needs a drag payload; building it for every
+                // row allocated the chat id, filter and profile key per chat,
+                // per paint, off-screen rows included.
+                let drag_enabled = self.settings.sidebar_pinned_open || slot >= pinned_count;
                 slot += 1;
                 let origin = self
                     .sidebar_session_transfer
@@ -6712,12 +6753,20 @@ impl Shell {
                         .flex_none()
                         .into_any_element()
                 } else {
+                    let drag = drag_enabled
+                        .then(|| {
+                            profile_key.as_ref().map(|profile_key| SidebarSessionDrag {
+                                chat_id: chat.id.clone(),
+                                visible_ids: visible_pinned_ids.clone(),
+                                filter: filter.clone(),
+                                profile_key: profile_key.clone(),
+                            })
+                        })
+                        .flatten();
                     let element = self.render_chat_row(
                         chat.id.clone(),
-                        transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )
-                        .into(),
+                        transcript::single_line(chat.title.as_deref().unwrap_or("New session"))
+                            .into(),
                         time_ago,
                         folder.into(),
                         branch.map(SharedString::from),
@@ -7076,9 +7125,7 @@ impl Shell {
         }
         SidebarSessionRows {
             custom_count,
-            regular_count: base_ids
-                .len()
-                .saturating_sub(pinned_count + custom_sessions),
+            regular_count: total_rows.saturating_sub(pinned_count + custom_sessions),
             rows: rendered,
             pinned_count,
             moving_row,

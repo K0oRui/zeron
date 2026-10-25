@@ -2907,12 +2907,16 @@ impl AppState {
         for session in &self.sessions {
             sessions.entry(session.chat_id.as_str()).or_insert(session);
         }
+        // Space ids in one set: `space_row` is a linear scan of the space table
+        // and this walk runs over every chat on every sidebar paint.
+        let live_spaces: std::collections::HashSet<&str> =
+            self.spaces.iter().map(|space| space.id.as_str()).collect();
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
             .filter(|c| match c.space_id.as_deref() {
                 // Project-less sessions are first-class rows.
                 None => true,
-                Some(id) => self.space_row(id).is_some(),
+                Some(id) => live_spaces.contains(id),
             })
             .map(|c| {
                 let status = if self.send_pending(&c.id, now) {
@@ -2949,21 +2953,28 @@ impl AppState {
     /// matches. A filter naming a space not synced here matches its own id.
     pub fn project_filter<'a>(&'a self, filter: Option<&str>) -> impl Fn(&Chat) -> bool + 'a {
         let filter = filter.map(|id| {
-            (
-                id.to_owned(),
-                self.space_row(id).map(zeron_proto::view::project_key),
-            )
+            let key = self.space_row(id).map(zeron_proto::view::project_key);
+            // Repository key per space, resolved once: the sidebar asks this of
+            // every chat in every paint, and `space_row` is a linear scan.
+            let keys: std::collections::HashMap<&str, String> = key
+                .as_ref()
+                .map(|_| {
+                    self.spaces
+                        .iter()
+                        .map(|space| (space.id.as_str(), zeron_proto::view::project_key(space)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (id.to_owned(), key, keys)
         });
         move |chat| {
-            let Some((id, key)) = &filter else {
+            let Some((id, key, keys)) = &filter else {
                 return true;
             };
             match chat.space_id.as_deref() {
-                Some(space_id) if space_id == id => true,
-                Some(space_id) => key.as_ref().is_some_and(|key| {
-                    self.space_row(space_id)
-                        .is_some_and(|space| zeron_proto::view::project_key(space) == *key)
-                }),
+                Some(space_id) => {
+                    space_id == id || (key.is_some() && keys.get(space_id) == key.as_ref())
+                }
                 None => false,
             }
         }
