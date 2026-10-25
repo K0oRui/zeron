@@ -1107,9 +1107,13 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
+                // The row takes its host device by reference, which would hold
+                // the `AppState` read above across the `&mut cx` call. The
+                // palette draws a handful of rows, not the sidebar's list.
+                let device_id = chat.device_id.clone();
                 self.render_chat_row(
                     id.clone(),
-                    Some(chat.device_id.as_str()),
+                    Some(device_id.as_str()),
                     transcript::single_line(chat.title.as_deref().unwrap_or("New session")).into(),
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), Utc::now())
                         .into(),
