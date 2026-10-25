@@ -19,11 +19,18 @@ const MISE_WRAPPER_MAX_BYTES: u64 = 16 * 1024;
 
 /// The npm package an agent CLI ships as, when it ships as one. OpenCode's
 /// package follows the installed generation (see `opencode_release_package`).
+///
+/// Every CLI whose self-updater merely shells out to a package manager must
+/// be here: the owner routes the update to the RIGHT npm/pnpm/volta prefix,
+/// where the self-updater (Kilo's `kilo upgrade` included) re-detects the
+/// method itself and, when it can't, asks interactively — a silent no-op
+/// under zeron's headless `stdin: null` runner.
 pub(super) fn npm_package(harness: HarnessId, installed: Option<&str>) -> Option<&'static str> {
     match harness {
         HarnessId::ClaudeCode => Some("@anthropic-ai/claude-code"),
         HarnessId::Codex => Some("@openai/codex"),
         HarnessId::Pi => Some("@earendil-works/pi-coding-agent"),
+        HarnessId::Kilo => Some("@kilocode/cli"),
         HarnessId::Opencode => Some(super::opencode_release_package(installed.unwrap_or(""))),
         _ => None,
     }
@@ -388,6 +395,41 @@ mod tests {
         // A vendor's native install isn't package-managed.
         assert_eq!(owner("/home/u/.local/bin/claude"), None);
         assert_eq!(owner("/usr/local/bin/codex"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kilo_npm_installs_update_through_their_owner_never_kilo_upgrade() {
+        const KILO: &str = "@kilocode/cli";
+        // The mapping `update_plan` needs to route an npm-installed `kilo` to
+        // its owning package manager. Without it the plan fell through to
+        // `kilo upgrade`, whose method detection re-resolves the manager from
+        // PATH (mixing Node prefixes) and asks INTERACTIVELY when it can't —
+        // a hidden no-op under the headless update runner.
+        assert_eq!(npm_package(HarnessId::Kilo, None), Some(KILO));
+        let owner = |path: &str| package_owner(Path::new(path), KILO);
+        assert_eq!(
+            owner("/opt/homebrew/lib/node_modules/@kilocode/cli/bin/kilo"),
+            Some(PackageOwner::Npm {
+                prefix: "/opt/homebrew".into()
+            })
+        );
+        assert_eq!(
+            owner(
+                "/home/u/.nvm/versions/node/v24.1.0/lib/node_modules/@kilocode/cli/bin/kilo"
+            ),
+            Some(PackageOwner::Npm {
+                prefix: "/home/u/.nvm/versions/node/v24.1.0".into()
+            })
+        );
+        assert_eq!(owner("/home/u/.bun/bin/kilo"), Some(PackageOwner::Bun));
+        assert_eq!(
+            owner("/work/app/node_modules/.bin/kilo"),
+            Some(PackageOwner::Project)
+        );
+        // The curl installer's location is vendor-native: `kilo upgrade` is
+        // right there (it detects "curl" and self-updates non-interactively).
+        assert_eq!(owner("/home/u/.kilo/bin/kilo"), None);
     }
 
     #[cfg(unix)]

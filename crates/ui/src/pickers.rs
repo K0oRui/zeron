@@ -6423,17 +6423,11 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
 }
 
 /// Kilo advertises its whole gateway catalog, including rows that need
-/// credits. Same rule as the harness's discovery-side filter, repeated here so
-/// a catalog from an older engine still opens on the free rows only.
+/// credits. The rule is shared ([`zeron_proto::kilo`]) with the harness's
+/// discovery-side filter and the relay client, applied here so a catalog from
+/// an older engine still opens on the free rows only.
 fn kilo_model_is_free(model: &Model) -> bool {
-    let id = model.id.to_ascii_lowercase();
-    let label = model.label.to_ascii_lowercase();
-    id.ends_with(":free")
-        || id.ends_with("-free")
-        || id.ends_with("/free")
-        || label.ends_with(" (free)")
-        || label.ends_with("auto free")
-        || label.ends_with("free models router")
+    zeron_proto::kilo::gateway_model_is_free(&model.id, &model.label)
 }
 
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
@@ -6451,9 +6445,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
     // if the rule matches nothing (a renamed free tier), show the list as-is
     // rather than an empty picker.
     let models = if harness == HarnessId::Kilo {
-        let (free, paid): (Vec<Model>, Vec<Model>) =
-            models.into_iter().partition(kilo_model_is_free);
-        if free.is_empty() { paid } else { free }
+        zeron_proto::kilo::keep_free_or_all(models, kilo_model_is_free)
     } else {
         models
     };
@@ -6530,10 +6522,11 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             }
             // Older engines (or a remote device on one) still store Kilo's
             // provider prefix. The harness row already identifies Kilo.
-            if harness == HarnessId::Kilo
-                && let Some(label) = model.label.strip_prefix("Kilo Gateway/").map(str::to_owned)
-            {
-                model.label = label;
+            if harness == HarnessId::Kilo {
+                let stripped = zeron_proto::kilo::strip_gateway_label(&model.label);
+                if stripped != model.label {
+                    model.label = stripped.to_owned();
+                }
             }
             Some(model)
         })
