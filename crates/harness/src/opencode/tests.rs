@@ -327,6 +327,7 @@ impl TurnWire {
             controls: RunControls {
                 realtime: None,
                 execution_lease: None,
+                user_message_id: None,
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3643,6 +3644,7 @@ async fn wedged_run(base: String, timeouts: BusTimeouts) -> (Option<String>, Don
         controls: RunControls {
             realtime: None,
             execution_lease: None,
+            user_message_id: None,
             request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
             steering,
             interrupt: tokio_util::sync::CancellationToken::new(),

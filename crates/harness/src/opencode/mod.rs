@@ -575,6 +575,37 @@ impl Harness for OpencodeHarness {
         self.model_catalog(true).await.map(|c| c.models)
     }
 
+    fn fallback_models(&self) -> Vec<Model> {
+        vec![
+            Model {
+                id: "opencode/beam-free".into(),
+                label: "Beam Free".into(),
+                description: Some("OpenCode free tier model".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: vec![],
+            },
+            Model {
+                id: "opencode/flint-40b-free".into(),
+                label: "Flint 40B Free".into(),
+                description: Some("OpenCode free tier model".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: vec![],
+            },
+        ]
+    }
+
     async fn skills(
         &self,
         cwd: &std::path::Path,
@@ -1515,6 +1546,8 @@ async fn decode_json_response<T: serde::de::DeserializeOwned + Send + 'static>(
 /// "Model not found" (field report, v0.2.21). `connected` names exactly
 /// the usable set (credentialed + config-declared + the anonymous Zen
 /// tier). An absent/empty `connected` (older server) falls back to `all`.
+/// When the catalog is empty (no signed-in providers), return a curated
+/// set of free tier models so the picker is functional.
 fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
     let connected: std::collections::HashSet<&str> = providers
         .connected
@@ -1561,6 +1594,38 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
             .collect();
         provider_models.sort_by(|a, b| a.label.cmp(&b.label));
         out.extend(provider_models);
+    }
+    // If no models were found (likely due to no signed-in providers),
+    // return a curated set of free tier models to keep the picker functional
+    if out.is_empty() {
+        out = vec![
+            Model {
+                id: "opencode/beam-free".into(),
+                label: "Beam Free".into(),
+                description: Some("OpenCode free tier model".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: vec![],
+            },
+            Model {
+                id: "opencode/flint-40b-free".into(),
+                label: "Flint 40B Free".into(),
+                description: Some("OpenCode free tier model".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: vec![],
+            },
+        ];
     }
     out
 }
