@@ -348,7 +348,14 @@ impl Shell {
 #[derive(Default)]
 pub(crate) struct ProjectIcons {
     entries: std::cell::RefCell<std::collections::HashMap<String, Entity<ProjectIcon>>>,
+    /// When the stale entries were last dropped. The sweep reads every cached
+    /// icon entity, and this runs once per icon per paint — throttled, an entry
+    /// older than the limit lives at most `SWEEP` longer.
+    last_sweep: std::cell::Cell<Option<std::time::Instant>>,
 }
+
+/// How often expired artwork entries are dropped.
+const SWEEP: Duration = Duration::from_secs(1);
 
 impl ProjectIcons {
     pub(crate) fn render<V: 'static>(
@@ -398,7 +405,17 @@ impl ProjectIcons {
             return monogram(&name, &seed, selected, Theme::of(cx));
         }
         let mut cache = self.entries.borrow_mut();
-        cache.retain(|_, entity| entity.read(cx).refreshed.elapsed() < Duration::from_secs(300));
+        let now = std::time::Instant::now();
+        if self
+            .last_sweep
+            .get()
+            .is_none_or(|last| now.duration_since(last) >= SWEEP)
+        {
+            self.last_sweep.set(Some(now));
+            cache.retain(|_, entity| {
+                entity.read(cx).refreshed.elapsed() < Duration::from_secs(300)
+            });
+        }
         let entity = cache
             .entry(key)
             .or_insert_with(|| {

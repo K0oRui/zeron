@@ -9053,6 +9053,10 @@ impl Shell {
     fn render_chat_row(
         &self,
         id: String,
+        // The chat's host device, handed in by the caller that already has the
+        // chat. Looking it up here meant scanning the whole chat table — twice —
+        // for every row on every paint, since only the id crosses the boundary.
+        device_id: Option<&str>,
         title: SharedString,
         time_ago: SharedString,
         space_name: SharedString,
@@ -9096,26 +9100,18 @@ impl Shell {
             crate::change_requests::ChangeRequestBadgeSurface::SessionRow
         };
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
-        // The device the row belongs to. One lookup, shared by the remote glyph
-        // and the change-request badge — this used to scan the whole chat table
-        // twice for the same value on every row, every paint.
-        let host = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
-        let pr_device = host.clone();
+        // The device the row belongs to, shared by the remote glyph and the
+        // change-request badge.
+        let host = device_id;
+        // Only a row that draws a change-request badge needs the owned copy.
+        let pr_device: Option<String> = change_request
+            .as_ref()
+            .and_then(|_| host.map(str::to_string));
         let remote = host
-            .as_deref()
             .is_some_and(|host| self.state.read(cx).local_device_id.as_deref() != Some(host));
         // A chat on a Cloud session machine wears the cloud, not the generic
         // remote-device globe.
-        let remote_glyph = if host
-            .as_deref()
-            .is_some_and(|host| zeron_proto::is_cloud_device(host, ""))
-        {
+        let remote_glyph = if host.is_some_and(|host| zeron_proto::is_cloud_device(host, "")) {
             icons::CLOUD
         } else {
             icons::REMOTE_SERVER
