@@ -46,6 +46,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -70,6 +71,12 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 // The one-file server unpacks on launch. A local cold probe took 1.903s, but
 // slower disks need substantially more headroom than the generic 10s budget.
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+// Kilo's catalog comes from its gateway, which it fetches with a 10s HTTP
+// timeout the first time `session/new` asks for providers. Matching that with
+// a 10s probe budget killed the child just as Kilo would have answered, so a
+// slow gateway fell back to the one-row static catalog ("Auto (Free)"). Leave
+// room for process boot, directory snapshot, and Kilo's own fetch/retry.
+const KILO_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one session control call (model / config option switch).
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// `session/load`'s own budget, on top of the handshake's: it replays the
@@ -697,40 +704,92 @@ pub async fn install_antigravity_release(
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `agy_acp_server` has no `--version` flag. Its `initialize` response carries
+/// `agentInfo.version`, which is also the only version the server reports for
+/// every platform archive.
 async fn confirm_reported_version(server: &Path, expected: &str) -> Result<(), HarnessError> {
     let mut command = Command::new(server);
     command
-        .arg("--version")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(VERSION_PROBE_TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            HarnessError::Install(format!(
-                "the downloaded Antigravity server did not report its version within {}s",
-                VERSION_PROBE_TIMEOUT.as_secs()
-            ))
-        })??;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    match antigravity_build_version(&text) {
-        Some(reported) if reported == expected => Ok(()),
-        Some(reported) => Err(HarnessError::Install(format!(
-            "the ACP registry lists Antigravity {expected}, but its archive contains {reported}"
-        ))),
-        None => Err(HarnessError::Install(format!(
-            "the downloaded Antigravity {expected} server reported no build label"
-        ))),
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        HarnessError::Install("the downloaded Antigravity server has no stdin".into())
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        HarnessError::Install("the downloaded Antigravity server has no stdout".into())
+    })?;
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientInfo": {
+                "name": "zeron",
+                "title": "Zeron",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false },
+                "terminal": false,
+            },
+        },
+    });
+    let reported = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await?;
+        stdin.flush().await?;
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await? {
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if message.get("id").and_then(Value::as_u64) != Some(1) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(HarnessError::Install(format!(
+                    "the downloaded Antigravity server rejected initialize: {error}"
+                )));
+            }
+            return message
+                .pointer("/result/agentInfo/version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    HarnessError::Install(
+                        "the downloaded Antigravity server reported no agent version".into(),
+                    )
+                });
+        }
+        Err(HarnessError::Install(
+            "the downloaded Antigravity server exited before reporting its version".into(),
+        ))
+    })
+    .await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let reported = reported.map_err(|_| {
+        HarnessError::Install(format!(
+            "the downloaded Antigravity server did not report its version within {}s",
+            VERSION_PROBE_TIMEOUT.as_secs()
+        ))
+    })??;
+    if reported == expected {
+        Ok(())
+    } else {
+        Err(HarnessError::Install(format!(
+            "the ACP registry lists Antigravity {expected}, but its archive reports {reported}"
+        )))
     }
 }
 
-/// the release in `--version` output's `Build label:` line. google's build
-/// metadata also names branch revisions, which are not releases.
+/// the release in a server's `Build label:` line. google's build metadata
+/// also names branch revisions, which are not releases.
 pub fn antigravity_build_version(output: &str) -> Option<String> {
     output
         .lines()
@@ -980,8 +1039,10 @@ pub fn antigravity_home() -> Result<PathBuf, HarnessError> {
 /// exposes no `--version` flag, so the version is keyed by the managed
 /// install directory instead. Returns `None` when it can't be determined;
 /// the caller falls back to probing the executable.
-pub fn managed_antigravity_version(_executable: &Path) -> Option<String> {
-    None
+pub fn managed_antigravity_version(executable: &Path) -> Option<String> {
+    newest_antigravity_install()
+        .filter(|(_, entry)| entry == executable)
+        .map(|(version, _)| version.to_string())
 }
 
 /// The auth method Antigravity's server saved in `settings.json` (it records
@@ -1154,7 +1215,23 @@ fn antigravity_spec() -> AcpAgentSpec {
     }
 }
 
-/// Kilo Code (`kilo acp`) â€” an opencode fork driven over its own ACP server.
+fn kilo_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        dirs.push(home.join(".kilo").join("bin").join("kilo"));
+        dirs.push(home.join(".local").join("bin").join("kilo"));
+        dirs.push(home.join(".bun").join("bin").join("kilo"));
+        dirs.push(home.join(".npm-global").join("bin").join("kilo"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/kilo"));
+    dirs.push(PathBuf::from("/usr/local/bin/kilo"));
+    dirs
+}
+
+/// Kilo Code (`kilo acp`) — the Kilo CLI, a fork of opencode that ships its
+/// own ACP server. It keeps its own data dir (`$XDG_DATA_HOME/kilo`), so its
+/// `auth.json` never collides with opencode's, and signs in through
+/// `kilo auth login` (Kilo's own account store, or any configured provider).
 fn kilo_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Kilo,
@@ -1162,15 +1239,43 @@ fn kilo_spec() -> AcpAgentSpec {
         executable: "kilo",
         env_override: "KILO_EXECUTABLE",
         args: &["acp"],
+        // The CLI *is* the ACP server, so a managed adapter copy would be a
+        // second full agent install; the user's own `kilo` is the one that
+        // holds their logins and config.
         npm_package: None,
         archive: None,
-        extra_paths: Vec::new,
+        extra_paths: kilo_install_paths,
         cli_executable: "kilo",
-        cli_extra_paths: Vec::new,
-        install_hint: "Install Kilo Code to enable, or set KILO_EXECUTABLE to its ACP server",
-        models: || vec![],
+        cli_extra_paths: kilo_install_paths,
+        install_hint: "kilo (searched PATH, the login shell's PATH, ~/.kilo/bin, \
+             ~/.local/bin, ~/.bun/bin, ~/.npm-global/bin, /opt/homebrew/bin, \
+             /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `npm install -g @kilocode/cli` or \
+             `curl -fsSL https://kilo.ai/cli/install | bash`, then \
+             `kilo auth login`; set KILO_EXECUTABLE to override)",
+        // Fallback only: discovery reads the real catalog from the ACP
+        // session's `model` config option (every provider the user configured).
+        // Kilo's own gateway default needs no API key.
+        models: || {
+            vec![Model {
+                id: "kilo/kilo-auto/free".into(),
+                label: "Kilo Auto (Free)".into(),
+                description: Some("Kilo's router picks a model for the task".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        // No `_session/steering` extension: a steer waits for the turn end.
         steering_mode: SteeringMode::TurnBoundary,
-        reasoning_levels: &[],
+        // Effort rides the session's `effort` option (category
+        // `thought_level`), whose values are the model's reasoning variants.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -1178,11 +1283,31 @@ fn kilo_spec() -> AcpAgentSpec {
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: false,
+        // Kilo's ACP server serves anonymous/free runs and leaves account
+        // handling to `kilo auth login`; it never needs a client-side
+        // authenticate step.
         auth_method: None,
-        skill_dirs: Vec::new,
+        skill_dirs: kilo_skill_dirs,
         hidden_commands: &[],
         drops_unstarted_cancelled_prompt: false,
     }
+}
+
+/// Kilo's own skill folders: `<config>/skill{,s}/**/SKILL.md`, where config is
+/// `$KILO_CONFIG_DIR` or `$XDG_CONFIG_HOME/kilo`.
+fn kilo_skill_dirs() -> Vec<PathBuf> {
+    let Some(config) = std::env::var_os("KILO_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| crate::executable::home_dir().map(|home| home.join(".config")))
+        })
+    else {
+        return Vec::new();
+    };
+    let config = config.join("kilo");
+    vec![config.join("skills"), config.join("skill")]
 }
 
 /// how long a sign-in may wait on the browser: the antigravity server gives
@@ -1359,9 +1484,9 @@ impl AcpHarness {
             .with_model_discovery_timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT)
     }
 
-    /// Kilo Code (`kilo acp`).
+    /// Kilo Code (`kilo acp`) — the Kilo CLI's own ACP server.
     pub fn kilo() -> Self {
-        Self::with_spec(kilo_spec())
+        Self::with_spec(kilo_spec()).with_model_discovery_timeout(KILO_DISCOVERY_TIMEOUT)
     }
 
     /// sign the agent out with acp `logout`, clearing the credentials its
@@ -1955,6 +2080,13 @@ impl AcpHarness {
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
+            if self.spec.id == HarnessId::Kilo {
+                models.retain(kilo_model_is_free);
+                for model in &mut models {
+                    let label = strip_kilo_gateway_label(&model.label).to_owned();
+                    model.label = label;
+                }
+            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -2009,6 +2141,27 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
         "ultrathink" => Some(ReasoningLevel::Ultrathink),
         _ => None,
     }
+}
+
+/// Kilo advertises its whole gateway catalog, including models that need
+/// credits. Its free rows are the `.../free` routers and the OpenRouter-style
+/// `:free` models; gateway names also carry a trailing "(free)" on those.
+/// Zeron keeps the picker on what the account can run without buying credits.
+fn kilo_model_is_free(model: &Model) -> bool {
+    let id = model.id.to_ascii_lowercase();
+    let label = model.label.to_ascii_lowercase();
+    id.ends_with(":free")
+        || id.ends_with("-free")
+        || id.ends_with("/free")
+        || label.ends_with(" (free)")
+        || label.ends_with("auto free")
+        || label.ends_with("free models router")
+}
+
+/// Kilo prefixes every gateway row with its provider name. The picker
+/// already sits under the Kilo harness, so the prefix is noise.
+fn strip_kilo_gateway_label(label: &str) -> &str {
+    label.strip_prefix("Kilo Gateway/").unwrap_or(label)
 }
 
 /// Derive the model list a `session/new` response advertises. The `model`
@@ -3107,6 +3260,16 @@ fn stop_outcome(
     }
 }
 
+/// Kilo runs `git config --get remote.origin.url` through Bun Shell on every
+/// LLM request with stdin inherited. Under `kilo acp` that stdin is the
+/// JSON-RPC pipe, so on Windows the git child blocks until the client writes
+/// another line and the turn produces nothing at all (Kilo issue #10768,
+/// unfixed as of 7.8.17; `kilo run` is unaffected). Kilo ignores blank lines,
+/// so a periodic newline releases the child without touching the turn.
+fn prompt_stdin_nudge(harness: HarnessId) -> Option<Duration> {
+    (harness == HarnessId::Kilo).then_some(Duration::from_secs(1))
+}
+
 /// One turn: `session/prompt` whose response (the `stopReason`) ends it.
 /// `prompt_id` (agents with the prompt-complete extension) rides `_meta` so
 /// the `_x.ai/session/prompt_complete` notification can be matched exactly —
@@ -3116,6 +3279,7 @@ fn prompt_turn(
     session_id: String,
     prompt: &PromptInput,
     prompt_id: Option<String>,
+    stdin_nudge: Option<Duration>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     let mut params = json!({
         "sessionId": session_id,
@@ -3126,7 +3290,21 @@ fn prompt_turn(
     }
     // Written now, not on first poll: a steer's `session/cancel` issued in
     // the same loop iteration must reach the agent after this prompt.
-    client.request_now("session/prompt", params)
+    let turn = client.request_now("session/prompt", params);
+    let Some(period) = stdin_nudge else {
+        return turn;
+    };
+    Box::pin(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(turn);
+        loop {
+            tokio::select! {
+                result = &mut turn => return result,
+                _ = ticker.tick() => client.nudge(),
+            }
+        }
+    })
 }
 
 /// A message bound for the agent: its text plus the image blocks inlined
@@ -4394,12 +4572,14 @@ async fn run_session(session: Session) {
         inline_images,
     )
     .await;
+    let stdin_nudge = prompt_stdin_nudge(harness);
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
             session_id.clone(),
             &current_prompt,
             current_prompt_id.clone(),
+            stdin_nudge,
         )
     });
     // Steers waiting for the turn boundary (agents without the extension, or
@@ -4724,6 +4904,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         &current_prompt,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if !steering_open {
                     break 'main;
@@ -5035,6 +5216,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         &current_prompt,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 }
                 while let Some(next_text) = steer_backlog.pop_front() {
@@ -5085,6 +5267,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         &current_prompt,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if turn.is_none() && !steering_open {
                     // Mailbox closed while the flush waited: nothing left.
@@ -5163,6 +5346,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         &current_prompt,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                 } else if !steering_open {
                     // Mirror the normal turn-settled exit: mailbox closed
@@ -5323,6 +5507,7 @@ async fn run_session(session: Session) {
                         session_id.clone(),
                         &current_prompt,
                         current_prompt_id.clone(),
+                        stdin_nudge,
                     ));
                     } else if steer_ext {
                         // Mid-turn injection via the `_session/steering`
@@ -5586,23 +5771,28 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let server = dir.path().join("agy_acp_server.par");
-        std::fs::write(
-            &server,
-            "#!/bin/sh\necho 'Built from changelist 1 based on //depot/branches/agy_acp_server_release_branch/973763860.1'\necho 'Build label: 1.2.0'\n",
-        )
-        .unwrap();
+        let script = |version: &str| {
+            format!(
+                "#!/bin/sh\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"agentInfo\":{{\"name\":\"antigravity-acp\",\"version\":\"{version}\"}}}}}}'\n"
+            )
+        };
+        std::fs::write(&server, script("1.2.0")).unwrap();
         std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
         confirm_reported_version(&server, "1.2.0").await.unwrap();
         let error = confirm_reported_version(&server, "9.9.9")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("contains 1.2.0"), "{error}");
+        assert!(error.to_string().contains("reports 1.2.0"), "{error}");
 
-        std::fs::write(&server, "#!/bin/sh\necho 'agy 9.9.9'\n").unwrap();
+        std::fs::write(
+            &server,
+            "#!/bin/sh\nread line\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'\n",
+        )
+        .unwrap();
         let error = confirm_reported_version(&server, "9.9.9")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("no build label"), "{error}");
+        assert!(error.to_string().contains("no agent version"), "{error}");
     }
 
     #[test]
@@ -5950,12 +6140,21 @@ mod tests {
         assert!(harness.installed());
         assert_eq!(harness.executable_path(), Some(legacy_server.clone()));
         assert!(is_managed_antigravity_server(&legacy_server));
+        assert_eq!(
+            managed_antigravity_version(&legacy_server).as_deref(),
+            Some(legacy.version)
+        );
 
         let current_server = install(current.version, current.sha512);
         install("9.0.0", "tampered");
         install("not-a-version", ANTIGRAVITY_SIGNED_MARKER);
         assert_eq!(harness.executable_path(), Some(current_server.clone()));
         assert!(!is_managed_antigravity_server(&legacy_server));
+        assert_eq!(managed_antigravity_version(&legacy_server), None);
+        assert_eq!(
+            managed_antigravity_version(&current_server).as_deref(),
+            Some(current.version)
+        );
 
         let signed_server = install("99.0.0", ANTIGRAVITY_SIGNED_MARKER);
         let newest = if crate::code_signature::SUPPORTED {
@@ -6039,7 +6238,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("contains {}", pin.version)),
+                .contains(&format!("reports {}", pin.version)),
             "{error}"
         );
         assert!(trusted_antigravity_installs().is_empty());
