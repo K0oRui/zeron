@@ -2,8 +2,9 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`), Kilo ([`AcpHarness::kilo`],
+//! `kilo acp` — see [`kilo`] for the whole provider) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
 //! pinned release archive). Pi, Claude, Codex and Cursor use native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -31,6 +32,7 @@
 
 mod antigravity_paths;
 mod devin_models;
+mod kilo;
 mod normalize;
 mod subagent;
 mod subagent_devin;
@@ -71,12 +73,6 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 // The one-file server unpacks on launch. A local cold probe took 1.903s, but
 // slower disks need substantially more headroom than the generic 10s budget.
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
-// Kilo's catalog comes from its gateway, which it fetches with a 10s HTTP
-// timeout the first time `session/new` asks for providers. Matching that with
-// a 10s probe budget killed the child just as Kilo would have answered, so a
-// slow gateway fell back to the one-row static catalog ("Auto (Free)"). Leave
-// room for process boot, directory snapshot, and Kilo's own fetch/retry.
-const KILO_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one session control call (model / config option switch).
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// `session/load`'s own budget, on top of the handshake's: it replays the
@@ -1215,101 +1211,6 @@ fn antigravity_spec() -> AcpAgentSpec {
     }
 }
 
-fn kilo_install_paths() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = crate::executable::home_dir() {
-        dirs.push(home.join(".kilo").join("bin").join("kilo"));
-        dirs.push(home.join(".local").join("bin").join("kilo"));
-        dirs.push(home.join(".bun").join("bin").join("kilo"));
-        dirs.push(home.join(".npm-global").join("bin").join("kilo"));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/kilo"));
-    dirs.push(PathBuf::from("/usr/local/bin/kilo"));
-    dirs
-}
-
-/// Kilo Code (`kilo acp`) — the Kilo CLI, a fork of opencode that ships its
-/// own ACP server. It keeps its own data dir (`$XDG_DATA_HOME/kilo`), so its
-/// `auth.json` never collides with opencode's, and signs in through
-/// `kilo auth login` (Kilo's own account store, or any configured provider).
-fn kilo_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Kilo,
-        display_name: "Kilo Code",
-        executable: "kilo",
-        env_override: "KILO_EXECUTABLE",
-        args: &["acp"],
-        // The CLI *is* the ACP server, so a managed adapter copy would be a
-        // second full agent install; the user's own `kilo` is the one that
-        // holds their logins and config.
-        npm_package: None,
-        archive: None,
-        extra_paths: kilo_install_paths,
-        cli_executable: "kilo",
-        cli_extra_paths: kilo_install_paths,
-        install_hint: "kilo (searched PATH, the login shell's PATH, ~/.kilo/bin, \
-             ~/.local/bin, ~/.bun/bin, ~/.npm-global/bin, /opt/homebrew/bin, \
-             /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs; install with \
-             `npm install -g @kilocode/cli` or \
-             `curl -fsSL https://kilo.ai/cli/install | bash`, then \
-             `kilo auth login`; set KILO_EXECUTABLE to override)",
-        // Fallback only: discovery reads the real catalog from the ACP
-        // session's `model` config option (every provider the user configured).
-        // Kilo's own gateway default needs no API key.
-        models: || {
-            vec![Model {
-                id: "kilo/kilo-auto/free".into(),
-                label: "Kilo Auto (Free)".into(),
-                description: Some("Kilo's router picks a model for the task".into()),
-                reasoning_levels: Vec::new(),
-                options: Vec::new(),
-            }]
-        },
-        // No `_session/steering` extension: a steer waits for the turn end.
-        steering_mode: SteeringMode::TurnBoundary,
-        // Effort rides the session's `effort` option (category
-        // `thought_level`), whose values are the model's reasoning variants.
-        reasoning_levels: &[
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
-        effort_in_model_id: false,
-        // Kilo's ACP server serves anonymous/free runs and leaves account
-        // handling to `kilo auth login`; it never needs a client-side
-        // authenticate step.
-        auth_method: None,
-        skill_dirs: kilo_skill_dirs,
-        hidden_commands: &[],
-        drops_unstarted_cancelled_prompt: false,
-    }
-}
-
-/// Kilo's own skill folders: `<config>/skill{,s}/**/SKILL.md`, where config is
-/// `$KILO_CONFIG_DIR` or `$XDG_CONFIG_HOME/kilo`.
-fn kilo_skill_dirs() -> Vec<PathBuf> {
-    let Some(config) = std::env::var_os("KILO_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| crate::executable::home_dir().map(|home| home.join(".config")))
-        })
-    else {
-        return Vec::new();
-    };
-    let config = config.join("kilo");
-    vec![config.join("skills"), config.join("skill")]
-}
-
 /// how long a sign-in may wait on the browser: the antigravity server gives
 /// its loopback redirect 300s, plus room for the token exchange.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(330);
@@ -1486,7 +1387,7 @@ impl AcpHarness {
 
     /// Kilo Code (`kilo acp`) — the Kilo CLI's own ACP server.
     pub fn kilo() -> Self {
-        Self::with_spec(kilo_spec()).with_model_discovery_timeout(KILO_DISCOVERY_TIMEOUT)
+        Self::with_spec(kilo::spec()).with_model_discovery_timeout(kilo::DISCOVERY_TIMEOUT)
     }
 
     /// sign the agent out with acp `logout`, clearing the credentials its
@@ -2081,11 +1982,7 @@ impl AcpHarness {
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             if self.spec.id == HarnessId::Kilo {
-                models.retain(kilo_model_is_free);
-                for model in &mut models {
-                    let label = strip_kilo_gateway_label(&model.label).to_owned();
-                    model.label = label;
-                }
+                models = kilo::curate_gateway_rows(models);
             }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
@@ -2141,27 +2038,6 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
         "ultrathink" => Some(ReasoningLevel::Ultrathink),
         _ => None,
     }
-}
-
-/// Kilo advertises its whole gateway catalog, including models that need
-/// credits. Its free rows are the `.../free` routers and the OpenRouter-style
-/// `:free` models; gateway names also carry a trailing "(free)" on those.
-/// Zeron keeps the picker on what the account can run without buying credits.
-fn kilo_model_is_free(model: &Model) -> bool {
-    let id = model.id.to_ascii_lowercase();
-    let label = model.label.to_ascii_lowercase();
-    id.ends_with(":free")
-        || id.ends_with("-free")
-        || id.ends_with("/free")
-        || label.ends_with(" (free)")
-        || label.ends_with("auto free")
-        || label.ends_with("free models router")
-}
-
-/// Kilo prefixes every gateway row with its provider name. The picker
-/// already sits under the Kilo harness, so the prefix is noise.
-fn strip_kilo_gateway_label(label: &str) -> &str {
-    label.strip_prefix("Kilo Gateway/").unwrap_or(label)
 }
 
 /// Derive the model list a `session/new` response advertises. The `model`
@@ -3260,14 +3136,16 @@ fn stop_outcome(
     }
 }
 
-/// Kilo runs `git config --get remote.origin.url` through Bun Shell on every
-/// LLM request with stdin inherited. Under `kilo acp` that stdin is the
-/// JSON-RPC pipe, so on Windows the git child blocks until the client writes
-/// another line and the turn produces nothing at all (Kilo issue #10768,
-/// unfixed as of 7.8.17; `kilo run` is unaffected). Kilo ignores blank lines,
-/// so a periodic newline releases the child without touching the turn.
+/// A periodic blank-line poke on the agent's stdin mid-turn, where one is
+/// needed at all: Kilo's Bun-Shell `git config` child inherits the pipe and,
+/// on Windows, wedges the turn until the client writes (see
+/// [`kilo::STDIN_NUDGE_PERIOD`] — the mechanism is Windows-only, so the
+/// period compiles to `None` elsewhere). Other agents get no nudge.
 fn prompt_stdin_nudge(harness: HarnessId) -> Option<Duration> {
-    (harness == HarnessId::Kilo).then_some(Duration::from_secs(1))
+    match harness {
+        HarnessId::Kilo => kilo::STDIN_NUDGE_PERIOD,
+        _ => None,
+    }
 }
 
 /// One turn: `session/prompt` whose response (the `stopReason`) ends it.

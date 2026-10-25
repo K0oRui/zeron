@@ -504,17 +504,11 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
 }
 
 /// Kilo advertises its whole gateway catalog, including rows that need
-/// credits. Same rule as the harness's discovery-side filter, repeated here so
-/// a catalog from an older engine still opens on the free rows only.
+/// credits. The rule is shared ([`zeron_proto::kilo`]) with the harness's
+/// discovery-side filter and the desktop picker, applied here so a catalog
+/// from an older engine still opens on the free rows only.
 fn kilo_model_is_free(model: &ModelInfo) -> bool {
-    let id = model.id.to_ascii_lowercase();
-    let label = model.label.to_ascii_lowercase();
-    id.ends_with(":free")
-        || id.ends_with("-free")
-        || id.ends_with("/free")
-        || label.ends_with(" (free)")
-        || label.ends_with("auto free")
-        || label.ends_with("free models router")
+    zeron_proto::kilo::gateway_model_is_free(&model.id, &model.label)
 }
 
 /// Clean a live `ListModels` reply: drop a `default` placeholder when real
@@ -526,9 +520,7 @@ pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo>
     // if the rule matches nothing (a renamed free tier), show the list as-is
     // rather than an empty picker.
     let models = if harness == "kilo" {
-        let (free, paid): (Vec<ModelInfo>, Vec<ModelInfo>) =
-            models.into_iter().partition(kilo_model_is_free);
-        if free.is_empty() { paid } else { free }
+        zeron_proto::kilo::keep_free_or_all(models, kilo_model_is_free)
     } else {
         models
     };

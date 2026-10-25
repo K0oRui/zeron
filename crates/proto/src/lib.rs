@@ -13,6 +13,7 @@ pub mod entities;
 pub mod file_mentions;
 pub mod headroom;
 pub mod invocation;
+pub mod kilo;
 pub mod motion;
 pub mod plan_usage;
 pub mod preview;
