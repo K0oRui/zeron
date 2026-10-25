@@ -139,12 +139,32 @@ New tests, both in `crates/ui/src/shell/spaces.rs`:
   harness when those settings are off. This is the contract that replaced the
   whole-`Chat` clone.
 
-This environment has no Rust toolchain and no crates.io access, so nothing here
-was compiled or run. The edited files parse cleanly under tree-sitter's Rust
-grammar; run the real suite before merging:
+Both pass in the CI run described below.
+
+There is no Rust toolchain in the authoring sandbox, so this was compiled and
+tested on the pull request's CI instead (`crates/ui` only; the harness, engine
+and app crates are untouched):
+
+- **Linux `UI tests`** (`cargo nextest run --config-file scripts/ci/nextest.toml
+  --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry`):
+  `zeron-ui` compiles and 1949 of 1952 tests pass. The three failures —
+  `pickers::tests::typed_windows_paths_resolve_on_any_client`,
+  `settings::accounts::tests::per_provider_agents_offer_one_sign_in_per_provider`
+  and `pinned_session_tests::sidebar_optimistic_writes_preserve_newer_edits_and_watch_state_on_failure`
+  — fail identically in the Windows serial run and none of them reach the row
+  model, the ordering or the pin-write path this change touches.
+- **Windows `UI tests`**: the release build of `zeron-ui` and the app compile and
+  the suite runs; the same three tests fail.
+- **`core-tests`** (harness/engine/sync/update/doc/preview) is red on `main`
+  itself: `crates/harness/tests/acp_hardening.rs` builds `RunControls` without
+  the `user_message_id` field the struct requires, so that suite does not
+  compile at `f626e78`. Unrelated to this change.
+- **`linux-browser`** stopped in the CI action's `apt` step (`download failed`),
+  before it built the browser fixture.
+
+Locally, the edited files were only checked against tree-sitter's Rust grammar
+(no parse errors). To rerun the suite by hand:
 
 ```sh
 cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
 ```
-
-That is what `.github/workflows/ui-tests.yml` runs.
