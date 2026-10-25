@@ -883,18 +883,24 @@ fn output_line(line: &str) -> SharedString {
 fn edit_call_detail(call: &ToolCall) -> Option<ToolDetail> {
     let ToolCall::EditFile {
         path,
-        old_string: Some(old),
-        new_string: Some(new),
+        old_string,
+        new_string,
     } = call
     else {
         return None;
     };
+    let old = old_string.as_deref().unwrap_or("");
+    let new = new_string.as_deref().unwrap_or("");
+    // Nothing to preview when both sides are empty.
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
     tool_detail(
         None,
         Some(&zeron_proto::ToolDiff {
             path: path.clone(),
-            old_text: Some(old.clone()),
-            new_text: new.clone(),
+            old_text: Some(old.to_owned()),
+            new_text: new.to_owned(),
         }),
         None,
     )
@@ -1526,9 +1532,14 @@ pub fn rows_for_entry(
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
-                    detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
-                        .or_else(|| edit_call_detail(call))
-                        .map(Arc::new),
+                    detail: match call {
+                        ToolCall::EditFile { .. } => edit_call_detail(call)
+                            .or_else(|| tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref()))
+                            .map(Arc::new),
+                        _ => tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
+                            .or_else(|| edit_call_detail(call))
+                            .map(Arc::new),
+                    },
                     invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
@@ -7719,9 +7730,7 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
-        // Subagent transcripts are read-only views over another chat's doc.
-        let revert_message_id =
-            (is_user_row && self.chat_id.is_none()).then(|| row.entry_id.clone());
+        let revert_message_id = is_user_row.then(|| row.entry_id.clone());
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -16440,16 +16449,17 @@ mod tests {
         assert_eq!(file.path, "/w/a.rs");
         assert_eq!(file.additions, 1);
         assert_eq!(file.deletions, 1);
-        // Missing strings → no synthesized diff (path-only invocation stays).
-        assert!(
-            edit_call_detail(&ToolCall::EditFile {
-                path: "/w/a.rs".into(),
-                old_string: None,
-                new_string: Some("b".into()),
-            })
-            .is_none()
-        );
-
+        // Missing old string is treated as empty → an additions preview.
+        let Some(ToolDetail::Diff { file, .. }) = edit_call_detail(&ToolCall::EditFile {
+            path: "/w/a.rs".into(),
+            old_string: None,
+            new_string: Some("b".into()),
+        }) else {
+            panic!("expected a diff detail")
+        };
+        assert_eq!(file.path, "/w/a.rs");
+        assert_eq!(file.additions, 1);
+        assert_eq!(file.deletions, 0);
         // Blank invocation → no block; the chip stays a plain card.
         assert!(
             call_block(&ToolCall::Exec {

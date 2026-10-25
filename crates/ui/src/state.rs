@@ -2899,6 +2899,14 @@ impl AppState {
     /// on any device — idle included — in pure recency order (status drives
     /// the dot, never the position; see [`sort_active`]).
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
+        // One pass over sessions instead of a linear scan per row: the sidebar
+        // rebuilds this list on every paint, and `session_for` walked the whole
+        // table for each chat.
+        let mut sessions: std::collections::HashMap<&str, &Session> =
+            std::collections::HashMap::with_capacity(self.sessions.len());
+        for session in &self.sessions {
+            sessions.entry(session.chat_id.as_str()).or_insert(session);
+        }
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
             .filter(|c| match c.space_id.as_deref() {
@@ -2906,7 +2914,14 @@ impl AppState {
                 None => true,
                 Some(id) => self.space_row(id).is_some(),
             })
-            .map(|c| (self.display_status_for(c, now), c))
+            .map(|c| {
+                let status = if self.send_pending(&c.id, now) {
+                    ChatIndicator::Working
+                } else {
+                    display_status(c, sessions.get(c.id.as_str()).copied(), now)
+                };
+                (status, c)
+            })
             .collect();
         sort_active(&mut rows);
         rows

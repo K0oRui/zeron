@@ -4179,13 +4179,18 @@ impl Shell {
             .filter(|gap| gap.group == group && !section.collapsed);
         let (after, before) = match gap {
             Some(gap) => {
+                // The gap index counts the section's nested project rows too
+                // (each placed project paints at least its header row above the
+                // loose sessions). Map it back to the loose members the anchors
+                // are chosen from.
+                let project_rows = section.project_keys.len();
                 let visible: HashSet<String> = self.sidebar_visible_order(cx).into_iter().collect();
                 let shown: Vec<&String> = section
                     .session_ids
                     .iter()
                     .filter(|member| visible.contains(*member))
                     .collect();
-                let mut index = gap.index;
+                let mut index = gap.index.saturating_sub(project_rows);
                 if let Some(source) = shown.iter().position(|member| *member == chat)
                     && index > source
                 {
@@ -5625,26 +5630,42 @@ impl Shell {
         // Section order wins: custom sections list their sessions manually,
         // so follow the section's own order, not recency. A project placed in
         // a section claims its sessions there, ahead of the loose rows.
-        fn section_of<'a>(
-            chat: &zeron_proto::Chat,
-            sections: &'a [zeron_proto::SidebarSection],
-            projects: &std::collections::HashMap<&str, &'a zeron_proto::SidebarSection>,
-            state: &AppState,
-        ) -> Option<&'a zeron_proto::SidebarSection> {
-            if let Some(section) = sections
-                .iter()
-                .find(|section| section.session_ids.contains(&chat.id))
-            {
-                return Some(section);
+        let claims_chats = custom_sections.iter().any(|section| {
+            !section.session_ids.is_empty()
+                || (organization == SidebarOrganization::ByProject
+                    && !section.project_keys.is_empty())
+        });
+        // Chat -> section, resolved once instead of rescanning every section
+        // (and every placed project) for each chat in each loop below.
+        let mut explicit_owner: std::collections::HashMap<&str, &zeron_proto::SidebarSection> =
+            std::collections::HashMap::new();
+        if claims_chats {
+            for section in custom_sections {
+                for id in &section.session_ids {
+                    explicit_owner.entry(id.as_str()).or_insert(section);
+                }
             }
-            state.space_for_chat(chat).and_then(|space| {
-                projects
-                    .get(zeron_proto::view::project_key(space).as_str())
-                    .copied()
-            })
         }
-        let project_owner: std::collections::HashMap<&str, &zeron_proto::SidebarSection> =
+        let project_keys: std::collections::HashMap<&str, String> =
             if organization == SidebarOrganization::ByProject {
+                // Space -> key once, then chat -> key in one lookup.
+                let space_keys: std::collections::HashMap<&str, String> = state
+                    .spaces
+                    .iter()
+                    .map(|space| (space.id.as_str(), zeron_proto::view::project_key(space)))
+                    .collect();
+                chats
+                    .iter()
+                    .filter_map(|(_, chat)| {
+                        let key = space_keys.get(chat.space_id.as_deref()?)?;
+                        Some((chat.id.as_str(), key.clone()))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
+        let project_owner: std::collections::HashMap<&str, &zeron_proto::SidebarSection> =
+            if organization == SidebarOrganization::ByProject && claims_chats {
                 custom_sections
                     .iter()
                     .flat_map(|section| {
@@ -5657,49 +5678,74 @@ impl Shell {
             } else {
                 Default::default()
             };
+        fn section_of<'a>(
+            chat: &zeron_proto::Chat,
+            explicit: &std::collections::HashMap<&str, &'a zeron_proto::SidebarSection>,
+            projects: &std::collections::HashMap<&str, &'a zeron_proto::SidebarSection>,
+            project_keys: &std::collections::HashMap<&str, String>,
+        ) -> Option<&'a zeron_proto::SidebarSection> {
+            explicit.get(chat.id.as_str()).copied().or_else(|| {
+                project_keys
+                    .get(chat.id.as_str())
+                    .and_then(|key| projects.get(key.as_str()).copied())
+            })
+        }
         let mut custom_order = Vec::new();
         let listed: HashSet<&str> = chats
             .iter()
             .map(|(_, chat)| chat.id.as_str())
             .collect();
         let mut placed: HashSet<&str> = HashSet::new();
-        for section in custom_sections {
-            if section.collapsed {
-                continue;
-            }
-            for key in &section.project_keys {
-                for (_, chat) in chats.iter().copied() {
-                    let belongs = section_of(chat, custom_sections, &project_owner, state)
-                        .is_some_and(|owner| owner.id == section.id)
-                        && state
-                            .space_for_chat(chat)
-                            .is_some_and(|space| zeron_proto::view::project_key(space) == *key);
-                    if belongs
-                        && listed.contains(chat.id.as_str())
-                        && placed.insert(chat.id.as_str())
-                    {
-                        custom_order.push(chat.id.clone());
+        if claims_chats {
+            for section in custom_sections {
+                if section.collapsed {
+                    continue;
+                }
+                for key in &section.project_keys {
+                    for (_, chat) in chats.iter().copied() {
+                        let belongs =
+                            section_of(chat, &explicit_owner, &project_owner, &project_keys)
+                                .is_some_and(|owner| owner.id == section.id)
+                                && project_keys
+                                    .get(chat.id.as_str())
+                                    .is_some_and(|chat_key| chat_key == key);
+                        if belongs
+                            && listed.contains(chat.id.as_str())
+                            && placed.insert(chat.id.as_str())
+                        {
+                            custom_order.push(chat.id.clone());
+                        }
+                    }
+                }
+                for id in &section.session_ids {
+                    if listed.contains(id.as_str()) && placed.insert(id.as_str()) {
+                        custom_order.push(id.clone());
                     }
                 }
             }
-            for id in &section.session_ids {
-                if listed.contains(id.as_str()) && placed.insert(id.as_str()) {
-                    custom_order.push(id.clone());
-                }
-            }
         }
-        let chats: Vec<&(_, _)> = chats
-            .into_iter()
-            .filter(|(_, chat)| {
-                section_of(chat, custom_sections, &project_owner, state).is_none()
-            })
-            .collect();
+        let chats: Vec<&(_, _)> = if claims_chats {
+            chats
+                .into_iter()
+                .filter(|(_, chat)| {
+                    section_of(chat, &explicit_owner, &project_owner, &project_keys).is_none()
+                })
+                .collect()
+        } else {
+            chats
+        };
         let ordered = if organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<&zeron_proto::Chat>)> = Vec::new();
             for (_, chat) in chats {
                 let key = Some((
                     if organization == SidebarOrganization::ByProject {
-                        sidebar_project_group(state, chat).0
+                        project_keys
+                            .get(chat.id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| match chat.space_id.clone() {
+                                Some(space_id) => space_id,
+                                None => format!("home:{}", chat.device_id),
+                            })
                     } else {
                         chat.device_id.clone()
                     },
@@ -5993,26 +6039,29 @@ impl Shell {
         status: ChatIndicator,
         chat: zeron_proto::Chat,
         state: &AppState,
+        project_by_chat: Option<&std::collections::HashMap<String, (String, String)>>,
     ) -> ActiveChatRow {
         // Line 1 is "project @ device" (t3code's project row); project-less
         // sessions name only their device — no project, no folder.
-        let space = state.space_for_chat(&chat);
-        let project = match (space, chat.space_id.as_deref()) {
-            (Some(space), _) => Some(space.display_name().to_string()),
-            (None, None) => None,
-            (None, Some(_)) => Some("?".to_string()),
+        let project = match project_by_chat.and_then(|m| m.get(&chat.id)) {
+            Some((_key, label)) => Some(label.clone()),
+            None => {
+                let space = state.space_for_chat(&chat);
+                match (space.as_ref(), chat.space_id.as_deref()) {
+                    (Some(space), _) => Some(space.display_name().to_string()),
+                    (None, None) => None,
+                    (None, Some(_)) => Some("?".to_string()),
+                }
+            }
         };
-        let device = state
-            .device_name(&chat.device_id)
-            .unwrap_or("Unknown device")
-            .to_string();
+        let device_name = state.device_name(&chat.device_id);
+        let device = device_name.unwrap_or("Unknown device").to_string();
         // Unknown device → no fragment, same as the archived list; a Cloud
         // chat's own machine isn't a device worth naming either.
-        let named = state.device_name(&chat.device_id).is_some()
-            && !zeron_proto::is_cloud_device(&chat.device_id, "");
-        let folder = match (project, named) {
+        let named = device_name.is_some() && !zeron_proto::is_cloud_device(&chat.device_id, "");
+        let folder = match (&project, named) {
             (Some(project), true) => format!("{project} @ {device}"),
-            (Some(project), false) => project,
+            (Some(project), false) => project.clone(),
             (None, true) => device.clone(),
             (None, false) => String::new(),
         };
@@ -6029,12 +6078,24 @@ impl Shell {
             .filter(|_| self.settings.sidebar_show_pull_request);
         let group = match self.settings.sidebar_organization {
             SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
-            SidebarOrganization::ByProject => Some(sidebar_project_group(state, &chat)),
+            SidebarOrganization::ByProject => {
+                let key = project_by_chat
+                    .and_then(|m| m.get(&chat.id))
+                    .map(|(key, _)| key.clone())
+                    .unwrap_or_else(|| {
+                        state
+                            .space_for_chat(&chat)
+                            .map(zeron_proto::view::project_key)
+                            .unwrap_or_else(|| format!("home:{}", chat.device_id))
+                    });
+                let label = project.unwrap_or_else(|| "No project".to_string());
+                Some((key, label))
+            }
             SidebarOrganization::InOneList => None,
         };
         ActiveChatRow {
             status,
-            chat: chat.clone(),
+            chat,
             folder,
             branch,
             change_request,
@@ -6063,7 +6124,14 @@ impl Shell {
             .map_or(saved_pins.as_slice(), |ids| ids.as_slice());
         let custom_sections = self.active_sidebar_sections(cx);
         let by_project = self.settings.sidebar_organization == SidebarOrganization::ByProject;
-        let project_labels: std::collections::HashMap<String, String> = {
+        // Only a section holding a placed project reads this map, and placed
+        // projects render only in By-project mode; skip the whole-space scan
+        // for the common no-sections list.
+        let project_labels: std::collections::HashMap<String, String> = if by_project
+            && custom_sections
+                .iter()
+                .any(|section| !section.project_keys.is_empty())
+        {
             let state = self.state.read(cx);
             state
                 .spaces
@@ -6075,8 +6143,10 @@ impl Shell {
                     )
                 })
                 .collect()
+        } else {
+            Default::default()
         };
-        let section_of_project: std::collections::HashMap<String, usize> = if by_project {
+        let section_of_project: std::collections::HashMap<&str, usize> = if by_project {
             custom_sections
                 .iter()
                 .enumerate()
@@ -6084,25 +6154,38 @@ impl Shell {
                     section
                         .project_keys
                         .iter()
-                        .map(move |key| (key.clone(), index))
+                        .map(move |key| (key.as_str(), index))
                 })
                 .collect()
         } else {
             Default::default()
         };
         let local_device_id = self.state.read(cx).local_device_id.clone();
-        let chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = {
-            let state = self.state.read(cx);
-            let mut chats: Vec<_> = state
-                .sidebar_chats(now, filter.as_deref())
-                .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
-                .collect();
-            chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-            });
-            chats
-        };
+        let state = self.state.read(cx);
+        // Build chat -> (project_key, label) once so every row avoids a
+        // per-chat linear scan of spaces (space_for_chat + representative_space).
+        let space_by_id: std::collections::HashMap<&str, &zeron_proto::Space> = state
+            .spaces
+            .iter()
+            .map(|space| (space.id.as_str(), space))
+            .collect();
+        let project_by_chat: std::collections::HashMap<String, (String, String)> = state
+            .chats
+            .iter()
+            .filter_map(|chat| {
+                let space = chat.space_id.as_deref().and_then(|id| space_by_id.get(id).copied())?;
+                let key = zeron_proto::view::project_key(space);
+                Some((chat.id.clone(), (key, space.display_name().to_string())))
+            })
+            .collect();
+        let mut chats_sorted: Vec<(ChatIndicator, zeron_proto::Chat)> = state
+            .sidebar_chats(now, filter.as_deref())
+            .into_iter()
+            .map(|(status, chat)| (status, chat.clone()))
+            .collect();
+        chats_sorted.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+        });
         // Jump chips read the same order the rows draw, built from the same
         // fetch — one clone and sort per render, not one per list plus one
         // for the slots.
@@ -6126,7 +6209,9 @@ impl Shell {
             let state = self.state.read(cx);
             chats_sorted
                 .into_iter()
-                .map(|(status, chat)| self.sidebar_chat_data(status, chat, &state))
+                .map(|(status, chat)| {
+                    self.sidebar_chat_data(status, chat, &state, Some(&project_by_chat))
+                })
                 .collect()
         };
         // Marquee state is measured per paint; forget rows that left the
@@ -6210,7 +6295,7 @@ impl Shell {
                 .then(|| {
                     row.group
                         .as_ref()
-                        .and_then(|(key, _)| section_of_project.get(key).copied())
+                        .and_then(|(key, _)| section_of_project.get(key.as_str()).copied())
                 })
                 .flatten()
             {
@@ -7073,7 +7158,7 @@ impl Shell {
             let state = self.state.read(cx);
             rows.into_iter()
                 .map(|chat| {
-                    self.sidebar_chat_data(state.display_status_for(&chat, now), chat, state)
+                    self.sidebar_chat_data(state.display_status_for(&chat, now), chat, state, None)
                 })
                 .collect()
         };
