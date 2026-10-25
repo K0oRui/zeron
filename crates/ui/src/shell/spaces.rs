@@ -1469,6 +1469,132 @@ mod pinned_session_tests {
     /// only the fields the row draws. This pins that contract — identity, the
     /// timestamps the time-ago reads, the host device — plus the settings gates
     /// that decide whether branch and harness metadata exist at all.
+    /// The row model is cached, so a paint can reuse rows it did not build.
+    /// Reuse is only sound if the cached rows are exactly what a cold build of
+    /// the same snapshot would produce — and if anything that changes a row's
+    /// text or height misses the cache. This is the regression test for the
+    /// v0.2.41 row cache: it was reverted because rows kept geometry their own
+    /// content no longer matched.
+    #[gpui::test]
+    fn sidebar_row_model_reuse_equals_a_cold_build(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        let mut first = pin_test_chat("chat-a");
+        first.device_id = "laptop".into();
+        first.title = Some("First".into());
+        first.space_id = Some("space-a".into());
+        first.source_context = Some(zeron_proto::ConversationSourceContext {
+            checkout_id: "co".into(),
+            repo_root: "/w/app".into(),
+            cwd: "/w/app".into(),
+            branch: "feature/sidebar".into(),
+            head_sha: None,
+            observed_at: first.created_at,
+        });
+        let second = pin_test_chat("chat-b");
+        let space: zeron_proto::Space = serde_json::from_value(serde_json::json!({
+            "id": "space-a",
+            "deviceId": "laptop",
+            "path": "/w/app",
+            "name": "App",
+            "createdAt": chrono::Utc::now(),
+        }))
+        .unwrap();
+
+        window
+            .update(cx, move |shell, _, cx| {
+                shell.settings.sidebar_show_branch = true;
+                // The tall row layout, so the branch actually contributes
+                // height (compact rows are a fixed 29px).
+                shell.settings.sidebar_compact = false;
+                shell.settings.sidebar_show_project_label = true;
+                shell.state.update(cx, |state, _| {
+                    state.chats = vec![first, second];
+                    state.spaces = vec![space];
+                });
+                let now = chrono::Utc::now();
+                let filter: Option<String> = None;
+                // The user's pin order: `chat-b` leads.
+                let pinned = vec!["chat-b".to_string()];
+                let gates = sidebar_row_gates(&shell.settings, filter.as_deref(), &pinned);
+
+                let cold = shell.sidebar_row_model(cx, now, &filter, &pinned, gates);
+                let cached = shell.sidebar_row_model(cx, now, &filter, &pinned, gates);
+                assert!(
+                    std::sync::Arc::ptr_eq(&cold, &cached),
+                    "an unchanged snapshot must reuse the model instead of rebuilding it"
+                );
+                assert_eq!(cold.pinned_count, 1, "the pinned chat leads the rows");
+                assert_eq!(cold.rows[0].id, "chat-b");
+                // Same inputs, fresh build: the cached rows may not carry
+                // anything a rebuild would not produce.
+                let rebuilt = shell.build_sidebar_row_model(cx, now, &filter, &pinned, 0);
+                assert_eq!(
+                    rebuilt.rows, cold.rows,
+                    "a cached model must equal a cold build of the same snapshot"
+                );
+                assert_eq!(rebuilt.pinned_count, cold.pinned_count);
+
+                // The branch decides the row height, so a state change to it
+                // has to miss the cache.
+                let with_branch = cold
+                    .rows
+                    .iter()
+                    .find(|row| row.id == "chat-a")
+                    .and_then(|row| row.branch.clone());
+                assert_eq!(with_branch.as_deref(), Some("feature/sidebar"));
+                let tall = super::super::sidebar_row_height(
+                    shell.settings.sidebar_compact,
+                    shell.settings.sidebar_show_project_label,
+                    true,
+                    false,
+                );
+                shell.state.update(cx, |state, _| {
+                    if let Some(chat) = state.chats.iter_mut().find(|chat| chat.id == "chat-a")
+                        && let Some(source) = chat.source_context.as_mut()
+                    {
+                        source.branch = "feature/renamed".into();
+                    }
+                });
+                let renamed =
+                    shell.sidebar_row_model(cx, now, &filter, &pinned, gates);
+                assert!(
+                    !std::sync::Arc::ptr_eq(&cold, &renamed),
+                    "a branch the row draws must invalidate the cached model"
+                );
+                let renamed_branch = renamed
+                    .rows
+                    .iter()
+                    .find(|row| row.id == "chat-a")
+                    .and_then(|row| row.branch.clone());
+                assert_eq!(renamed_branch.as_deref(), Some("feature/renamed"));
+
+                // Hiding branches is a settings gate: the model must rebuild
+                // without them, and the row must lose the height the branch
+                // contributed — never keep the old geometry.
+                shell.settings.sidebar_show_branch = false;
+                let gates = sidebar_row_gates(&shell.settings, filter.as_deref(), &pinned);
+                let flat = shell.sidebar_row_model(cx, now, &filter, &pinned, gates);
+                assert!(
+                    flat.rows.iter().all(|row| row.branch.is_none()),
+                    "a hidden branch is rebuilt, not carried over from the cache"
+                );
+                let short = super::super::sidebar_row_height(
+                    shell.settings.sidebar_compact,
+                    shell.settings.sidebar_show_project_label,
+                    false,
+                    false,
+                );
+                assert!(
+                    short < tall,
+                    "the row height the sidebar lays out follows the drawn branch"
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn row_model_carries_the_fields_the_row_draws(cx: &mut gpui::TestAppContext) {
         use super::*;
@@ -2707,10 +2833,27 @@ pub(super) fn pinned_drag_snapshot_is_valid(
     snapshot_ids.iter().any(|id| id == dragged_id) && snapshot_ids == current_ids
 }
 
+/// The sidebar's built row model for one state snapshot.
+///
+/// Building it costs one owned row per session — ids, labels, device names and
+/// change-request snapshots copied out of `AppState` — plus the status walk and
+/// both sorts. None of that changes between two frames that cannot change the
+/// state, so the model is kept across paints (see
+/// [`crate::state::AppState::sidebar_row_fingerprint`]) and the render walks it
+/// **by reference**: pins and sections hold row indices, so reusing a cached
+/// model never clones a row.
+pub(super) struct SidebarRowModel {
+    fingerprint: u64,
+    rows: Vec<ActiveChatRow>,
+    /// Pins lead the list, so this many leading rows are the pinned ones.
+    pinned_count: usize,
+}
+
 /// One sidebar row's data, owned so it outlives the `AppState` read guard that
 /// produced it. It copies only the fields the row draws off the chat: cloning
 /// the whole `Chat` here (a dozen `String`s, the source context and the config)
 /// for every session on every paint was the sidebar's largest allocation.
+#[derive(Debug, Clone, PartialEq)]
 struct ActiveChatRow {
     status: ChatIndicator,
     id: String,
@@ -2855,6 +2998,43 @@ const SIDEBAR_FIRST_FRAME_ROWS: usize = 120;
 /// [`ARCHIVED_PAGE_ROWS`].
 const ARCHIVED_INITIAL_ROWS: usize = 10;
 const ARCHIVED_PAGE_ROWS: usize = 25;
+
+/// The shell-owned half of the row model's cache key: the settings that change
+/// what a row says or how the list is ordered, the project filter, and the
+/// resolved pin order (pins reorder the list, and the synced/optimistic pin
+/// state lives outside [`crate::state::AppState`]).
+fn sidebar_row_gates(
+    settings: &crate::settings::UiSettings,
+    filter: Option<&str>,
+    pinned_order: &[String],
+) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let organization = match settings.sidebar_organization {
+        SidebarOrganization::ByProject => 0u8,
+        SidebarOrganization::ByDevice => 1,
+        SidebarOrganization::InOneList => 2,
+    };
+    organization.hash(&mut hasher);
+    let sort = match settings.sidebar_sort {
+        SidebarSort::LastUpdated => 0u8,
+        SidebarSort::Created => 1,
+    };
+    sort.hash(&mut hasher);
+    // The three gates decide whether `branch`, `change_request` and `harness`
+    // exist at all. `branch` and `change_request` also feed
+    // `sidebar_row_height`, so a missed change here is the v0.2.41 stale-geometry
+    // bug, not a cosmetic one.
+    settings.sidebar_show_branch.hash(&mut hasher);
+    settings.sidebar_show_pull_request.hash(&mut hasher);
+    settings.sidebar_show_harness.hash(&mut hasher);
+    filter.hash(&mut hasher);
+    pinned_order.len().hash(&mut hasher);
+    for id in pinned_order {
+        id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// Put this machine's device group first without disturbing the recency-based
 /// order of any remote groups. A targeted promotion is more truthful than a
@@ -6340,6 +6520,107 @@ impl Shell {
         }
     }
 
+    /// Build the row model from one `AppState` snapshot. Only called on a cache
+    /// miss — see [`Self::sidebar_row_model`].
+    fn build_sidebar_row_model(
+        &self,
+        cx: &App,
+        now: chrono::DateTime<chrono::Utc>,
+        filter: &Option<String>,
+        pinned_order: &[String],
+        fingerprint: u64,
+    ) -> SidebarRowModel {
+        let state = self.state.read(cx);
+        // Build space -> (project_key, label) once. Each row looks its label up
+        // by the chat's space id, so the model never clones a key and a label
+        // per chat — there are far fewer spaces than chats — and no row pays
+        // for a `space_for_chat` linear scan.
+        let project_by_space: std::collections::HashMap<String, (String, String)> = state
+            .spaces
+            .iter()
+            .map(|space| {
+                (
+                    space.id.clone(),
+                    (
+                        zeron_proto::view::project_key(space),
+                        space.display_name().to_string(),
+                    ),
+                )
+            })
+            .collect();
+        // Borrowed: the rows are built from this borrow, so no chat is cloned
+        // (see `ActiveChatRow`).
+        let mut chats_sorted: Vec<(ChatIndicator, &zeron_proto::Chat)> =
+            state.sidebar_chats(now, filter.as_deref());
+        // `sidebar_chats` already returns recency order with the id tiebreak —
+        // exactly the LastUpdated order — so only the other sort needs a pass.
+        if self.settings.sidebar_sort != SidebarSort::LastUpdated {
+            chats_sorted.sort_by(|left, right| {
+                compare_sidebar_chats(self.settings.sidebar_sort, left.1, right.1)
+            });
+        }
+        let mut rows: Vec<ActiveChatRow> = chats_sorted
+            .iter()
+            .map(|&(status, chat)| {
+                self.sidebar_chat_data(status, chat, &state, Some(&project_by_space))
+            })
+            .collect();
+        // Pins lead, in the user's own order; every other row keeps the recency
+        // order it arrived in. Sorting on a computed key avoids the id vector
+        // clones, the second ordering pass and the rank table this used to
+        // build over the whole list.
+        let mut pin_rank: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(pinned_order.len());
+        for (ix, id) in pinned_order.iter().enumerate() {
+            pin_rank.entry(id.as_str()).or_insert(ix);
+        }
+        rows.sort_by_key(|row| match pin_rank.get(row.id.as_str()) {
+            Some(ix) => (0u8, *ix),
+            None => (1u8, 0usize),
+        });
+        let active: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        let pinned_count = pin_rank.keys().filter(|id| active.contains(*id)).count();
+        SidebarRowModel {
+            fingerprint,
+            rows,
+            pinned_count,
+        }
+    }
+
+    /// The row model for this paint: the cached one while its fingerprint still
+    /// matches, else a fresh build that replaces it.
+    ///
+    /// A model cache is exactly what v0.2.41 shipped and reverted, because a
+    /// cached row kept geometry its own text no longer matched. The fix is the
+    /// key: everything the build reads is hashed — state in
+    /// [`crate::state::AppState::sidebar_row_fingerprint`], settings, filter and
+    /// pin order in [`sidebar_row_gates`] — so a cached model is only reused for
+    /// the exact inputs it was built from, and the clock alone (session
+    /// staleness) forces a rebuild once a second.
+    fn sidebar_row_model(
+        &mut self,
+        cx: &mut Context<Self>,
+        now: chrono::DateTime<chrono::Utc>,
+        filter: &Option<String>,
+        pinned_order: &[String],
+        gates: u64,
+    ) -> std::sync::Arc<SidebarRowModel> {
+        let fingerprint = {
+            let state = self.state.read(cx);
+            state.sidebar_row_fingerprint(gates, now)
+        };
+        if let Some(model) = &self.sidebar_row_model
+            && model.fingerprint == fingerprint
+        {
+            return model.clone();
+        }
+        let model = std::sync::Arc::new(
+            self.build_sidebar_row_model(cx, now, filter, pinned_order, fingerprint),
+        );
+        self.sidebar_row_model = Some(model.clone());
+        model
+    }
+
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
@@ -6398,40 +6679,57 @@ impl Shell {
             Default::default()
         };
         let local_device_id = self.state.read(cx).local_device_id.clone();
-        let state = self.state.read(cx);
-        // Build space -> (project_key, label) once. Each row looks its label up
-        // by the chat's space id, so the model no longer clones a key and a
-        // label per chat — there are far fewer spaces than chats — and no row
-        // pays for a `space_for_chat` linear scan.
-        let project_by_space: std::collections::HashMap<String, (String, String)> = state
-            .spaces
+        let gates = sidebar_row_gates(&self.settings, filter.as_deref(), pinned_order);
+        let model = self.sidebar_row_model(cx, now, &filter, pinned_order, gates);
+        // Walked by reference: everything below addresses these rows by index,
+        // so a cached model is reused without cloning a single row.
+        let rows = model.rows.as_slice();
+        // Marquee state is measured per paint; forget rows that left the
+        // list so the map tracks the visible set. The extents map tracks the
+        // same set.
+        let active: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        self.title_marquee
+            .borrow_mut()
+            .retain(|id, _| active.contains(id.as_str()));
+        self.sidebar_row_extents
+            .borrow_mut()
+            .retain(|id, _| active.contains(id.as_str()));
+        // The list's size, kept for the section counts below (the row list is
+        // split into pinned/regular/custom further down).
+        let total_rows = rows.len();
+        let pinned_count = model.pinned_count.min(total_rows);
+        self.sidebar_pinned_heights = rows[..pinned_count]
             .iter()
-            .map(|space| {
-                (
-                    space.id.clone(),
-                    (
-                        zeron_proto::view::project_key(space),
-                        space.display_name().to_string(),
-                    ),
+            .map(|row| {
+                sidebar_row_height(
+                    self.settings.sidebar_compact,
+                    self.settings.sidebar_show_project_label,
+                    row.branch.is_some(),
+                    row.change_request.is_some(),
                 )
             })
             .collect();
-        // Borrowed: the rows are built from this borrow, so no chat is cloned
-        // (see `ActiveChatRow`).
-        let mut chats_sorted: Vec<(ChatIndicator, &zeron_proto::Chat)> =
-            state.sidebar_chats(now, filter.as_deref());
-        // `sidebar_chats` already returns recency order with the id tiebreak —
-        // exactly the LastUpdated order — so only the other sort needs a pass.
-        if self.settings.sidebar_sort != SidebarSort::LastUpdated {
-            chats_sorted.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, left.1, right.1)
-            });
-        }
-        // Jump chips read the same order the rows draw. Only the hint overlay
-        // reads this table, so it is built while the modifier is held: the
-        // ordering pass allocates per chat and used to run on every paint.
+        let visible_pinned_ids = std::sync::Arc::new(
+            rows[..pinned_count]
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+        );
+        let regular_indexes: Vec<usize> = (pinned_count..total_rows).collect();
+
+        // Jump chips read the same painted order as the rows. Only the hint
+        // overlay reads this table, so it is built while the modifier is held —
+        // and from the state, not the row model, since the model deliberately
+        // does not carry per-chat space ids. The ordering pass allocates per
+        // chat, which is why it is not part of the model.
         let visible_slots: std::collections::HashMap<String, usize> = if self.jump_hints {
             let state = self.state.read(cx);
+            let mut chats_sorted = state.sidebar_chats(now, filter.as_deref());
+            if self.settings.sidebar_sort != SidebarSort::LastUpdated {
+                chats_sorted.sort_by(|left, right| {
+                    compare_sidebar_chats(self.settings.sidebar_sort, left.1, right.1)
+                });
+            }
             Self::order_sidebar_ids(
                 &chats_sorted,
                 pinned_order,
@@ -6448,58 +6746,6 @@ impl Shell {
         } else {
             std::collections::HashMap::new()
         };
-        let mut rows: Vec<ActiveChatRow> = chats_sorted
-            .iter()
-            .map(|&(status, chat)| {
-                self.sidebar_chat_data(status, chat, &state, Some(&project_by_space))
-            })
-            .collect();
-        // Marquee state is measured per paint; forget rows that left the
-        // list so the map tracks the visible set.
-        let visible: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        self.title_marquee
-            .borrow_mut()
-            .retain(|id, _| visible.contains(id.as_str()));
-        // The list's size, kept for the section counts below (the row list is
-        // split into pinned/regular/custom further down).
-        let total_rows = rows.len();
-        // Pins lead, in the user's own order; every other row keeps the recency
-        // order it arrived in. Sorting on a computed key avoids the id vector
-        // clones, the second ordering pass and the rank table this used to
-        // build over the whole list on every paint.
-        let mut pin_rank: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::with_capacity(pinned_order.len());
-        for (ix, id) in pinned_order.iter().enumerate() {
-            pin_rank.entry(id.as_str()).or_insert(ix);
-        }
-        rows.sort_by_key(|row| match pin_rank.get(row.id.as_str()) {
-            Some(ix) => (0u8, *ix),
-            None => (1u8, 0usize),
-        });
-        let active: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-        self.sidebar_row_extents
-            .borrow_mut()
-            .retain(|id, _| active.contains(id.as_str()));
-        let pinned_count = pin_rank.keys().filter(|id| active.contains(*id)).count();
-        let regular_rows = rows.split_off(pinned_count);
-        let pinned_rows = rows;
-        self.sidebar_pinned_heights = pinned_rows
-            .iter()
-            .map(|row| {
-                sidebar_row_height(
-                    self.settings.sidebar_compact,
-                    self.settings.sidebar_show_project_label,
-                    row.branch.is_some(),
-                    row.change_request.is_some(),
-                )
-            })
-            .collect();
-        let visible_pinned_ids = std::sync::Arc::new(
-            pinned_rows
-                .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>(),
-        );
 
         let custom_count = custom_sections.len();
         let section_order =
@@ -6520,7 +6766,7 @@ impl Shell {
                 )
             })
             .collect();
-        let mut regular_groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
+        let mut regular_groups: Vec<(Option<(String, String)>, Vec<usize>)> = Vec::new();
         // Chat -> explicit section, resolved once: the old form rescanned every
         // section's session list for every row on every paint.
         let mut section_of_session: std::collections::HashMap<&str, usize> =
@@ -6530,14 +6776,15 @@ impl Shell {
                 section_of_session.entry(id.as_str()).or_insert(index);
             }
         }
-        for row in regular_rows {
-            if let Some(index) = section_of_session.get(row.id.as_str()).copied() {
-                custom_groups[index].1.push(row);
+        for index in regular_indexes {
+            let row = &rows[index];
+            if let Some(section) = section_of_session.get(row.id.as_str()).copied() {
+                custom_groups[section].1.push(index);
                 continue;
             }
             // A project placed in a section takes its sessions with it, out of
             // the project's own group. Explicit session placements win.
-            if let Some(index) = by_project
+            if let Some(section) = by_project
                 .then(|| {
                     row.group
                         .as_ref()
@@ -6545,22 +6792,23 @@ impl Shell {
                 })
                 .flatten()
             {
-                custom_groups[index].1.push(row);
+                custom_groups[section].1.push(index);
                 continue;
             }
             if let Some((_, existing)) = regular_groups
                 .iter_mut()
-                .find(|(group, _)| group == &row.group)
+                .find(|(group, _)| group.as_ref() == row.group.as_ref())
             {
-                existing.push(row);
+                existing.push(index);
             } else {
-                regular_groups.push((row.group.clone(), vec![row]));
+                regular_groups.push((row.group.clone(), vec![index]));
             }
         }
         // Sections keep their placed order, as Pinned does, not activity order.
         // Placed projects come first, in their own order, then loose sessions.
-        for ((_, rows), section) in custom_groups.iter_mut().zip(&custom_sections) {
-            rows.sort_by_key(|row| {
+        for ((_, indexes), section) in custom_groups.iter_mut().zip(&custom_sections) {
+            indexes.sort_by_key(|index| {
+                let row = &rows[*index];
                 let project = by_project
                     .then(|| {
                         row.group.as_ref().and_then(|(key, _)| {
@@ -6569,7 +6817,7 @@ impl Shell {
                     })
                     .flatten();
                 match project {
-                    Some(index) => (0u8, index),
+                    Some(placed) => (0u8, placed),
                     None => (
                         1,
                         section
@@ -6585,12 +6833,12 @@ impl Shell {
             promote_local_device_group(&mut regular_groups, local_device_id.as_deref());
         }
         let mut sections = Vec::with_capacity(regular_groups.len() + usize::from(pinned_count > 0));
-        if !pinned_rows.is_empty() {
-            sections.push((None, pinned_rows));
+        if pinned_count > 0 {
+            sections.push((None, (0..pinned_count).collect::<Vec<usize>>()));
         }
         let custom_sessions = custom_groups
             .iter()
-            .map(|(_, rows)| rows.len())
+            .map(|(_, indexes)| indexes.len())
             .sum::<usize>();
         sections.extend(custom_groups);
         sections.extend(regular_groups);
@@ -6602,10 +6850,10 @@ impl Shell {
                 .map(|state| &mut state.transfer)
         });
         if let Some(drag) = transfer {
-            for (section_index, (group, rows)) in sections.iter().enumerate() {
-                let Some(index) = rows
+            for (section_index, (group, indexes)) in sections.iter().enumerate() {
+                let Some(index) = indexes
                     .iter()
-                    .position(|row| row.id == drag.payload.chat_id)
+                    .position(|index| rows[*index].id == drag.payload.chat_id)
                 else {
                     continue;
                 };
@@ -6617,11 +6865,12 @@ impl Shell {
                         .map_or_else(|| "regular".into(), |(key, _)| format!("regular:{key}"))
                 };
                 drag.source_index = index;
+                let dragged = &rows[indexes[index]];
                 drag.row_height = sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
-                    rows[index].branch.is_some(),
-                    rows[index].change_request.is_some(),
+                    dragged.branch.is_some(),
+                    dragged.change_request.is_some(),
                 );
                 // Move the vacant slot to the destination instead of keeping two
                 // holes. Sample layout and paint with the same reversible easing.
@@ -6632,7 +6881,7 @@ impl Shell {
                         .is_some_and(|gap| gap.group != drag.source_group);
                 let target = if collapse {
                     drag.row_height
-                        + if rows.len() > 1 {
+                        + if indexes.len() > 1 {
                             SIDEBAR_LIST_GAP
                         } else {
                             0.0
@@ -6705,9 +6954,8 @@ impl Shell {
             cx.notify();
         }
         let view = cx.entity_id();
-        for (group, rows) in sections {
+        for (group, indexes) in sections {
             let pinned_group = slot < pinned_count;
-            let rows = rows;
             let drag_group = if pinned_group {
                 "pinned".to_owned()
             } else {
@@ -6723,9 +6971,9 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|(key, _)| !key.starts_with("section:"));
             let header_icon_chat = (project_group && self.settings.sidebar_show_project_icon)
-                .then(|| rows.first().map(|row| row.id.clone()))
+                .then(|| indexes.first().map(|index| rows[*index].id.clone()))
                 .flatten();
-            let mut rendered_rows = Vec::with_capacity(rows.len());
+            let mut rendered_rows = Vec::with_capacity(indexes.len());
             // A custom section's placed projects render as nested groups ahead
             // of its loose sessions.
             let section_projects: Option<&Vec<String>> = by_project
@@ -6738,35 +6986,27 @@ impl Shell {
                 })
                 .flatten();
             let mut project_rows: Vec<(String, Option<String>, Vec<SidebarKeyedRow>)> = Vec::new();
-            for (group_index, row) in rows.into_iter().enumerate() {
+            for (group_index, index) in indexes.into_iter().enumerate() {
+                // Borrowed from the (possibly cached) model: the row element
+                // copies what it needs out of it below, and only for rows that
+                // actually draw.
+                let row = &rows[index];
+                let id = &row.id;
                 let row_project = row.group.as_ref().map(|(key, _)| key.clone());
                 let in_project_block = section_projects
                     .is_some_and(|keys| row_project.as_ref().is_some_and(|key| keys.contains(key)));
-                let ActiveChatRow {
-                    status,
-                    id,
-                    device_id,
-                    title,
-                    created_at,
-                    last_message_at,
-                    harness,
-                    folder,
-                    branch,
-                    change_request,
-                    group: _,
-                } = row;
                 let time_ago: SharedString =
-                    format_time_ago(last_message_at.unwrap_or(created_at), now).into();
+                    format_time_ago(row.last_message_at.unwrap_or(row.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(id.as_str());
                 let height = sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
-                    branch.is_some(),
-                    change_request.is_some(),
+                    row.branch.is_some(),
+                    row.change_request.is_some(),
                 );
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
-                let jump_slot = visible_slots.get(&id).copied();
+                let jump_slot = visible_slots.get(id).copied();
                 let jump_label: Option<SharedString> = if jump_hints && let Some(slot) = jump_slot {
                     let combo = keymap.get(ShortcutId::JumpSession(slot));
                     (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
@@ -6781,12 +7021,12 @@ impl Shell {
                 let origin = self
                     .sidebar_session_transfer
                     .as_ref()
-                    .filter(|drag| drag.payload.chat_id == id)
+                    .filter(|drag| drag.payload.chat_id.as_str() == id.as_str())
                     .map(|drag| drag.origin.clone())
                     .or_else(|| {
                         self.sidebar_session_return
                             .as_ref()
-                            .filter(|returning| returning.transfer.payload.chat_id == id)
+                            .filter(|returning| returning.transfer.payload.chat_id.as_str() == id.as_str())
                             .map(|returning| returning.transfer.origin.clone())
                     });
                 let is_moving = origin.is_some();
@@ -6798,13 +7038,13 @@ impl Shell {
                             .as_ref()
                             .map(|state| &state.transfer)
                     })
-                    .filter(|drag| drag.payload.chat_id == id)
+                    .filter(|drag| drag.payload.chat_id.as_str() == id.as_str())
                     .map_or(0.0, |drag| drag.collapsed_height);
                 let slot_height = height - removed;
                 // The inline rename editor lives inside the row, so that row
                 // must stay mounted while it is open.
                 let is_renaming = self.chat_rename.as_ref().is_some_and(|rename| {
-                    rename.surface == ChatRenameSurface::Sidebar && rename.chat_id == id
+                    rename.surface == ChatRenameSurface::Sidebar && rename.chat_id.as_str() == id.as_str()
                 });
                 let unmeasured = !self
                     .sidebar_row_extents
@@ -6820,18 +7060,18 @@ impl Shell {
                     && origin.is_none()
                     && ((unmeasured && slot > SIDEBAR_FIRST_FRAME_ROWS)
                         || virtual_window.is_some_and(|window| {
-                            self.sidebar_row_off_screen(&id, window)
+                            self.sidebar_row_off_screen(id.as_str(), window)
                         }));
                 let row_extents = self.sidebar_row_extents.clone();
                 let row_scroll = self.sidebar_scroll.clone();
-                let row_id = id.clone();
+                let row_id = id.to_string();
                 let extent_height = slot_height.max(0.0);
                 // Built here, above the split, so the row's id is still ours:
                 // the off-screen placeholder consumes nothing.
                 let drag = drag_enabled
                     .then(|| {
                         profile_key.as_ref().map(|profile_key| SidebarSessionDrag {
-                            chat_id: id.clone(),
+                            chat_id: id.to_string(),
                             visible_ids: visible_pinned_ids.clone(),
                             filter: filter.clone(),
                             profile_key: profile_key.clone(),
@@ -6845,16 +7085,17 @@ impl Shell {
                         .into_any_element()
                 } else {
                     let element = self.render_chat_row(
-                        id.clone(),
-                        Some(device_id.as_str()),
-                        transcript::single_line(title.as_deref().unwrap_or("New session"))
+                        id.to_string(),
+                        Some(row.device_id.as_str()),
+                        transcript::single_line(row.title.as_deref().unwrap_or("New session"))
                             .into(),
                         time_ago,
-                        folder.into(),
-                        branch.map(SharedString::from),
-                        change_request,
-                        harness,
-                        status,
+                        // Only a drawn row copies its labels out of the model.
+                        row.folder.clone().into(),
+                        row.branch.clone().map(SharedString::from),
+                        row.change_request.clone(),
+                        row.harness,
+                        row.status,
                         is_selected,
                         false,
                         is_moving,
@@ -6878,7 +7119,7 @@ impl Shell {
                             })
                             .into_any_element()
                     } else {
-                        self.render_sidebar_gap_row(element, &id, &drag_group, group_index)
+                        self.render_sidebar_gap_row(element, id.as_str(), &drag_group, group_index)
                     }
                 };
                 // The hit region stays at the natural slot while its content slides;
@@ -6908,7 +7149,7 @@ impl Shell {
                     })
                     .id(SharedString::from(format!("session-slot-{}", id)))
                     .debug_selector({
-                        let id = id.clone();
+                        let id = id.to_string();
                         move || format!("session-slot-{id}")
                     })
                     .h(px(slot_height.max(0.0)))
@@ -6958,7 +7199,7 @@ impl Shell {
                     {
                         Some((_, _, rows)) => rows.push(keyed_row),
                         None => {
-                            project_rows.push((project_key, Some(id.clone()), vec![keyed_row]))
+                            project_rows.push((project_key, Some(id.to_string()), vec![keyed_row]))
                         }
                     }
                 } else {

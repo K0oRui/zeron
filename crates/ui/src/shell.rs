@@ -2491,6 +2491,11 @@ pub struct Shell {
     sidebar_resort: std::collections::HashMap<String, f32>,
     /// Keys that just appeared in a live list (fade in, no glide).
     sidebar_new_keys: std::collections::HashSet<String>,
+    /// The sidebar's built row model, reused while its fingerprint still
+    /// matches (see [`AppState::sidebar_row_fingerprint`]). Held here, not in
+    /// the row builder, so it survives the repaints that cannot change it:
+    /// scroll, hover, marquee, resize and every other animation frame.
+    sidebar_row_model: Option<std::sync::Arc<spaces::SidebarRowModel>>,
     resort_epoch: usize,
     /// Last observed `window.is_window_active()` — rising edge fires a
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
@@ -2980,6 +2985,7 @@ impl Shell {
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
+            sidebar_row_model: None,
             resort_epoch: 0,
             was_window_active: false,
             debug_dialog,

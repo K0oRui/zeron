@@ -335,6 +335,13 @@ impl ChangeRequestClientState {
         self.snapshots.retain(|key, _| targets.contains(key));
     }
 
+    /// Every stored checkout snapshot, for callers that need to key a cached
+    /// derivation on this state instead of re-reading it (the sidebar's row
+    /// model fingerprint).
+    pub fn snapshots(&self) -> impl Iterator<Item = &CheckoutChangeRequestStatus> {
+        self.snapshots.values()
+    }
+
     pub fn change_request_for_chat<'a>(
         &'a self,
         chat: &Chat,
