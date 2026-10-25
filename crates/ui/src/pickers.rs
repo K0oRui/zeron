@@ -1940,8 +1940,24 @@ impl Pickers {
                 self.save_defaults();
             }
         }
+        // Only invalidate the row cache when the catalog content actually
+        // changed — redundant refreshes (stale-while-revalidate, duplicate
+        // opens, retry clicks) keep the cached flattened rows intact instead
+        // of forcing a full 7k-model recompute on every render.
+        let old = self.models.get(&harness).cloned();
+        let changed = match (&loaded, &old) {
+            (Loadable::Ready(new), Some(Loadable::Ready(old)))
+                if new.len() == old.len()
+                    && new.iter().zip(old.iter()).all(|(a, b)| a.id == b.id && a.label == b.label) =>
+            {
+                false
+            }
+            _ => true,
+        };
         self.models.insert(harness, loaded);
-        self.catalog_rev += 1;
+        if changed {
+            self.catalog_rev += 1;
+        }
         // A list that landed while its popover is open re-anchors the
         // keyboard highlight onto the selected row (it sat at 0 while
         // loading).
@@ -6257,16 +6273,41 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// Kilo advertises its whole gateway catalog, including rows that need
+/// credits. Same rule as the harness's discovery-side filter, repeated here so
+/// a catalog from an older engine still opens on the free rows only.
+fn kilo_model_is_free(model: &Model) -> bool {
+    let id = model.id.to_ascii_lowercase();
+    let label = model.label.to_ascii_lowercase();
+    id.ends_with(":free")
+        || id.ends_with("-free")
+        || id.ends_with("/free")
+        || label.ends_with(" (free)")
+        || label.ends_with("auto free")
+        || label.ends_with("free models router")
+}
+
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
 /// fold (`models_from_session`) for catalogs served by OLDER engines (the
 /// space's device may run any version): the `default` alias row drops when a
 /// real row exists, an orphan `<model>[1m]` variant presents as its base id
 /// with the Context Window trait pinned to 1M, and Claude rows adopt the
 /// curated catalog's labels so the version number always shows ("Opus 5.5",
-/// not the wire's terse "Opus" alias — user request). Idempotent over
-/// already-clean lists. The send path recomposes the advertised id from the
-/// base + trait (`pick_model_value`), so a folded pick still runs.
+/// not the wire's terse "Opus" alias — user request). Kilo keeps only its free
+/// rows. Idempotent over already-clean lists. The send path recomposes the
+/// advertised id from the base + trait (`pick_model_value`), so a folded pick
+/// still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
+    // An older engine never filtered Kilo's gateway rows. Keep the free ones;
+    // if the rule matches nothing (a renamed free tier), show the list as-is
+    // rather than an empty picker.
+    let models = if harness == HarnessId::Kilo {
+        let (free, paid): (Vec<Model>, Vec<Model>) =
+            models.into_iter().partition(kilo_model_is_free);
+        if free.is_empty() { paid } else { free }
+    } else {
+        models
+    };
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
     }
@@ -10169,7 +10210,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_strips_the_kilo_gateway_provider_prefix() {
+    fn normalize_keeps_only_free_kilo_rows_and_strips_the_prefix() {
         let models = normalize_model_rows(
             HarnessId::Kilo,
             vec![
@@ -10178,8 +10219,14 @@ mod tests {
                     "kilo/nvidia/nemotron-3-super-120b-a12b:free",
                     "Kilo Gateway/NVIDIA: Nemotron 3 Super (free)",
                 ),
+                bare_model(
+                    "kilo/anthropic/claude-sonnet-5",
+                    "Kilo Gateway/Anthropic: Claude Sonnet 5",
+                ),
+                bare_model("kilo/freeform/model", "Kilo Gateway/Freeform"),
             ],
         );
+        assert_eq!(models.len(), 2);
         assert_eq!(models[0].label, "Auto Free");
         assert_eq!(models[1].label, "NVIDIA: Nemotron 3 Super (free)");
         assert_eq!(models[0].id, "kilo/kilo-auto/free");

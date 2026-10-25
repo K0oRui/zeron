@@ -503,11 +503,35 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
         .map(|m| m.label.clone())
 }
 
+/// Kilo advertises its whole gateway catalog, including rows that need
+/// credits. Same rule as the harness's discovery-side filter, repeated here so
+/// a catalog from an older engine still opens on the free rows only.
+fn kilo_model_is_free(model: &ModelInfo) -> bool {
+    let id = model.id.to_ascii_lowercase();
+    let label = model.label.to_ascii_lowercase();
+    id.ends_with(":free")
+        || id.ends_with("-free")
+        || id.ends_with("/free")
+        || label.ends_with(" (free)")
+        || label.ends_with("auto free")
+        || label.ends_with("free models router")
+}
+
 /// Clean a live `ListModels` reply: drop a `default` placeholder when real
 /// rows exist, fold `[1m]`/`-1m` variants into a Context Window option, and
 /// prefer curated labels (legacy `HarnessCatalog.normalize`).
 pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     let catalog = curated_catalog(harness);
+    // An older engine never filtered Kilo's gateway rows. Keep the free ones;
+    // if the rule matches nothing (a renamed free tier), show the list as-is
+    // rather than an empty picker.
+    let models = if harness == "kilo" {
+        let (free, paid): (Vec<ModelInfo>, Vec<ModelInfo>) =
+            models.into_iter().partition(kilo_model_is_free);
+        if free.is_empty() { paid } else { free }
+    } else {
+        models
+    };
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
     models
@@ -738,6 +762,37 @@ mod tests {
         assert_eq!(out[0].id, "claude-opus-5");
         assert_eq!(out[0].label, "Opus 5");
         assert!(out[0].options.iter().any(|o| o.id == "contextWindow"));
+    }
+
+    #[test]
+    fn normalize_keeps_only_free_kilo_rows() {
+        let live = vec![
+            model(
+                "kilo/kilo-auto/free",
+                "Kilo Gateway/Auto Free",
+                "x",
+                &[],
+                vec![],
+            ),
+            model(
+                "kilo/nvidia/nemotron-3-super-120b-a12b:free",
+                "Kilo Gateway/NVIDIA: Nemotron 3 Super (free)",
+                "x",
+                &[],
+                vec![],
+            ),
+            model(
+                "kilo/anthropic/claude-sonnet-5",
+                "Kilo Gateway/Anthropic: Claude Sonnet 5",
+                "x",
+                &[],
+                vec![],
+            ),
+        ];
+        let out = normalize_models("kilo", live);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "kilo/kilo-auto/free");
+        assert_eq!(out[1].id, "kilo/nvidia/nemotron-3-super-120b-a12b:free");
     }
 
     #[test]
