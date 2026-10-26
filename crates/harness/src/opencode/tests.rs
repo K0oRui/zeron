@@ -3799,3 +3799,131 @@ async fn a_stopped_server_process_fails_the_turn_and_is_torn_down() {
     assert!(!alive, "the stopped server {pid} outlived its run");
     drop(steer_tx);
 }
+
+#[tokio::test]
+async fn revert_lists_files_then_posts_v1_rewind() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let posts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let recorded = posts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let posts = recorded.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let start = head.lines().next().unwrap_or_default().to_owned();
+                let content_length = head
+                    .lines()
+                    .filter_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .next()
+                    .unwrap_or(0);
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                while buf.len() < header_end + content_length {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let body: Value =
+                    serde_json::from_slice(&buf[header_end..header_end + content_length])
+                        .unwrap_or(Value::Null);
+                let mut parts = start.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                let path = target.split('?').next().unwrap_or_default();
+                if method == "POST" {
+                    posts.lock().unwrap().push((path.to_owned(), body));
+                }
+                let (status, payload) = match (method, path) {
+                    ("GET", "/global/health") => (
+                        "200 OK",
+                        json!({ "healthy": true, "version": "1.18.31" }),
+                    ),
+                    ("GET", "/session/ses_1") => ("200 OK", json!({ "id": "ses_1" })),
+                    ("GET", "/session/ses_1/message") => (
+                        "200 OK",
+                        json!([
+                            {
+                                "info": { "id": "msg_a", "role": "user" },
+                                "parts": [{ "type": "text", "text": "first" }]
+                            },
+                            {
+                                "info": { "id": "msg_b", "role": "assistant" },
+                                "parts": [{ "type": "text", "text": "ok" }]
+                            },
+                            {
+                                "info": { "id": "msg_c", "role": "user" },
+                                "parts": [{ "type": "text", "text": "second" }]
+                            }
+                        ]),
+                    ),
+                    ("GET", "/session/ses_1/diff") => (
+                        "200 OK",
+                        json!([{ "path": "src/main.rs" }, { "path": "README.md" }]),
+                    ),
+                    ("POST", "/session/ses_1/revert") => ("200 OK", json!({ "id": "ses_1" })),
+                    _ => ("404 Not Found", json!({ "missing": path })),
+                };
+                let body = payload.to_string();
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let harness = OpencodeHarness::new().with_base_url(base);
+    let request: RunRequest = serde_json::from_value(json!({
+        "prompt": "x", "cwd": "/tmp", "sandbox": "workspace-write", "resume": "ses_1"
+    }))
+    .unwrap();
+    let target = crate::RevertTarget {
+        message_id: "z2".into(),
+        user_index: 1,
+        text: "second".into(),
+    };
+    let files = crate::Harness::revert_preview(&harness, request.clone(), target.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        files,
+        vec!["README.md".to_string(), "src/main.rs".to_string()]
+    );
+    crate::Harness::revert_commit(&harness, request, target, true)
+        .await
+        .unwrap();
+    let posted = posts.lock().unwrap().clone();
+    assert!(
+        posted.iter().any(|(path, body)| {
+            path.ends_with("/revert") && body["messageID"] == "msg_c" && body["files"] == true
+        }),
+        "{posted:?}"
+    );
+}

@@ -764,20 +764,10 @@ impl SessionsEngine {
             .or_else(|| host.request_from_chat_row(chat_id, &text))
             .ok_or_else(|| EngineError::Other("no run configuration for this chat".into()))?;
         let harness = request.harness.unwrap_or_else(|| host.harness_for(chat_id));
-        if harness != HarnessId::Opencode {
-            return Err(EngineError::Other(
-                "Chat revert is only available for OpenCode sessions".into(),
-            ));
-        }
         request.harness = Some(harness);
         request.prompt = text.clone();
         if request.resume.as_deref().is_none_or(str::is_empty) {
             request.resume = self.inner.resume_for(chat_id, &request.cwd, harness);
-        }
-        if request.resume.as_deref().is_none_or(str::is_empty) {
-            return Err(EngineError::Other(
-                "This chat has no OpenCode session to rewind".into(),
-            ));
         }
         Ok((
             request,

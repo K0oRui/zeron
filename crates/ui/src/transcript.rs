@@ -7908,7 +7908,7 @@ impl Transcript {
                     }))
                     .tooltip(crate::settings::widgets::text_tooltip("Revert to here"))
                     .child(
-                        crate::icons::icon(crate::icons::ALT_ARROW_LEFT)
+                        crate::icons::icon(crate::icons::UNDO_LEFT)
                             .size(px(14.0))
                             .text_color(theme.text_muted),
                     )

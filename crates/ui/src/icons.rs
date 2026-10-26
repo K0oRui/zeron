@@ -137,6 +137,8 @@ icon_assets![
     (ARCHIVE_UP_MINIMALISTIC, "archive-up-minimalistic"),
     (REFRESH, "refresh"),
     (RESTART, "restart"),
+    // Solar Icons Linear undo-left — transcript "Revert to here".
+    (UNDO_LEFT, "undo-left"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
     (EYE, "eye"),
@@ -380,6 +382,7 @@ mod tests {
             GLOBAL,
             COPY,
             REFRESH,
+            UNDO_LEFT,
             ALT_ARROW_LEFT,
             ALT_ARROW_DOWN,
             ARROW_UP_RIGHT,

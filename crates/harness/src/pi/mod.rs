@@ -77,6 +77,12 @@ impl PiHarness {
         self.agent_dir = Some(path.into());
         self
     }
+
+    fn session_file(&self, request: &RunRequest) -> Option<PathBuf> {
+        let id = crate::revert::resume_id(request)?;
+        let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
+        store.resolve(id, Path::new(&request.cwd)).ok()
+    }
     pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
         self.interrupt_grace = interrupt;
         self.kill_grace = kill;
@@ -465,6 +471,23 @@ impl Harness for PiHarness {
             futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
                 .boxed(),
         )
+    }
+
+    async fn revert_preview(
+        &self,
+        request: RunRequest,
+        target: crate::RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        crate::revert::preview_at(self.session_file(&request).as_deref(), &target)
+    }
+
+    async fn revert_commit(
+        &self,
+        request: RunRequest,
+        target: crate::RevertTarget,
+        _files: bool,
+    ) -> Result<(), HarnessError> {
+        crate::revert::commit_at(self.session_file(&request).as_deref(), &target)
     }
 }
 #[derive(Clone)]

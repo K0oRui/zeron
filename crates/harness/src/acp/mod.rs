@@ -2576,6 +2576,33 @@ impl Harness for AcpHarness {
             events
         })
     }
+
+    async fn revert_preview(
+        &self,
+        request: RunRequest,
+        target: crate::RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        let file = crate::revert::session_file_in(
+            self.spec.id,
+            &request,
+            self.sessions_root.as_deref(),
+        );
+        crate::revert::preview_at(file.as_deref(), &target)
+    }
+
+    async fn revert_commit(
+        &self,
+        request: RunRequest,
+        target: crate::RevertTarget,
+        _files: bool,
+    ) -> Result<(), HarnessError> {
+        let file = crate::revert::session_file_in(
+            self.spec.id,
+            &request,
+            self.sessions_root.as_deref(),
+        );
+        crate::revert::commit_at(file.as_deref(), &target)
+    }
 }
 
 // ---------------------------------------------------------------------------
