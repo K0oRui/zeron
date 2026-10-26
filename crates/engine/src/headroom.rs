@@ -3,8 +3,10 @@
 //! Headroom is a per-device runtime: it is installed beside the agent CLIs and
 //! listens on loopback, so its preference file, install, and process all live
 //! in the engine data dir rather than the synced workspace. When enabled, runs
-//! for the providers that document a base-URL override get that override in
-//! their spawn environment (the same seam the credential broker uses).
+//! for [`PROVIDERS`] get the proxy in their spawn environment (the same seam
+//! the credential broker uses): a base-URL override, or for OpenCode a value
+//! its harness turns into provider config. Agents named by [`UNROUTED`] have
+//! no such seam, and Settings says so rather than implying full coverage.
 //!
 //! Everything here fails open: an agent run never waits on Headroom, and a
 //! proxy that cannot start only records an error in [`HeadroomStatus`].
@@ -29,15 +31,32 @@ const OPENCODE_PROXY_ENV: &str = "HEADROOM_PROXY_URL";
 /// environment only, like every other credential-broker value.
 const OPENCODE_PLUGIN_ENV: &str = "ZERON_HEADROOM_OPENCODE_PLUGIN";
 
-/// Providers Zeron can route through the proxy. Four honor a documented
-/// base-URL variable; OpenCode takes the same routing as inline config, which
-/// its harness merges into the `OPENCODE_CONFIG_CONTENT` it already builds.
-pub const PROVIDERS: [HarnessId; 5] = [
+/// Providers Zeron can route through the proxy. Each one either honors a
+/// documented base-URL variable, or (OpenCode) takes the same routing as
+/// inline config its harness merges into the `OPENCODE_CONFIG_CONTENT` it
+/// already builds. `routes` is the other half of this list: a provider here
+/// must produce an override, and [`UNROUTED`] must not.
+pub const PROVIDERS: [HarnessId; 6] = [
     HarnessId::ClaudeCode,
     HarnessId::Codex,
+    HarnessId::Cursor,
     HarnessId::Grok,
     HarnessId::Opencode,
     HarnessId::Antigravity,
+];
+
+/// Agents Zeron runs that Headroom cannot route. Their CLIs read no base-URL
+/// variable and expose no inline proxy seam, so traffic bypasses the proxy
+/// whatever the preference says. Settings names them instead of letting the
+/// routed list imply full coverage (`Mock` is test-only and stays out of both
+/// lists).
+pub const UNROUTED: [HarnessId; 6] = [
+    HarnessId::Devin,
+    HarnessId::Hermes,
+    HarnessId::Pi,
+    HarnessId::Kilo,
+    HarnessId::Muse,
+    HarnessId::NvidiaNim,
 ];
 
 const INSTALL_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -228,6 +247,7 @@ impl Headroom {
             installing,
             error,
             providers: PROVIDERS.to_vec(),
+            unrouted: UNROUTED.to_vec(),
             manual_command: Some(manual_install_command()),
         }
     }
@@ -522,10 +542,9 @@ impl Headroom {
         self.stop_proxy().await;
         let mut inner = self.lock();
         inner.running = false;
-        inner.error = Some(
-            "Headroom's proxy didn't answer on 127.0.0.1:8787. Check that the port is free, then retry."
-                .into(),
-        );
+        inner.error = Some(format!(
+            "Headroom's proxy didn't answer on 127.0.0.1:{PORT}. Check that the port is free, then retry."
+        ));
         None
     }
 
@@ -582,22 +601,45 @@ impl Headroom {
     }
 }
 
-/// The environment overrides one provider needs to reach `port`.
-fn apply_routes(harness: HarnessId, port: u16, env: &mut BTreeMap<String, String>) {
+/// The environment overrides one provider needs to reach `port`, in the order
+/// they are applied. A provider [`PROVIDERS`] lists must return at least one
+/// entry here; anything else returns none, so an unrouted agent's run is left
+/// exactly as it would be with Headroom off.
+///
+/// Anthropic-family clients append `/v1/messages` themselves, so they get the
+/// bare origin; OpenAI-family clients append `/chat/completions` to a base
+/// that already ends in `/v1`.
+fn routes(harness: HarnessId, port: u16) -> Vec<(&'static str, String)> {
     let base = format!("http://127.0.0.1:{port}");
-    let (key, value) = match harness {
-        HarnessId::ClaudeCode => ("ANTHROPIC_BASE_URL", base),
-        HarnessId::Codex => ("OPENAI_BASE_URL", format!("{base}/v1")),
-        HarnessId::Grok => ("GROK_MODELS_BASE_URL", format!("{base}/v1")),
-        HarnessId::Antigravity => ("GOOGLE_GEMINI_BASE_URL", base),
+    let openai = format!("{base}/v1");
+    match harness {
+        // GH #746: with a custom ANTHROPIC_BASE_URL and ENABLE_TOOL_SEARCH
+        // unset, Claude Code stops searching tools and loses its MCP tools.
+        HarnessId::ClaudeCode => vec![
+            ("ANTHROPIC_BASE_URL", base),
+            ("ENABLE_TOOL_SEARCH", "true".into()),
+        ],
+        HarnessId::Codex => vec![("OPENAI_BASE_URL", openai)],
+        // Cursor's agent picks its endpoints from these two, the same pair
+        // Headroom's own Cursor install writes into the app's environment.
+        HarnessId::Cursor => vec![
+            ("OPENAI_BASE_URL", openai),
+            ("ANTHROPIC_BASE_URL", base),
+        ],
+        HarnessId::Grok => vec![("GROK_MODELS_BASE_URL", openai)],
+        // Antigravity's ACP server is Gemini-CLI lineage and reads the CLI's
+        // endpoint variable; Headroom has no variable of its own for it.
+        HarnessId::Antigravity => vec![("GOOGLE_GEMINI_BASE_URL", base)],
         // OpenCode has no base-URL variable: its harness turns this into the
         // provider overrides and plugin entry inside its inline config.
-        HarnessId::Opencode => (OPENCODE_PROXY_ENV, base),
-        _ => return,
-    };
-    env.insert(key.to_string(), value);
-    if harness == HarnessId::ClaudeCode {
-        env.insert("ENABLE_TOOL_SEARCH".into(), "true".into());
+        HarnessId::Opencode => vec![(OPENCODE_PROXY_ENV, base)],
+        _ => Vec::new(),
+    }
+}
+
+fn apply_routes(harness: HarnessId, port: u16, env: &mut BTreeMap<String, String>) {
+    for (key, value) in routes(harness, port) {
+        env.insert(key.to_string(), value);
     }
 }
 
@@ -879,6 +921,14 @@ mod tests {
         apply_routes(HarnessId::Codex, 8787, &mut env);
         assert_eq!(env["OPENAI_BASE_URL"], "http://127.0.0.1:8787/v1");
 
+        // Cursor rides both families: whichever models a chat uses, the agent
+        // resolves that base URL through the proxy.
+        let mut env = BTreeMap::new();
+        apply_routes(HarnessId::Cursor, 8787, &mut env);
+        assert_eq!(env["OPENAI_BASE_URL"], "http://127.0.0.1:8787/v1");
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
+        assert_eq!(env.len(), 2);
+
         let mut env = BTreeMap::new();
         apply_routes(HarnessId::Grok, 8787, &mut env);
         assert_eq!(env["GROK_MODELS_BASE_URL"], "http://127.0.0.1:8787/v1");
@@ -896,10 +946,43 @@ mod tests {
 
     #[test]
     fn unsupported_providers_are_left_alone() {
+        for harness in UNROUTED {
+            let mut env = BTreeMap::new();
+            apply_routes(harness, 8787, &mut env);
+            assert!(env.is_empty(), "{} must not be routed", harness.as_str());
+        }
+        // ...including the test harness, which is in neither list.
         let mut env = BTreeMap::new();
-        apply_routes(HarnessId::Cursor, 8787, &mut env);
-        apply_routes(HarnessId::Devin, 8787, &mut env);
+        apply_routes(HarnessId::Mock, 8787, &mut env);
         assert!(env.is_empty());
+    }
+
+    /// The card's two lists are the whole product's provider surface: every
+    /// agent either has a route or is named as one Headroom cannot compress.
+    #[test]
+    fn provider_lists_match_the_route_table() {
+        for harness in HarnessId::ALL {
+            assert_eq!(
+                !routes(harness, 8787).is_empty(),
+                PROVIDERS.contains(&harness),
+                "{} is listed and routed inconsistently",
+                harness.as_str()
+            );
+            assert!(
+                PROVIDERS.contains(&harness)
+                    || UNROUTED.contains(&harness)
+                    || harness == HarnessId::Mock,
+                "{} is neither routed nor listed as unroutable",
+                harness.as_str()
+            );
+        }
+        for harness in PROVIDERS {
+            assert!(
+                !UNROUTED.contains(&harness),
+                "{} is listed both ways",
+                harness.as_str()
+            );
+        }
     }
 
     #[test]

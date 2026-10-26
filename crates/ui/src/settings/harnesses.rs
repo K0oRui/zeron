@@ -154,6 +154,53 @@ fn headroom_provider_labels(providers: &[HarnessId]) -> String {
     names.join(", ")
 }
 
+/// The one line under the Headroom title: what the proxy is doing right now,
+/// which says more than "on" ever could.
+fn headroom_detail(status: &HeadroomStatus, installing: bool) -> String {
+    if installing {
+        return "Installing the proxy…".into();
+    }
+    if let Some(error) = &status.error {
+        return format!("Error — {error}");
+    }
+    if !status.installed {
+        return format!(
+            "Not installed · the proxy listens on 127.0.0.1:{}",
+            status.port
+        );
+    }
+    let version = status
+        .version
+        .as_deref()
+        .map(|version| format!(" · v{version}"))
+        .unwrap_or_default();
+    match (status.enabled, status.running) {
+        (false, _) => format!(
+            "Off · rides 127.0.0.1:{} when enabled{version}",
+            status.port
+        ),
+        (true, true) => format!("Running on 127.0.0.1:{}{version}", status.port),
+        (true, false) => format!(
+            "Not answering on 127.0.0.1:{}{version} — retried at the next run",
+            status.port
+        ),
+    }
+}
+
+/// What the one button says: the same action installs, updates and repairs,
+/// so the label names whichever the device needs.
+fn headroom_action_label(status: &HeadroomStatus, installing: bool) -> &'static str {
+    if installing {
+        "Installing…"
+    } else if !status.installed {
+        "Install"
+    } else if status.update_available {
+        "Update"
+    } else {
+        "Reinstall"
+    }
+}
+
 /// The failure was the update itself (its release is still known, so it can
 /// be retried), not a failed check.
 fn install_failed(status: &HarnessUpdateStatus) -> bool {
@@ -631,6 +678,14 @@ impl HarnessesPage {
         self.updates = Loadable::Idle;
         self.update_task = None;
         self.update_action_task = None;
+        // Another device is another proxy: never paint the old one's status
+        // under the new device's name.
+        self.headroom = Loadable::Idle;
+        self.headroom_task = None;
+        self.headroom_action_task = None;
+        self.headroom_install_task = None;
+        self.pending_headroom_toggle = None;
+        self.installing_headroom = false;
         self.load(cx);
         if let Some(painted) = painted.filter(|_| matches!(self.harnesses, Loadable::Loading)) {
             self.harnesses = painted;
@@ -642,6 +697,10 @@ impl HarnessesPage {
     /// `ListHarnesses` against the target device (installed probe + enabled
     /// set both come from where the CLIs actually live).
     fn load(&mut self, cx: &mut Context<Self>) {
+        // The Headroom card is part of this page, so the same load that
+        // paints the rows reads the device's proxy runtime. Without this the
+        // card had its state loaded by nothing and never rendered.
+        self.load_headroom(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -972,7 +1031,10 @@ impl HarnessesPage {
             return;
         };
         let params = self.with_target(serde_json::json!({}));
-        self.headroom = Loadable::Loading;
+        // A re-read keeps the painted card: only the first answer blanks it.
+        if !matches!(self.headroom, Loadable::Ready(_)) {
+            self.headroom = Loadable::Loading;
+        }
         self.headroom_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::GET_HEADROOM, params).await;
             this.update(cx, |page, cx| {
@@ -989,8 +1051,9 @@ impl HarnessesPage {
         }));
     }
 
-    fn headroom_failed(&mut self, _error: String, cx: &mut Context<Self>) {
-        self.load_headroom(cx);
+    /// A refused or failed call lands on the card, which offers a retry.
+    fn headroom_failed(&mut self, error: String, _cx: &mut Context<Self>) {
+        self.headroom = Loadable::Error(error);
     }
 
     fn set_headroom_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1022,6 +1085,7 @@ impl HarnessesPage {
             })
             .ok();
         }));
+        cx.notify();
     }
 
     fn install_headroom(&mut self, cx: &mut Context<Self>) {
@@ -1049,29 +1113,81 @@ impl HarnessesPage {
             })
             .ok();
         }));
+        cx.notify();
     }
 
-    /// The device's Headroom proxy: install/update, on/off, and what it
-    /// routes.
+    /// The device's Headroom proxy: install/update, on/off, health, and what
+    /// it routes. Drawn while the answer is in flight and when it fails too,
+    /// so the row never disappears mid-read.
     fn render_headroom(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.supports_headroom(cx) {
             return None;
         }
-        let Some(status) = self.headroom.ready() else {
-            return None;
-        };
+        match &self.headroom {
+            Loadable::Idle | Loadable::Loading => Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::row_title(theme, "Headroom"))
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![div()
+                                    .child(SharedString::from("Reading the proxy's state…"))
+                                    .into_any_element()],
+                            )),
+                    )
+                    .child(crate::loaders::ring_spinner(
+                        "headroom-loading",
+                        12.0,
+                        theme.text_muted,
+                    ))
+                    .into_any_element(),
+            ),
+            Loadable::Error(message) => {
+                let message = message.clone();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(widgets::row_title(theme, "Headroom"))
+                        .child(widgets::error_strip(theme, message))
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("headroom-retry")
+                                .tab_index(0)
+                                .role(gpui::Role::Button)
+                                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .on_click(cx.listener(|page, _, _, cx| page.load_headroom(cx)))
+                                .child(SharedString::from("Retry")),
+                        )
+                        .into_any_element(),
+                )
+            }
+            Loadable::Ready(status) => Some(self.render_headroom_ready(status, theme, cx)),
+        }
+    }
+
+    fn render_headroom_ready(
+        &self,
+        status: &HeadroomStatus,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let installing = self.installing_headroom || status.installing;
         let enabled = self.pending_headroom_toggle.unwrap_or(status.enabled);
         let enabled_copy = enabled;
-        let providers = headroom_provider_labels(&status.providers);
+        let pending = self.pending_headroom_toggle.is_some();
         let toggle = widgets::toggle_switch(theme, enabled, "headroom-switch")
             .id("headroom-toggle")
-            .when(self.pending_headroom_toggle.is_some() || installing, |el| {
-                el.opacity(0.55)
-            })
-            .when(installing, |el| {
-                el.cursor_not_allowed()
-            })
+            .when(pending || installing, |el| el.opacity(0.55))
+            .when(installing, |el| el.cursor_not_allowed())
             .when(!installing, |el| {
                 let enabled_copy = enabled_copy;
                 el.cursor_pointer()
@@ -1090,52 +1206,71 @@ impl HarnessesPage {
                         page.set_headroom_enabled(!enabled_copy, cx);
                     }))
             });
-        let install = widgets::ghost_action(&theme)
+        // Install, update and repair all run the same action: the engine
+        // updates a present install and installs a missing one. The button is
+        // live in every state but "already installing" — a missing runtime is
+        // exactly when Install is needed.
+        let action_label = headroom_action_label(status, installing);
+        let install = widgets::ghost_action(theme)
             .id("headroom-install")
-            .when(!status.installed || installing, |el| {
-                el.opacity(0.55)
-            })
-            .when(status.installed && !installing, |el| {
+            .when(installing, |el| el.opacity(0.55))
+            .when(!installing, |el| {
                 el.cursor_pointer()
                     .tab_index(0)
                     .role(gpui::Role::Button)
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
                     .on_click(cx.listener(|page, _, _, cx| {
                         page.install_headroom(cx);
                     }))
             })
-            .child(if installing {
-                SharedString::from("Installing…")
-            } else if status.installed {
-                SharedString::from("Installed")
-            } else {
-                SharedString::from("Install")
-            });
-        let detail = if installing {
-            SharedString::from("Installing Headroom proxy…")
-        } else if let Some(message) = &status.error {
-            SharedString::from(format!("Error — {message}"))
-        } else if !providers.is_empty() {
-            SharedString::from(format!("Routes {providers}"))
-        } else {
-            SharedString::from("Idle")
-        };
-        Some(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(16.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(widgets::row_title(theme, "Headroom"))
-                        .child(widgets::meta_line(theme, vec![div().child(detail).into_any_element()])),
-                )
-                .child(toggle)
-                .child(install)
-                .into_any_element(),
-        )
+            .child(SharedString::from(action_label));
+        let mut fragments = vec![div()
+            .child(SharedString::from(headroom_detail(status, installing)))
+            .into_any_element()];
+        let providers = headroom_provider_labels(&status.providers);
+        if !providers.is_empty() {
+            fragments.push(
+                div()
+                    .child(SharedString::from(format!("Routes {providers}")))
+                    .into_any_element(),
+            );
+        }
+        if let Some(manual) = &status.manual_command
+            && !status.installed
+            && status.error.is_some()
+        {
+            // The install could not run on its own: say what to run instead.
+            fragments.push(
+                div()
+                    .child(SharedString::from(format!("Run it yourself: {manual}")))
+                    .into_any_element(),
+            );
+        }
+        let unrouted = headroom_provider_labels(&status.unrouted);
+        let mut detail = div()
+            .flex_1()
+            .min_w_0()
+            .child(widgets::row_title(theme, "Headroom"))
+            .child(widgets::meta_line(theme, fragments));
+        if !unrouted.is_empty() {
+            detail = detail.child(widgets::meta_line(
+                theme,
+                vec![div()
+                    .child(SharedString::from(format!(
+                        "Not routed: {unrouted} (these agents read no proxy setting)"
+                    )))
+                    .into_any_element()],
+            ));
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(16.0))
+            .child(detail)
+            .child(toggle)
+            .child(install)
+            .into_any_element()
     }
 
     fn set_update_policy(
@@ -2074,4 +2209,42 @@ fn install_phase_copy_and_cancel_target_match_install() {
         install_hint(HarnessId::Codex, true, false)
             .starts_with("codex CLI not installed — turn it off or install it.")
     );
+}
+
+#[cfg(test)]
+#[test]
+fn headroom_detail_names_what_the_proxy_is_doing() {
+    use zeron_proto::headroom::HeadroomStatus;
+    let mut status = HeadroomStatus::unavailable();
+    assert!(super::headroom_detail(&status, false).starts_with("Not installed"));
+    status.installed = true;
+    status.version = Some("0.41.0".into());
+    assert_eq!(
+        super::headroom_detail(&status, false),
+        "Off · rides 127.0.0.1:8787 when enabled · v0.41.0"
+    );
+    status.enabled = true;
+    status.running = true;
+    assert_eq!(
+        super::headroom_detail(&status, false),
+        "Running on 127.0.0.1:8787 · v0.41.0"
+    );
+    // An error outranks every state: it is what the user has to act on.
+    status.error = Some("boom".into());
+    assert_eq!(super::headroom_detail(&status, false), "Error — boom");
+    assert_eq!(super::headroom_detail(&status, true), "Installing the proxy…");
+}
+
+#[cfg(test)]
+#[test]
+fn headroom_button_offers_the_action_the_device_needs() {
+    use zeron_proto::headroom::HeadroomStatus;
+    let mut status = HeadroomStatus::unavailable();
+    // A missing runtime is exactly when Install must be clickable.
+    assert_eq!(super::headroom_action_label(&status, false), "Install");
+    status.installed = true;
+    assert_eq!(super::headroom_action_label(&status, false), "Reinstall");
+    status.update_available = true;
+    assert_eq!(super::headroom_action_label(&status, false), "Update");
+    assert_eq!(super::headroom_action_label(&status, true), "Installing…");
 }

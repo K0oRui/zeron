@@ -38,6 +38,11 @@ pub struct HeadroomStatus {
     /// Providers this build routes through the proxy.
     #[serde(default)]
     pub providers: Vec<HarnessId>,
+    /// Agents Zeron can run that Headroom cannot route: their CLIs read no
+    /// base-URL variable and take no inline proxy config. Settings names them
+    /// so the card never reads as "every provider is compressed".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrouted: Vec<HarnessId>,
     /// The command Install/Update runs, for display when automation is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_command: Option<String>,
@@ -56,6 +61,7 @@ impl HeadroomStatus {
             installing: false,
             error: None,
             providers: Vec::new(),
+            unrouted: Vec::new(),
             manual_command: None,
         }
     }
@@ -77,6 +83,7 @@ mod tests {
             installing: false,
             error: None,
             providers: vec![HarnessId::ClaudeCode, HarnessId::Codex],
+            unrouted: vec![HarnessId::Hermes],
             manual_command: None,
         };
         let json = serde_json::to_value(&status).unwrap();
@@ -85,6 +92,7 @@ mod tests {
         assert_eq!(json["updateAvailable"], true);
         assert_eq!(json["running"], true);
         assert_eq!(json["providers"][0], "claude-code");
+        assert_eq!(json["unrouted"][0], "hermes");
         assert_eq!(
             serde_json::from_value::<HeadroomStatus>(json).unwrap(),
             status
@@ -102,6 +110,7 @@ mod tests {
         .unwrap();
         assert!(!status.installing);
         assert!(status.providers.is_empty());
+        assert!(status.unrouted.is_empty());
         assert!(status.error.is_none());
         assert!(!status.update_available);
     }
