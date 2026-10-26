@@ -78,7 +78,9 @@ use zeron_proto::{
 };
 
 use crate::process::{Child, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RevertTarget, RunControls};
+
+mod rewind;
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -454,6 +456,56 @@ impl OpencodeHarness {
         Server::spawn_with_env(&exe, cwd, self.startup_timeout, mcp, run_env).await
     }
 
+    /// `files = None` previews (returns the paths a commit could restore).
+    /// `files = Some(restore)` commits the rewind.
+    async fn revert_native(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+        files: Option<bool>,
+    ) -> Result<Option<Vec<String>>, HarnessError> {
+        let Some(session_id) = crate::revert::resume_id(&request).map(str::to_owned) else {
+            return Ok(if files.is_none() {
+                Some(Vec::new())
+            } else {
+                None
+            });
+        };
+        let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
+        let mut server = self
+            .server_with_env(directory.as_deref(), request.mcp.as_ref(), &request.env)
+            .await?;
+        if server
+            .session_info(&session_id, directory.as_deref())
+            .await
+            .is_err()
+        {
+            server.shutdown(self.kill_grace).await;
+            return Ok(if files.is_none() {
+                Some(Vec::new())
+            } else {
+                None
+            });
+        }
+        let result = if let Some(restore) = files {
+            rewind::commit(
+                &server,
+                &session_id,
+                directory.as_deref(),
+                &target,
+                restore,
+            )
+            .await
+            .map(|()| None)
+        } else {
+            rewind::preview(&server, &session_id, directory.as_deref(), &target)
+                .await
+                .map(Some)
+        };
+        server.shutdown(self.kill_grace).await;
+        result
+    }
+
     /// One short-lived server answers both discovery calls. Also primes the
     /// commands cache so concurrent picker/composer fetches share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -674,6 +726,27 @@ impl Harness for OpencodeHarness {
             rx.recv().await.map(|ev| (ev, rx))
         })
         .boxed())
+    }
+
+    async fn revert_preview(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        self.revert_native(request, target, None)
+            .await
+            .map(|files| files.unwrap_or_default())
+    }
+
+    async fn revert_commit(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+        files: bool,
+    ) -> Result<(), HarnessError> {
+        self.revert_native(request, target, Some(files))
+            .await
+            .map(|_| ())
     }
 }
 

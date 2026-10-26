@@ -26,8 +26,8 @@ use zeron_proto::{
 };
 
 use crate::{
-    CancellationToken, Harness, HarnessError, ModelCatalog, ModelContext, RunControls, SteerMessage,
-    TurnControl,
+    CancellationToken, Harness, HarnessError, ModelCatalog, ModelContext, RevertTarget, RunControls,
+    SteerMessage, TurnControl,
 };
 
 const NIM_BASE_URL: &str = "https://integrate.api.nvidia.com";
@@ -458,6 +458,23 @@ impl Harness for NvidiaNimHarness {
         })
         .boxed())
     }
+
+    async fn revert_preview(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        self.sessions().preview(&request, &target)
+    }
+
+    async fn revert_commit(
+        &self,
+        request: RunRequest,
+        target: RevertTarget,
+        _files: bool,
+    ) -> Result<(), HarnessError> {
+        self.sessions().commit(&request, &target)
+    }
 }
 
 struct RunStreamGuard {
@@ -549,6 +566,58 @@ impl HistoryStore {
             ));
         }
         Ok(Some(saved.messages))
+    }
+
+    fn user_turns(messages: &[HistoryMessage]) -> Vec<crate::revert::UserTurn> {
+        messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == "user")
+            .map(|(index, message)| crate::revert::UserTurn {
+                key: index as u64,
+                text: message.content.clone(),
+                id: message.message_id.clone(),
+            })
+            .collect()
+    }
+
+    fn preview(
+        &self,
+        request: &RunRequest,
+        target: &crate::RevertTarget,
+    ) -> Result<Vec<String>, HarnessError> {
+        let Some(session_id) = crate::revert::resume_id(request) else {
+            return Ok(Vec::new());
+        };
+        let Some(messages) = self.load(session_id)? else {
+            return Ok(Vec::new());
+        };
+        let turns = Self::user_turns(&messages);
+        if turns.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::revert::pick_turn(&turns, target)?;
+        Ok(Vec::new())
+    }
+
+    fn commit(
+        &self,
+        request: &RunRequest,
+        target: &crate::RevertTarget,
+    ) -> Result<(), HarnessError> {
+        let Some(session_id) = crate::revert::resume_id(request) else {
+            return Ok(());
+        };
+        let Some(mut messages) = self.load(session_id)? else {
+            return Ok(());
+        };
+        let turns = Self::user_turns(&messages);
+        if turns.is_empty() {
+            return Ok(());
+        }
+        let cut = crate::revert::pick_turn(&turns, target)?.key as usize;
+        messages.truncate(cut);
+        self.save(session_id, &messages)
     }
 
     fn save(&self, session_id: &str, messages: &[HistoryMessage]) -> Result<(), HarnessError> {
@@ -1589,5 +1658,40 @@ mod tests {
         assert!(saw_error);
         assert_eq!(status, DoneStatus::Errored);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn revert_truncates_saved_history_at_the_user_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = HistoryStore {
+            root: tmp.path().to_path_buf(),
+        };
+        store
+            .save(
+                "s1",
+                &[
+                    HistoryMessage::user("first".into(), Vec::new(), Some("m1".into())),
+                    HistoryMessage::assistant("a".into()),
+                    HistoryMessage::user("second".into(), Vec::new(), Some("m2".into())),
+                    HistoryMessage::assistant("b".into()),
+                ],
+            )
+            .unwrap();
+        let mut request = run_request();
+        request.resume = Some("s1".into());
+        let target = crate::RevertTarget {
+            message_id: "m2".into(),
+            user_index: 1,
+            text: "second".into(),
+        };
+        assert!(store.preview(&request, &target).unwrap().is_empty());
+        store.commit(&request, &target).unwrap();
+        let kept = store.load("s1").unwrap().unwrap();
+        assert_eq!(
+            kept.iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "a"]
+        );
     }
 }

@@ -288,26 +288,25 @@ pub trait Harness: Send + Sync {
 
     /// Resolve a revert at `target` and report the files it would restore.
     /// The caller must have torn down the live runtime first.
+    ///
+    /// Default: rewind a JSONL session store when one exists; report no
+    /// restorable files (only OpenCode snapshots files today).
     async fn revert_preview(
         &self,
-        _request: RunRequest,
-        _target: RevertTarget,
+        request: RunRequest,
+        target: RevertTarget,
     ) -> Result<Vec<String>, HarnessError> {
-        Err(HarnessError::Protocol(
-            "chat revert is not supported by this harness".into(),
-        ))
+        crate::revert::preview(self.id(), &request, &target)
     }
 
     /// Commit the revert at `target`, optionally restoring file snapshots.
     async fn revert_commit(
         &self,
-        _request: RunRequest,
-        _target: RevertTarget,
-        _files: bool,
+        request: RunRequest,
+        target: RevertTarget,
+        files: bool,
     ) -> Result<(), HarnessError> {
-        Err(HarnessError::Protocol(
-            "chat revert is not supported by this harness".into(),
-        ))
+        crate::revert::commit(self.id(), &request, &target, files)
     }
 
     /// Bootstrap without a synthetic user prompt; providers opt in explicitly.
@@ -332,6 +331,7 @@ pub(crate) mod adapter_install;
 pub mod archive_install;
 mod catalog;
 mod catalog_failure;
+mod revert;
 pub(crate) mod code_signature;
 pub mod redact;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};

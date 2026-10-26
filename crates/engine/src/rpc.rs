@@ -2021,7 +2021,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         method,
         methods::REVERT_PREVIEW | methods::REVERT_COMMIT | methods::REVERT_CANCEL
     ) {
-        // A cold OpenCode boot can take minutes before the revert resolves.
+        // A cold provider boot (OpenCode especially) can take minutes.
         return Duration::from_secs(8 * 60);
     }
     use std::time::Duration;
