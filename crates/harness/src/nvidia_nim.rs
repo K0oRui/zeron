@@ -1370,7 +1370,7 @@ mod tests {
         let events = decoder
             .push(b"\xA6\x80\",\"more\":true}\r\ndata: second\r\n\r\n")
             .unwrap();
-        assert_eq!(events, vec!["{\"text\":\"🙂\",\"more\":true}\nsecond"]);
+        assert_eq!(events, vec!["{\"text\":\"🦀\",\"more\":true}\nsecond"]);
         assert_eq!(decoder.finish().unwrap(), Vec::<String>::new());
     }
 
