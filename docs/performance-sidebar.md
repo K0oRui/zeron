@@ -234,7 +234,27 @@ Two waves, all of them outside the row model:
      state.
 
 Final state: `Windows tests`, `macOS tests`, `Native Codex voice`, `Android`,
-`Preview networking`, `Cursor compatibility` and `core-tests` pass. Both Linux
-UI jobs in that run stopped in the CI action's `apt` step
-(`libwebkit2gtk-4.1-0`: `download failed` after ~150 s) before compiling, the
-same step that succeeded on the previous run; they are re-run with this commit.
+`Preview networking`, `Cursor compatibility`, `core-tests` and both Linux UI
+jobs pass.
+
+### Why the apt step could fail a green build
+
+`ui-tests` and `linux-browser` each lost one run in the CI action's `apt` step
+(`libwebkit2gtk-4.1-0`: `download failed` after ~150 s) before compiling
+anything. `scripts/ci/apt-install.sh` already retried, but it retried *the same
+mirror*: the runner's sources point apt at a mirror LIST
+(`mirror+file:/etc/apt/apt-mirrors.txt`) that resolves to one regional mirror,
+so three or four bounded attempts all stalled against the same host and the
+job died after ten minutes. The cache was not the problem — most .debs came
+from it and only the packages upstream had republished (that webkit build is
+25.5 MB) had to be fetched.
+
+The script now keeps a second host for the same suites: when the bounded
+attempts against the runner's mirror fail, it rebuilds one deb822 stanza from
+the file's own `Types`/`Suites`/`Components`/`Signed-By` pointed at
+`archive.ubuntu.com` (a hostname rewrite would not move a mirror-list URI at
+all), refreshes that index and retries there. Both phases stay bounded
+(~17 minutes worst case, previously an unbounded-then-failing 10), and the two
+jobs get 40-minute budgets so a degraded mirror cannot eat the build and test
+time. `Acquire::Retries` also went from 3 to 5, so a single stalled connection
+is retried inside an attempt instead of consuming it.

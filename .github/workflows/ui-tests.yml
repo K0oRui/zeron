@@ -65,7 +65,9 @@ jobs:
 
   ui-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # apt-install.sh bounds its mirror fallback at ~17 minutes; the suite itself
+    # takes ~13, so a degraded mirror must not eat the test budget.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/linux-ci
@@ -83,7 +85,8 @@ jobs:
 
   linux-browser:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Same apt budget as ui-tests, plus the fixture build and two 5-minute runs.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/linux-ci
