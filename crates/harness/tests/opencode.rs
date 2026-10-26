@@ -1350,15 +1350,14 @@ async fn models_keep_large_catalog_on_empty_response_and_recover() {
     assert_eq!(harness.models().await.unwrap().len(), 512);
 
     fake.set_providers(json!({"all": [], "connected": []}));
-    // An empty response without a credential-context change is a failed probe,
-    // so the last successful catalog remains available.
-    let retained = harness.models().await.unwrap();
-    assert_eq!(retained.len(), 512);
-    assert!(
-        retained
-            .iter()
-            .all(|model| model.id.starts_with("provider/"))
-    );
+    // No provider advertises models (nobody signed in): the picker falls back
+    // to the curated free tier instead of going empty. A probe that genuinely
+    // fails keeps the last good catalog instead — that path is covered by
+    // `catalog::tests::empty_catalogs_are_failed_and_cannot_replace_last_good`.
+    let free = harness.models().await.unwrap();
+    assert_eq!(free.len(), 2, "{free:?}");
+    assert_eq!(free[0].id, "opencode/beam-free");
+    assert_eq!(free[1].id, "opencode/flint-40b-free");
 
     fake.set_providers(json!({
         "all": [{"id": "new-account", "models": {"fresh": {"name": "Fresh"}}}],

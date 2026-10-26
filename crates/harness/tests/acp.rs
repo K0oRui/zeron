@@ -169,15 +169,34 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     assert!(exec_output.starts_with("   Compiling zeron-harness"));
     assert_eq!(exec_output.lines().count(), 6, "{exec_output:?}");
 
-    // Edit tool: single-shot completed call carries the inline diff.
-    assert!(events.contains(&AgentEvent::ToolCall {
-        id: "t2".into(),
-        call: ToolCall::EditFile {
-            path: "/w/src/resolve.rs".into(),
-            old_string: None,
-            new_string: None,
-        },
-    }));
+    // Edit tool: the completed call carries the inline diff, so the call
+    // itself names the file and both sides of the change (not just the
+    // later ToolResult).
+    let (path, old_string, new_string) = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCall {
+                id,
+                call: ToolCall::EditFile {
+                    path,
+                    old_string,
+                    new_string,
+                },
+            } if id == "t2" => Some((path.clone(), old_string.clone(), new_string.clone())),
+            _ => None,
+        })
+        .expect("edit call present");
+    assert_eq!(path, "/w/src/resolve.rs");
+    assert!(
+        old_string
+            .as_deref()
+            .is_some_and(|t| t.contains(".filter(|p| p.exists())")),
+        "{old_string:?}"
+    );
+    assert!(
+        new_string.as_deref().is_some_and(|t| t.contains("split_paths")),
+        "{new_string:?}"
+    );
     let diff = events
         .iter()
         .find_map(|e| match e {
@@ -750,13 +769,14 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
     assert_eq!(harness.steering_mode(), SteeringMode::StepBoundary);
+    // Grok Build advertises Low/Medium/High; the xhigh effort arrives per
+    // model (4.6/4.7) through the catalog, not through this ladder.
     assert_eq!(
         harness.reasoning_levels(),
         &[
             zeron_proto::ReasoningLevel::Low,
             zeron_proto::ReasoningLevel::Medium,
             zeron_proto::ReasoningLevel::High,
-            zeron_proto::ReasoningLevel::XHigh,
         ]
     );
 }
@@ -797,7 +817,7 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
         .expect("grok-4.5");
     assert_eq!(
         grok45.description.as_deref(),
-        Some("xAI's coding model, up to 500k context"),
+        Some("xAI's coding model — 500k context"),
         "{grok45:?}"
     );
 }
@@ -1528,6 +1548,13 @@ def config(model):
     return [{'id':'model', 'category':'model', 'type':'select',
              'currentValue':'gpt-old', 'options':[{'value':model, 'name':model}]}]
 
+def plan_model():
+    # What this session may pick is what the signed-in plan can run, so it
+    # tracks the model states; while the catalog probe is erroring or hanging
+    # the session still names the last good model.
+    state = (root / 'state').read_text()
+    return state if state in ('gpt-old', 'gpt-new') else 'gpt-old'
+
 if sys.argv[1:] == ['models', 'list', '--format', 'json']:
     with (root / 'probes').open('a') as f: f.write('probe\n')
     state = (root / 'state').read_text()
@@ -1556,7 +1583,7 @@ for line in sys.stdin:
     result = {}
     if method == 'initialize': result = {'protocolVersion':1, 'agentCapabilities':{}}
     elif method == 'session/new':
-        result = {'sessionId':'s-1', 'configOptions':config('gpt-old')}
+        result = {'sessionId':'s-1', 'configOptions':config(plan_model())}
     elif method == 'session/set_config_option':
         selected = req['params']['value']
         assert (root / 'refreshed').exists(), 'selected before own session refreshed'

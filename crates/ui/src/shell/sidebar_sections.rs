@@ -2515,10 +2515,15 @@ mod tests {
                     vec!["regular".to_string()]
                 );
                 assert!(
-                    !shell.active_sidebar_sections(cx)[0].collapsed,
-                    "a rejected write drops the edits queued behind it"
+                    shell.active_sidebar_sections(cx)[0].collapsed,
+                    "a rejected write keeps the edit queued behind it: the queue \
+                     holds deltas applied to the latest watch state"
                 );
-                assert!(shell.sidebar_pin_write.is_none());
+                assert_eq!(
+                    shell.sidebar_pin_write.as_ref().unwrap().queue.len(),
+                    1,
+                    "only the resolved change leaves the queue"
+                );
                 assert!(shell.active_sidebar_pins(cx).is_empty());
                 shell.sidebar_pin_write = Some(super::super::sidebar_pins::PendingSidebarPins {
                     id: 2,
