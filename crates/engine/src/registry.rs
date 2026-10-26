@@ -1084,13 +1084,14 @@ mod tests {
         assert_eq!(grok.id(), HarnessId::Grok);
         assert_eq!(grok.display_name(), "Grok");
         assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
+        // grok-4.5's ladder stops at High; the xhigh effort arrives per model
+        // (4.6/4.7) through the catalog, not through the harness default.
         assert_eq!(
             grok.reasoning_levels(),
             &[
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh
+                ReasoningLevel::High
             ]
         );
         // Cursor, Devin, Hermes and Pi mirror their specs the same way.

@@ -457,6 +457,7 @@ mod tests {
             self.shell.update(cx, |shell, cx| {
                 div().w(px(280.0)).h(px(200.0)).child(shell.render_chat_row(
                     "hover-test".into(),
+                    None,
                     "Hover test".into(),
                     "now".into(),
                     "Project".into(),

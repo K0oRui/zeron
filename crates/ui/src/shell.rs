@@ -1120,7 +1120,15 @@ fn sidebar_marquee_label(
     label: impl IntoElement,
 ) -> impl IntoElement {
     let mut map = rows.borrow_mut();
-    let row = map.entry(chat_id.to_owned()).or_default();
+    // The map tracks exactly the rows on screen, so the key is nearly always
+    // present: probe before inserting instead of allocating a String key per
+    // row on every paint.
+    if !map.contains_key(chat_id) {
+        map.insert(chat_id.to_owned(), TitleMarqueeRow::default());
+    }
+    let row = map
+        .get_mut(chat_id)
+        .expect("a marquee row is present after the probe above");
     let scroll = row.scroll.clone();
     let content = div().flex_none().whitespace_nowrap().child(label);
     let track = div()
@@ -2132,6 +2140,20 @@ impl Render for SidebarPane {
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
         };
+        // A collapsed (or width-fitted-away) column paints nothing, so the
+        // session list is not built at all — every ancestor notification used
+        // to rebuild the whole row model behind a zero-width clip. The resort
+        // baselines are dropped with it so a glide never replays on return.
+        let column_width = shell.read(cx).sidebar_now();
+        if column_width <= 0.5 {
+            shell.update(cx, |shell, cx| {
+                shell.dismiss_session_card(cx);
+                shell.sidebar_prev_order.clear();
+                shell.sidebar_resort.clear();
+                shell.sidebar_new_keys.clear();
+            });
+            return div().into_any_element();
+        }
         let inner = shell.update(cx, |shell, cx| {
             let theme = Theme::of(cx).clone();
             shell.render_chat_sidebar(&theme, cx)
@@ -2469,6 +2491,11 @@ pub struct Shell {
     sidebar_resort: std::collections::HashMap<String, f32>,
     /// Keys that just appeared in a live list (fade in, no glide).
     sidebar_new_keys: std::collections::HashSet<String>,
+    /// The sidebar's built row model, reused while its fingerprint still
+    /// matches (see [`AppState::sidebar_row_fingerprint`]). Held here, not in
+    /// the row builder, so it survives the repaints that cannot change it:
+    /// scroll, hover, marquee, resize and every other animation frame.
+    sidebar_row_model: Option<std::sync::Arc<spaces::SidebarRowModel>>,
     resort_epoch: usize,
     /// Last observed `window.is_window_active()` — rising edge fires a
     /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
@@ -2958,6 +2985,7 @@ impl Shell {
             sidebar_prev_order: Vec::new(),
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
+            sidebar_row_model: None,
             resort_epoch: 0,
             was_window_active: false,
             debug_dialog,
@@ -9031,6 +9059,10 @@ impl Shell {
     fn render_chat_row(
         &self,
         id: String,
+        // The chat's host device, handed in by the caller that already has the
+        // chat. Looking it up here meant scanning the whole chat table — twice —
+        // for every row on every paint, since only the id crosses the boundary.
+        device_id: Option<&str>,
         title: SharedString,
         time_ago: SharedString,
         space_name: SharedString,
@@ -9067,13 +9099,6 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        let pr_device = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let pr_surface = if search_query.is_some() {
             crate::change_requests::ChangeRequestBadgeSurface::Sidebar
@@ -9081,22 +9106,18 @@ impl Shell {
             crate::change_requests::ChangeRequestBadgeSurface::SessionRow
         };
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
-        let host = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
+        // The device the row belongs to, shared by the remote glyph and the
+        // change-request badge.
+        let host = device_id;
+        // Only a row that draws a change-request badge needs the owned copy.
+        let pr_device: Option<String> = change_request
+            .as_ref()
+            .and_then(|_| host.map(str::to_string));
         let remote = host
-            .as_deref()
             .is_some_and(|host| self.state.read(cx).local_device_id.as_deref() != Some(host));
         // A chat on a Cloud session machine wears the cloud, not the generic
         // remote-device globe.
-        let remote_glyph = if host
-            .as_deref()
-            .is_some_and(|host| zeron_proto::is_cloud_device(host, ""))
-        {
+        let remote_glyph = if host.is_some_and(|host| zeron_proto::is_cloud_device(host, "")) {
             icons::CLOUD
         } else {
             icons::REMOTE_SERVER

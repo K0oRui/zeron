@@ -85,6 +85,9 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         label,
     };
     match harness {
+        // Codex signs in twice: the ChatGPT OAuth flow, or a pasted
+        // `OPENAI_API_KEY` saved next to it (no browser round-trip).
+        HarnessId::Codex => vec![option("oauth", "ChatGPT"), option("api-key", "API key")],
         HarnessId::Opencode | HarnessId::Kilo => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),

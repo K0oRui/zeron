@@ -83,8 +83,11 @@ jobs:
   # compiled once (one cargo invocation, so dependencies are built once) and then run.
   macos-native:
     runs-on: macos-latest
-    # A cold cache (first run, eviction, toolchain bump) takes about 32 minutes; warm is about 10.
-    timeout-minutes: 45
+    # A cold cache (first run, eviction, toolchain bump) takes about 35 minutes
+    # for the build alone and about 20 more for the app check plus the test and
+    # native WebKit suites; warm is about 10. 45 cancelled a legitimately cold
+    # run after the build had already succeeded.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain

@@ -2895,6 +2895,14 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
+    /// The cache key of the sidebar's row model (see `row_model_key`).
+    ///
+    /// `gates` is the caller's hash of the sidebar settings, the project filter
+    /// and the resolved pin order; everything else the model reads lives here.
+    pub fn sidebar_row_fingerprint(&self, gates: u64, now: DateTime<Utc>) -> u64 {
+        row_model_key::fingerprint(self, gates, now)
+    }
+
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
     /// on any device — idle included — in pure recency order (status drives
     /// the dot, never the position; see [`sort_active`]).
@@ -2907,12 +2915,16 @@ impl AppState {
         for session in &self.sessions {
             sessions.entry(session.chat_id.as_str()).or_insert(session);
         }
+        // Space ids in one set: `space_row` is a linear scan of the space table
+        // and this walk runs over every chat on every sidebar paint.
+        let live_spaces: std::collections::HashSet<&str> =
+            self.spaces.iter().map(|space| space.id.as_str()).collect();
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
             .filter(|c| match c.space_id.as_deref() {
                 // Project-less sessions are first-class rows.
                 None => true,
-                Some(id) => self.space_row(id).is_some(),
+                Some(id) => live_spaces.contains(id),
             })
             .map(|c| {
                 let status = if self.send_pending(&c.id, now) {
@@ -2949,21 +2961,28 @@ impl AppState {
     /// matches. A filter naming a space not synced here matches its own id.
     pub fn project_filter<'a>(&'a self, filter: Option<&str>) -> impl Fn(&Chat) -> bool + 'a {
         let filter = filter.map(|id| {
-            (
-                id.to_owned(),
-                self.space_row(id).map(zeron_proto::view::project_key),
-            )
+            let key = self.space_row(id).map(zeron_proto::view::project_key);
+            // Repository key per space, resolved once: the sidebar asks this of
+            // every chat in every paint, and `space_row` is a linear scan.
+            let keys: std::collections::HashMap<&str, String> = key
+                .as_ref()
+                .map(|_| {
+                    self.spaces
+                        .iter()
+                        .map(|space| (space.id.as_str(), zeron_proto::view::project_key(space)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (id.to_owned(), key, keys)
         });
         move |chat| {
-            let Some((id, key)) = &filter else {
+            let Some((id, key, keys)) = &filter else {
                 return true;
             };
             match chat.space_id.as_deref() {
-                Some(space_id) if space_id == id => true,
-                Some(space_id) => key.as_ref().is_some_and(|key| {
-                    self.space_row(space_id)
-                        .is_some_and(|space| zeron_proto::view::project_key(space) == *key)
-                }),
+                Some(space_id) => {
+                    space_id == id || (key.is_some() && keys.get(space_id) == key.as_ref())
+                }
                 None => false,
             }
         }
@@ -4627,6 +4646,349 @@ fn spawn_subagent_watch(
     })
 }
 
+/// The sidebar row model's cache key.
+///
+/// The sidebar builds one owned row per session on every paint — id, device,
+/// title, labels, branch and change-request snapshots copied out of
+/// [`AppState`] — and that model is now cached. This is the key that decides
+/// whether the cached copy is still exactly what a rebuild would produce, so
+/// it hashes **every `AppState` value the build reads** (plus, through `gates`,
+/// the sidebar settings, the project filter and the resolved pin order).
+///
+/// Two rules keep it honest:
+///
+/// - a field a row draws must be hashed here. Missing one leaves a stale value
+///   on screen; missing `branch` or the change request would also change the
+///   row's height — the v0.2.41 row-width failure (`docs/performance-macos-
+///   stability.md`).
+/// - time is bucketed to the second, never walked in full. Session staleness
+///   (`zeron_proto::view::session_stale`), presence (`device_online`) and the
+///   Cloud wake grace flip on the clock alone, so the second is part of the
+///   key: at most one rebuild a second, and a status can never lag the clock
+///   by more than that.
+mod row_model_key {
+    use std::hash::{Hash, Hasher};
+
+    use chrono::{DateTime, Utc};
+    use zeron_proto::{
+        ChangeRequestState, ChatSyncState, CloudState, ConnectivityState, DoneStatus, ProgramState,
+        SessionStatus,
+    };
+
+    use super::AppState;
+
+    pub(super) fn fingerprint(state: &AppState, gates: u64, now: DateTime<Utc>) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        gates.hash(&mut hasher);
+        // The clock alone changes some derived statuses; bucket it.
+        now.timestamp().hash(&mut hasher);
+        state.local_device_id.hash(&mut hasher);
+        state.connectivity.state.tag().hash(&mut hasher);
+        for chat in &state.connectivity.chats {
+            chat.chat_id.hash(&mut hasher);
+            chat.sync_state.tag().hash(&mut hasher);
+            chat.connected.hash(&mut hasher);
+            chat.delivery_live.hash(&mut hasher);
+        }
+        state.chats.len().hash(&mut hasher);
+        for chat in &state.chats {
+            chat.hash_fields(&mut hasher);
+        }
+        state.sessions.len().hash(&mut hasher);
+        for session in &state.sessions {
+            session.hash_fields(&mut hasher);
+        }
+        state.spaces.len().hash(&mut hasher);
+        for space in &state.spaces {
+            space.hash_fields(&mut hasher);
+        }
+        state.devices.len().hash(&mut hasher);
+        for device in &state.devices {
+            device.hash_fields(&mut hasher);
+        }
+        for (chat_id, send) in &state.pending_sends {
+            chat_id.hash(&mut hasher);
+            send.message_id.hash(&mut hasher);
+            send.started.timestamp_micros().hash(&mut hasher);
+        }
+        for (session, at) in &state.cloud_wakes {
+            session.hash(&mut hasher);
+            // Only whether the grace window is open matters.
+            (at.elapsed().as_secs() < super::CLOUD_WAKE_GRACE.as_secs()).hash(&mut hasher);
+        }
+        match &state.cloud_status {
+            Some(status) => {
+                true.hash(&mut hasher);
+                status.state.tag().hash(&mut hasher);
+                status.device_id.hash(&mut hasher);
+                status.available.hash(&mut hasher);
+            }
+            None => false.hash(&mut hasher),
+        }
+        match &state.cloud_sessions {
+            Some(sessions) => {
+                true.hash(&mut hasher);
+                sessions.available.hash(&mut hasher);
+                for session in &sessions.sessions {
+                    session.chat_id.hash(&mut hasher);
+                    session.device_id.hash(&mut hasher);
+                    session.state.tag().hash(&mut hasher);
+                }
+            }
+            None => false.hash(&mut hasher),
+        }
+        // `snapshots` is a hash map, and the row build takes the first
+        // matching snapshot, so hash them in a stable order.
+        let mut snapshots: Vec<_> = state.change_requests.snapshots().collect();
+        snapshots.sort_by(|left, right| {
+            left.device_id
+                .cmp(&right.device_id)
+                .then_with(|| left.cwd.cmp(&right.cwd))
+                .then_with(|| left.branch.cmp(&right.branch))
+                .then_with(|| left.checkout_id.cmp(&right.checkout_id))
+        });
+        snapshots.len().hash(&mut hasher);
+        for snapshot in snapshots {
+            snapshot.checkout_id.hash(&mut hasher);
+            snapshot.device_id.hash(&mut hasher);
+            snapshot.cwd.hash(&mut hasher);
+            snapshot.branch.hash(&mut hasher);
+            match &snapshot.change_request {
+                Some(summary) => {
+                    true.hash(&mut hasher);
+                    summary.provider.hash(&mut hasher);
+                    summary.number.hash(&mut hasher);
+                    summary.title.hash(&mut hasher);
+                    summary.url.hash(&mut hasher);
+                    summary.state.tag().hash(&mut hasher);
+                    summary.base_ref.hash(&mut hasher);
+                    summary.head_ref.hash(&mut hasher);
+                }
+                None => false.hash(&mut hasher),
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Every field of one chat. Hashing all of them, not just the drawn ones,
+    /// keeps this honest when the row learns to draw something new.
+    trait HashChat {
+        fn hash_fields(&self, hasher: &mut impl Hasher);
+    }
+
+    impl HashChat for zeron_proto::Chat {
+        fn hash_fields(&self, hasher: &mut impl Hasher) {
+            self.id.hash(hasher);
+            self.device_id.hash(hasher);
+            self.title.hash(hasher);
+            self.archived.hash(hasher);
+            self.cwd.hash(hasher);
+            self.branch.hash(hasher);
+            self.checkout_id.hash(hasher);
+            match &self.source_context {
+                Some(source) => {
+                    true.hash(hasher);
+                    source.checkout_id.hash(hasher);
+                    source.repo_root.hash(hasher);
+                    source.cwd.hash(hasher);
+                    source.branch.hash(hasher);
+                    source.head_sha.hash(hasher);
+                    source.observed_at.timestamp_micros().hash(hasher);
+                }
+                None => false.hash(hasher),
+            }
+            match &self.config {
+                Some(config) => {
+                    true.hash(hasher);
+                    config.harness.hash(hasher);
+                    config.model.hash(hasher);
+                }
+                None => false.hash(hasher),
+            }
+            self.last_message_preview.hash(hasher);
+            self.last_message_at
+                .map(|at| at.timestamp_micros())
+                .hash(hasher);
+            self.created_at.timestamp_micros().hash(hasher);
+            self.harness_session_id.hash(hasher);
+            self.harness_session_cwd.hash(hasher);
+            self.harness_session_harness.hash(hasher);
+            self.space_id.hash(hasher);
+            self.last_seen_at.map(|at| at.timestamp_micros()).hash(hasher);
+            self.room_gen.hash(hasher);
+            self.parent_chat_id.hash(hasher);
+        }
+    }
+
+    trait HashSession {
+        fn hash_fields(&self, hasher: &mut impl Hasher);
+    }
+
+    impl HashSession for zeron_proto::Session {
+        fn hash_fields(&self, hasher: &mut impl Hasher) {
+            self.chat_id.hash(hasher);
+            self.device_id.hash(hasher);
+            self.status.tag().hash(hasher);
+            self.started_at.map(|at| at.timestamp_micros()).hash(hasher);
+            self.updated_at.timestamp_micros().hash(hasher);
+            self.running_subagents.hash(hasher);
+            self.last_completed_turn.hash(hasher);
+            match &self.last_turn_outcome {
+                Some(outcome) => {
+                    true.hash(hasher);
+                    outcome.status.tag().hash(hasher);
+                    outcome.finished_at.timestamp_micros().hash(hasher);
+                }
+                None => false.hash(hasher),
+            }
+            match &self.terminal_activity {
+                Some(activity) => {
+                    true.hash(hasher);
+                    activity.terminal_id.hash(hasher);
+                    activity.updated_at.timestamp_micros().hash(hasher);
+                    activity.report.id.hash(hasher);
+                    activity.report.state.tag().hash(hasher);
+                    activity.report.progress.hash(hasher);
+                    activity.report.app.hash(hasher);
+                    activity.report.title.hash(hasher);
+                    activity.report.message.hash(hasher);
+                }
+                None => false.hash(hasher),
+            }
+        }
+    }
+
+    trait HashSpace {
+        fn hash_fields(&self, hasher: &mut impl Hasher);
+    }
+
+    impl HashSpace for zeron_proto::Space {
+        fn hash_fields(&self, hasher: &mut impl Hasher) {
+            self.id.hash(hasher);
+            self.device_id.hash(hasher);
+            self.path.hash(hasher);
+            self.name.hash(hasher);
+            self.git_detected.hash(hasher);
+            self.git_checked_at
+                .map(|at| at.timestamp_micros())
+                .hash(hasher);
+            self.checkout_id.hash(hasher);
+            self.repository_id.hash(hasher);
+            self.github_repo.hash(hasher);
+            self.created_at.timestamp_micros().hash(hasher);
+        }
+    }
+
+    trait HashDevice {
+        fn hash_fields(&self, hasher: &mut impl Hasher);
+    }
+
+    impl HashDevice for zeron_proto::Device {
+        fn hash_fields(&self, hasher: &mut impl Hasher) {
+            self.id.hash(hasher);
+            self.name.hash(hasher);
+            self.platform.hash(hasher);
+            self.last_seen_at
+                .map(|at| at.timestamp_micros())
+                .hash(hasher);
+            self.created_at.map(|at| at.timestamp_micros()).hash(hasher);
+            self.version.hash(hasher);
+            self.cursor_sdk_version.hash(hasher);
+            self.capabilities.hash(hasher);
+        }
+    }
+
+    /// The proto enums ship no `Hash` (they are wire types), so hash their
+    /// discriminant. A new variant fails to compile until it is listed here,
+    /// which is the point.
+    trait StatusTag {
+        fn tag(self) -> u8;
+    }
+
+    impl StatusTag for SessionStatus {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Idle => 0,
+                Self::Working => 1,
+                Self::AwaitingInput => 2,
+                Self::Errored => 3,
+            }
+        }
+    }
+
+    impl StatusTag for ProgramState {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Idle => 0,
+                Self::Working => 1,
+                Self::Done => 2,
+                Self::Blocked => 3,
+                Self::Error => 4,
+            }
+        }
+    }
+
+    impl StatusTag for DoneStatus {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Completed => 0,
+                Self::Interrupted => 1,
+                Self::Errored => 2,
+            }
+        }
+    }
+
+    impl StatusTag for ChatSyncState {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Local => 0,
+                Self::Waiting => 1,
+                Self::Connecting => 2,
+                Self::Synced => 3,
+                Self::Offline => 4,
+                Self::StorageError => 5,
+                Self::Unknown => 6,
+            }
+        }
+    }
+
+    impl StatusTag for ConnectivityState {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Disabled => 0,
+                Self::Offline => 1,
+                Self::Reconnecting => 2,
+                Self::Connected => 3,
+            }
+        }
+    }
+
+    impl StatusTag for CloudState {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Off => 0,
+                Self::Provisioning => 1,
+                Self::Starting => 2,
+                Self::Ready => 3,
+                Self::Sleeping => 4,
+                Self::Stopping => 5,
+                Self::Deleting => 6,
+                Self::Error => 7,
+            }
+        }
+    }
+
+    impl StatusTag for ChangeRequestState {
+        fn tag(self) -> u8 {
+            match self {
+                Self::Open => 0,
+                Self::Closed => 1,
+                Self::Merged => 2,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5282,6 +5644,97 @@ mod tests {
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
         }
+    }
+
+    /// The sidebar caches its row model against
+    /// [`AppState::sidebar_row_fingerprint`]. If the key misses a field the
+    /// rows draw, a repaint shows the old value; if it over-triggers the cache
+    /// is inert. This pins both directions, plus the clock rule: staleness is
+    /// evaluated per second, so the same second must reuse and the next must
+    /// rebuild.
+    #[test]
+    fn sidebar_row_fingerprint_tracks_exactly_what_the_rows_draw() {
+        let mut state = AppState::new();
+        // Fixed clock, so the second bucket cannot land either side of a
+        // boundary between two runs.
+        let now = DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let gates = 0x5eedu64;
+        let base = state.sidebar_row_fingerprint(gates, now);
+        assert_eq!(
+            base,
+            state.sidebar_row_fingerprint(gates, now),
+            "an unchanged state hashes the same"
+        );
+        assert_ne!(
+            base,
+            state.sidebar_row_fingerprint(gates ^ 1, now),
+            "the sidebar settings, filter and pin order are part of the key"
+        );
+
+        state.chats = vec![chat("c1", 0, Some(1))];
+        let one_chat = state.sidebar_row_fingerprint(gates, now);
+        assert_ne!(one_chat, base, "a new chat changes the list");
+
+        // A drawn field: the title.
+        state.chats[0].title = Some("Renamed".into());
+        let renamed = state.sidebar_row_fingerprint(gates, now);
+        assert_ne!(renamed, one_chat, "the row's title is drawn");
+
+        // The branch and its change request decide the row's height
+        // (`sidebar_row_height`) — the value v0.2.41's row cache went stale on.
+        state.chats[0].branch = Some("feature".into());
+        assert_ne!(
+            renamed,
+            state.sidebar_row_fingerprint(gates, now),
+            "a branch changes the row height"
+        );
+
+        // The project's label, which the row draws in its folder line.
+        state.spaces = vec![space("s1", "dev", "/repo", 0)];
+        let with_space = state.sidebar_row_fingerprint(gates, now);
+        assert_ne!(with_space, renamed, "a new project changes the label");
+        state.spaces[0].name = Some("Repo".into());
+        assert_ne!(
+            with_space,
+            state.sidebar_row_fingerprint(gates, now),
+            "the project's display name is drawn"
+        );
+
+        // Session status and its staleness clock.
+        let live = state.sidebar_row_fingerprint(gates, now);
+        state.sessions = vec![session("c1", SessionStatus::Working, 0, now)];
+        let working = state.sidebar_row_fingerprint(gates, now);
+        assert_ne!(working, live, "a session's status is drawn");
+        assert_eq!(
+            working,
+            state.sidebar_row_fingerprint(gates, now + TimeDelta::milliseconds(400)),
+            "inside one second the cache is reused"
+        );
+        assert_ne!(
+            working,
+            state.sidebar_row_fingerprint(gates, now + TimeDelta::seconds(1)),
+            "staleness is judged against the clock, so the next second rebuilds"
+        );
+
+        // A send in flight overrides the row's status.
+        state.begin_pending_send("c1", "m1", now);
+        assert_ne!(
+            working,
+            state.sidebar_row_fingerprint(gates, now),
+            "a pending send reads as Working"
+        );
+
+        // State the rows never read must not invalidate the model: the
+        // selection lives on the render side, not in the rows.
+        let before = state.sidebar_row_fingerprint(gates, now);
+        state.selected_chat = Some("c1".into());
+        assert_eq!(
+            before,
+            state.sidebar_row_fingerprint(gates, now),
+            "an unrelated field must not rebuild the model"
+        );
     }
 
     fn user_entry(id: &str) -> SessionMessageEntry {

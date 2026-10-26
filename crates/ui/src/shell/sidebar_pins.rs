@@ -176,7 +176,6 @@ impl Shell {
         } else {
             None
         };
-        let failed = result.is_err();
         match result {
             Ok(value) => {
                 self.clear_pin_write_notice();
@@ -199,13 +198,13 @@ impl Shell {
             self.schedule_save(cx);
         }
         let pending = self.sidebar_pin_write.as_mut().unwrap();
-        if failed {
-            // Later edits were computed against a base the engine rejected, so
-            // replaying them would show changes that can never land.
-            pending.queue.clear();
-        } else {
-            pending.queue.pop_front();
-        }
+        // The resolved change leaves the queue whether it landed or not. What
+        // stays is a queue of DELTAS, and the overlay applies them to the
+        // latest watch state it holds — so a drop made while an older write was
+        // in flight is still exactly what the user asked for. Clearing the queue
+        // on failure silently discarded that drop instead: it vanished from the
+        // list and was never sent.
+        pending.queue.pop_front();
         let next = pending.queue.front().cloned();
         if next.is_none() {
             // Removing the overlay reveals the latest watch/ack, not a stale

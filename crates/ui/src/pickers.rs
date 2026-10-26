@@ -644,15 +644,23 @@ pub fn resolve_typed_path(
         let bytes = text.as_bytes();
         bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
     };
-    let target = match typed_path_target(&text, home) {
-        Some(target) => target,
-        None if is_home_relative(&text) => return None,
-        None if windows && text.starts_with('\\') => {
-            let root = windows_browser_path(base?)?.root_path();
-            child_path(&root, text.trim_start_matches('\\'))
+    // One leading separator on a Windows target is the open folder's DRIVE
+    // (`\Projects`, typed that way or pasted as `/Projects`) — resolved here,
+    // before `typed_path_target`, which answers for any string that merely
+    // contains a backslash and would hand `\Projects` back as a POSIX
+    // absolute. UNC (`\\server\share`) and extended (`\\?\D:`) roots keep both
+    // separators and stay with it.
+    let drive_rooted = windows && text.starts_with('\\') && !text.starts_with(r"\\");
+    let target = if drive_rooted {
+        let root = windows_browser_path(base?)?.root_path();
+        child_path(&root, text.trim_start_matches('\\'))
+    } else {
+        match typed_path_target(&text, home) {
+            Some(target) => target,
+            None if is_home_relative(&text) => return None,
+            None if windows && drive_relative(&text) => format!(r"{}\{}", &text[..2], &text[2..]),
+            None => child_path(base?, &text),
         }
-        None if windows && drive_relative(&text) => format!(r"{}\{}", &text[..2], &text[2..]),
-        None => child_path(base?, &text),
     };
     Some(normalize_browser_path(&target))
 }
