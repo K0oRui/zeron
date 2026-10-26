@@ -367,13 +367,15 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        "nvidia-nim" => vec![model(
-            "nvidia/nemotron-3-super-120b-a12b",
-            "Nemotron 3 Super 120B",
-            "NVIDIA Nemotron 3 Super model through NIM",
-            &[],
-            vec![],
-        )],
+        "nvidia-nim" => zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK
+            .iter()
+            .map(|(id, label, context, output)| {
+                let description = format!(
+                    "{context} token context window · up to {output} output tokens"
+                );
+                model(id, label, &description, &[], vec![])
+            })
+            .collect(),
         // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
         _ => vec![
             model(
@@ -727,6 +729,21 @@ mod tests {
         );
         assert!(models.iter().any(|m| m.id == "grok-4.6"));
         assert!(models.iter().any(|m| m.id == "grok-4.5"));
+    }
+
+    #[test]
+    fn nim_fallback_uses_the_shared_chat_catalog() {
+        let models = fallback_models("nvidia-nim");
+        assert_eq!(models.len(), zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK.len());
+        assert_eq!(models[0].id, "nvidia/nemotron-3-ultra-550b-a55b");
+        assert!(models.iter().all(|model| {
+            !model
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("free")
+        }));
     }
 
     #[test]

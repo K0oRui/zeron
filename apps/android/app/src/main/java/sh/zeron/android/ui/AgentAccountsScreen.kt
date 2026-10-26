@@ -111,6 +111,7 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
     var signJob by remember { mutableStateOf<Job?>(null) }
     var askKey by remember { mutableStateOf(false) }
     var codeRequest by remember { mutableStateOf<CompletableDeferred<String?>?>(null) }
+    var apiKeyHarness by remember { mutableStateOf<String?>(null) }
     var removing by remember { mutableStateOf<Account?>(null) }
 
     suspend fun load() {
@@ -216,14 +217,16 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
         }
     }
 
-    /** Asks for the code the sign-in page shows (Claude's paste fallback). */
-    suspend fun askForCode(): String? {
+    /** Asks for an OAuth paste code, or for a raw key when `harnessForKey` is set. */
+    suspend fun askForCode(harnessForKey: String? = null): String? {
         val request = CompletableDeferred<String?>()
+        apiKeyHarness = harnessForKey
         codeRequest = request
         return try {
             request.await()
         } finally {
             codeRequest = null
+            apiKeyHarness = null
         }
     }
 
@@ -234,8 +237,11 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
         val start = c.deviceLoginStart(t.deviceId, t.harness, option.provider, done)
         try {
             if (start.pasteCode) {
-                model.browser.open(context, start.url)
-                val code = askForCode() ?: throw CancellationException("No code")
+                // API-key flows have no page: an empty URL distinguishes them
+                // from Claude's browser-based paste-code fallback.
+                if (start.url.isNotEmpty()) model.browser.open(context, start.url)
+                val code = askForCode(harnessForKey = t.harness.takeIf { start.url.isEmpty() })
+                    ?: throw CancellationException("No credential")
                 deviceAccounts = c.deviceLoginComplete(t.deviceId, start.loginId, code)
                 return
             }
@@ -309,7 +315,7 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
             rules.note,
             when (target) {
                 is AccountsTarget.Cloud -> "Cloud sessions use the account in use. Sign-ins and keys are kept in Cloud, never on this phone."
-                is AccountsTarget.Device -> "Account changes affect new sessions on ${target.name}. Signing in runs on ${target.name}; you finish in the browser here."
+                is AccountsTarget.Device -> "Account changes affect new sessions on ${target.name}. Browser sign-ins and API-key entries are completed here; credentials stay on ${target.name}."
             },
         ).joinToString("\n\n")
         cloudSection("Accounts on $deviceName", footer = footer) {
@@ -374,7 +380,9 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
         }
     }
     codeRequest?.let { request ->
-        PasteCodeDialog(onDismiss = { request.complete(null) }, onCode = { request.complete(it) })
+        apiKeyHarness?.let { harness ->
+            DeviceApiKeyDialog(harness = harness, onDismiss = { request.complete(null) }, onKey = { request.complete(it) })
+        } ?: PasteCodeDialog(onDismiss = { request.complete(null) }, onCode = { request.complete(it) })
     }
     removing?.let { a ->
         AlertDialog(
@@ -498,6 +506,41 @@ private fun ApiKeyDialog(agent: CloudStore.Agent, onDismiss: () -> Unit, onSave:
             }
         },
         confirmButton = { TextButton(onClick = { onSave(key) }, enabled = key.isNotEmpty()) { Text("Save key") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** A computer-hosted API-key login: the key never enters Cloud or this phone's store. */
+@Composable
+private fun DeviceApiKeyDialog(harness: String, onDismiss: () -> Unit, onKey: (String) -> Unit) {
+    var key by remember { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
+    val nvidia = harness == "nvidia-nim"
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { ZIcon(ZIcons.Key, null) },
+        title = { Text(if (nvidia) "NVIDIA API key" else "OpenAI API key") },
+        text = {
+            Column {
+                Text(
+                    if (nvidia) "Paste the key from NVIDIA API Catalog. It is sent only to the computer hosting NIM."
+                    else "Paste your OpenAI API key. It is sent only to the computer hosting Codex.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    key, { key = it.trim() },
+                    singleLine = true,
+                    placeholder = { Text(if (nvidia) "nvapi-…" else "sk-…") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onKey(key) }, enabled = key.isNotEmpty()) { Text("Save key") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

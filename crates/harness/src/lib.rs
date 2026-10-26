@@ -1,7 +1,8 @@
 //! zeron-harness — one interface over coding agents (plus a mock for tests).
 //!
 //! NATIVE DRIVERS speak each agent's own wire directly: Claude Code over
-//! stream-json ([`ClaudeHarness`]), Codex over the app-server JSON-RPC
+//! stream-json ([`ClaudeHarness`]), NVIDIA NIM over authenticated
+//! OpenAI-compatible HTTP/SSE ([`NvidiaNimHarness`]), Codex over the app-server JSON-RPC
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
 //! ([`CursorHarness`]), and opencode over its own HTTP/SSE server protocol
 //! ([`OpencodeHarness`] — what the opencode desktop app speaks). The shared

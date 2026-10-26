@@ -61,7 +61,9 @@ jobs:
 
   offline-linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The cold no-provider build takes about 40 minutes before the separate
+    # WebRTC AEC3 build starts; leave enough headroom for its tests to finish.
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 2
     steps:

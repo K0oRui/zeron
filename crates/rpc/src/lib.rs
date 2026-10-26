@@ -253,6 +253,9 @@ pub mod methods {
     /// callback the requesting device caught on its own loopback (a phone
     /// signing a computer's agent in). Answers `{status, location?}`.
     pub const RELAY_AGENT_LOGIN_CALLBACK: &str = "RelayAgentLoginCallback";
+    /// `{loginId, code}`: finish a paste-code OAuth flow or an API-key flow
+    /// (`code` carries the pasted key in the latter). The reply is the fresh
+    /// account snapshot. Legacy Codex clients may use `SaveCodexApiKey`.
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";

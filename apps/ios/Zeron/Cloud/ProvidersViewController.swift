@@ -193,7 +193,7 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
         if !targetOnline {
             return "\(targetName) is offline — showing what it last reported."
         }
-        return "Agents run with the logins on \(targetName). Switch accounts here; to add one, sign in from Zeron on that computer."
+        return "Agents run with the logins on \(targetName). Open a provider to add, switch, or remove its accounts."
     }
 
     // MARK: Loading

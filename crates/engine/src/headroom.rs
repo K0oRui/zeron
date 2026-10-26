@@ -45,11 +45,11 @@ pub const PROVIDERS: [HarnessId; 6] = [
     HarnessId::Antigravity,
 ];
 
-/// Agents Zeron runs that Headroom cannot route. Their CLIs read no base-URL
-/// variable and expose no inline proxy seam, so traffic bypasses the proxy
-/// whatever the preference says. Settings names them instead of letting the
-/// routed list imply full coverage (`Mock` is test-only and stays out of both
-/// lists).
+/// Agents Zeron runs that Headroom does not currently route. Their drivers
+/// are not wired to the proxy's per-provider environment, so traffic bypasses
+/// it whatever the preference says. Settings names them instead of letting
+/// the routed list imply full coverage (`Mock` is test-only and stays out of
+/// both lists).
 pub const UNROUTED: [HarnessId; 6] = [
     HarnessId::Devin,
     HarnessId::Hermes,

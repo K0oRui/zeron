@@ -1004,6 +1004,23 @@ impl HarnessUpdateCoordinator {
         if self.settle_if_unmonitored(harness) {
             return Ok(());
         }
+        if harness == HarnessId::NvidiaNim {
+            // NIM ships inside Zeron, not as an independently installed CLI.
+            // Its release is the application's release; never probe a made-up
+            // executable or ask the user to update a separate provider.
+            self.mutate(harness, |status| {
+                status.installed_version = Some(env!("CARGO_PKG_VERSION").into());
+                status.latest_version = None;
+                status.channel = None;
+                status.can_apply = false;
+                status.manual_command = None;
+                status.phase = HarnessUpdatePhase::Current;
+                status.progress = None;
+                status.checked_at = Some(now_ms());
+                status.error = None;
+            });
+            return Ok(());
+        }
         let _check_slot = self
             .inner
             .check_slots
@@ -3099,6 +3116,23 @@ mod tests {
     use crate::registry::HarnessRegistry;
 
     struct ExecutableHarness(PathBuf, HarnessId);
+
+    #[tokio::test]
+    async fn builtin_nim_update_check_does_not_look_for_a_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(ExecutableHarness(
+            PathBuf::new(),
+            HarnessId::NvidiaNim,
+        )));
+        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry);
+        coordinator.check_one(HarnessId::NvidiaNim).await.unwrap();
+        let status = coordinator.status(HarnessId::NvidiaNim);
+        assert_eq!(status.phase, HarnessUpdatePhase::Current);
+        assert!(status.error.is_none());
+        assert!(!status.can_apply);
+        assert_eq!(status.installed_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

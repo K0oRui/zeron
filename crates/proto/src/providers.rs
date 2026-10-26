@@ -4,11 +4,38 @@
 
 use crate::HarnessId;
 
+/// Last known NVIDIA featured chat models, shared by the engine and clients
+/// when live discovery is unavailable. Inventory membership alone does not
+/// establish chat support or free access, so arbitrary `/v1/models` rows are
+/// deliberately not copied into these static catalogs.
+pub const NVIDIA_NIM_FEATURED_FALLBACK: [(&str, &str, u64, u64); 4] = [
+    (
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "Nemotron 3 Ultra 550B",
+        1_048_576,
+        8_192,
+    ),
+    (
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "Nemotron 3.5 Super VL",
+        1_048_576,
+        8_192,
+    ),
+    ("z-ai/glm-5-3", "GLM 5.3", 1_048_576, 8_192),
+    (
+        "deepseek-ai/deepseek-v4.1-flash",
+        "DeepSeek V4.1 Flash",
+        1_048_576,
+        16_384,
+    ),
+];
+
 /// The providers zeron can sign into, in display order: (harness, name, CLI
-/// command — named in the empty-state copy, zeron settings.agents.tsx
-/// `PROVIDERS`). Every agent with a login of its own is here; what each one
-/// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
+/// command or login label — named in the empty-state copy, zeron
+/// settings.agents.tsx `PROVIDERS`). Every agent with a login of its own is
+/// here; what each one supports is documented engine-side (`agent_accounts`
+/// module docs).
+pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -20,6 +47,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
     (HarnessId::Muse, "Muse Code", "muse login"),
+    (HarnessId::NvidiaNim, "NVIDIA NIM", "NVIDIA API key"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
@@ -39,7 +67,7 @@ pub fn provider_name(harness: HarnessId) -> &'static str {
 /// Whether the provider reports plan usage. One that doesn't shows no meters
 /// and no "usage unavailable" note — there is nothing missing. Pure.
 pub fn reports_usage(harness: HarnessId) -> bool {
-    harness != HarnessId::Antigravity
+    !matches!(harness, HarnessId::Antigravity | HarnessId::NvidiaNim)
 }
 
 /// Providers whose agent holds exactly ONE login (Antigravity): once it is
@@ -63,6 +91,10 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Hermes => Some(
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
+        ),
+        HarnessId::NvidiaNim => Some(
+            "Connect an API key from NVIDIA API Catalog. Model availability and charges depend \
+             on your NVIDIA account; Zeron does not label inventory entries as free.",
         ),
         _ => None,
     }
@@ -88,6 +120,7 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         // Codex signs in twice: the ChatGPT OAuth flow, or a pasted
         // `OPENAI_API_KEY` saved next to it (no browser round-trip).
         HarnessId::Codex => vec![option("oauth", "ChatGPT"), option("api-key", "API key")],
+        HarnessId::NvidiaNim => vec![option("api-key", "NVIDIA API key")],
         HarnessId::Opencode | HarnessId::Kilo => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),

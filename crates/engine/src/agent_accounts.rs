@@ -106,10 +106,12 @@ pub struct RelayedCallback {
 }
 
 mod muse;
+mod nvidia_nim;
 mod oauth;
 #[cfg(test)]
 mod provider_tests;
 pub use muse::MuseRunEnvironment;
+pub use nvidia_nim::NvidiaNimRunEnvironment;
 mod stores;
 mod usage;
 
@@ -447,6 +449,12 @@ enum LoginFlow {
         /// this device's live Claude store.
         capture: Option<CaptureSink>,
     },
+    /// A raw provider key is completed through `CompleteAgentLogin`, just like
+    /// a paste-code flow. Only the provider and expiry live here — never the key.
+    ApiKey {
+        harness: HarnessId,
+        started_at: Instant,
+    },
     /// A spawned login child polled to completion: `codex login` against a
     /// throwaway `CODEX_HOME`, the cursor shim's login mode minting into a
     /// throwaway store file, `grok login` against a throwaway `GROK_HOME`, or
@@ -509,6 +517,7 @@ impl LoginFlow {
     fn started_at(&self) -> Instant {
         match self {
             LoginFlow::Claude { started_at, .. }
+            | LoginFlow::ApiKey { started_at, .. }
             | LoginFlow::Spawned { started_at, .. }
             | LoginFlow::Task { started_at, .. } => *started_at,
         }
@@ -1001,6 +1010,7 @@ impl AgentAccounts {
             HarnessId::Kilo,
             HarnessId::Pi,
             HarnessId::Muse,
+            HarnessId::NvidiaNim,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
@@ -1009,6 +1019,14 @@ impl AgentAccounts {
         if let Some(slot) = self.muse_active() {
             active_keys
                 .entry(HarnessId::Muse)
+                .or_default()
+                .insert(slot.account_key);
+        }
+        // NVIDIA keys are Zeron-owned too: selection is explicit and never
+        // requires rewriting a third-party CLI's global credential store.
+        if let Some(slot) = self.nvidia_nim_active() {
+            active_keys
+                .entry(HarnessId::NvidiaNim)
                 .or_default()
                 .insert(slot.account_key);
         }
@@ -1169,6 +1187,7 @@ impl AgentAccounts {
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
             HarnessId::Muse => self.set_muse_active(Some(&slot.id))?,
+            HarnessId::NvidiaNim => self.set_nvidia_nim_active(Some(&slot.id))?,
             HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
@@ -1484,6 +1503,10 @@ impl AgentAccounts {
             self.forget_muse(account_id).await?;
             return self.list_locked(false).await;
         }
+        if harness == HarnessId::NvidiaNim {
+            self.forget_nvidia_nim(account_id)?;
+            return self.list_locked(false).await;
+        }
         let snapshot = self.list_locked(false).await?;
         let row = snapshot
             .accounts
@@ -1522,6 +1545,25 @@ impl AgentAccounts {
 
     // ── add-account OAuth flows ─────────────────────────────────────────────
 
+    /// Start a raw-key login. The flow owns no secret until `complete_login`
+    /// arrives, which also lets the phone use its existing secure paste flow.
+    fn start_api_key_login(&self, harness: HarnessId) -> AgentLoginStart {
+        let login_id = new_id();
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::ApiKey {
+                harness,
+                started_at: Instant::now(),
+            },
+        );
+        AgentLoginStart {
+            login_id,
+            url: String::new(),
+            mode: AgentLoginMode::ApiKey,
+            callback_port: None,
+        }
+    }
+
     pub async fn start_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
         self.start_login_for(harness, None).await
     }
@@ -1557,12 +1599,7 @@ impl AgentAccounts {
                 self.start_claude_login().await
             }
             HarnessId::Codex => match provider {
-                Some("api-key") => AgentLoginStart {
-                    login_id: new_id(),
-                    url: String::new(),
-                    mode: AgentLoginMode::ApiKey,
-                    callback_port: None,
-                },
+                Some("api-key") => self.start_api_key_login(HarnessId::Codex),
                 Some("oauth") | None => self.start_codex_login(requester).await?,
                 Some(other) => return Err(stores::unsupported_login(harness, other)),
             },
@@ -1571,6 +1608,10 @@ impl AgentAccounts {
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
             HarnessId::Muse => self.start_muse_login().await?,
+            HarnessId::NvidiaNim => match provider.unwrap_or("api-key") {
+                "api-key" => self.start_api_key_login(HarnessId::NvidiaNim),
+                other => return Err(stores::unsupported_login(harness, other)),
+            },
             HarnessId::Opencode | HarnessId::Kilo => match provider.unwrap_or("openai") {
                 "openai" => self.start_openai_login(harness, "openai").await?,
                 "github-copilot" => self.start_copilot_login(harness).await?,
@@ -2235,6 +2276,18 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        self.sweep_flows();
+        let api_key_harness = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::ApiKey { harness, .. }) => Some(*harness),
+            _ => None,
+        };
+        if let Some(harness) = api_key_harness {
+            // Keep the flow on validation failure so the user can correct the
+            // paste without starting over. A successful save consumes it.
+            let snapshot = self.save_api_key(harness, code).await?;
+            self.remove_flow(login_id);
+            return Ok(snapshot);
+        }
         let (verifier, expected_state, capture) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude {
                 verifier,
@@ -2274,6 +2327,22 @@ impl AgentAccounts {
         .await?;
         self.remove_flow(login_id);
         self.list(false).await
+    }
+
+    /// Save a provider API key through the same completion path on desktop
+    /// and mobile. Unknown providers are rejected before any key is persisted.
+    pub async fn save_api_key(
+        &self,
+        harness: HarnessId,
+        raw_key: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        match harness {
+            HarnessId::Codex => self.save_codex_api_key(raw_key).await,
+            HarnessId::NvidiaNim => self.save_nvidia_nim_api_key(raw_key).await,
+            other => Err(EngineError::Other(format!(
+                "API-key logins are not supported for {other:?}"
+            ))),
+        }
     }
 
     /// Save a pasted Codex API key (`OPENAI_API_KEY`) as an account slot.
@@ -2483,7 +2552,7 @@ impl AgentAccounts {
                         "This sign-in attempt expired — start again.".into(),
                     ));
                 }
-                Some(LoginFlow::Claude { .. }) => {
+                Some(LoginFlow::Claude { .. } | LoginFlow::ApiKey { .. }) => {
                     return Ok(AgentLoginPoll {
                         status: AgentLoginStatus::Pending,
                         message: None,
@@ -3109,8 +3178,9 @@ impl AgentAccounts {
             let mut inflight = lock(&self.inner.inflight_probes);
             for &(harness, slot, active) in targets {
                 // Muse reports its usage from runs (`record_muse_usage`); a
-                // probe's fresh host has observed none.
-                if harness == HarnessId::Muse {
+                // probe's fresh host has observed none. NIM exposes token
+                // usage per response, not a subscription quota to probe.
+                if matches!(harness, HarnessId::Muse | HarnessId::NvidiaNim) {
                     continue;
                 }
                 let key = usage_key(harness, &slot.account_key);
@@ -3470,6 +3540,68 @@ impl AgentAccounts {
             tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
         }
         Ok(access_token)
+    }
+}
+
+/// Compose every Zeron-owned account environment behind the registry's single
+/// hook. Adding NIM must not displace Muse's per-account config roots.
+pub struct AccountRunEnvironment {
+    muse: MuseRunEnvironment,
+    nvidia_nim: NvidiaNimRunEnvironment,
+}
+
+impl AccountRunEnvironment {
+    pub fn new(accounts: AgentAccounts) -> Self {
+        Self {
+            muse: MuseRunEnvironment(accounts.clone()),
+            nvidia_nim: NvidiaNimRunEnvironment(accounts),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::registry::RunEnvironment for AccountRunEnvironment {
+    async fn prepare(
+        &self,
+        harness: HarnessId,
+        request: &mut zeron_proto::RunRequest,
+    ) -> Result<(), String> {
+        crate::registry::RunEnvironment::prepare(&self.muse, harness, request).await?;
+        crate::registry::RunEnvironment::prepare(&self.nvidia_nim, harness, request).await
+    }
+
+    async fn credential(&self, harness: HarnessId) -> Option<String> {
+        if let Some(credential) =
+            crate::registry::RunEnvironment::credential(&self.muse, harness).await
+        {
+            return Some(credential);
+        }
+        crate::registry::RunEnvironment::credential(&self.nvidia_nim, harness).await
+    }
+
+    async fn record_usage(
+        &self,
+        harness: HarnessId,
+        credential: &str,
+        windows: Vec<AgentUsageWindow>,
+        plan_label: Option<String>,
+    ) {
+        crate::registry::RunEnvironment::record_usage(
+            &self.muse,
+            harness,
+            credential,
+            windows.clone(),
+            plan_label.clone(),
+        )
+        .await;
+        crate::registry::RunEnvironment::record_usage(
+            &self.nvidia_nim,
+            harness,
+            credential,
+            windows,
+            plan_label,
+        )
+        .await;
     }
 }
 
