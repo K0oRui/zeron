@@ -78,6 +78,7 @@ fn controls(answers: Vec<UserInputAnswer>) -> (RunControls, Controls) {
         RunControls {
             realtime: None,
             execution_lease: None,
+            user_message_id: None,
             steering,
             interrupt: interrupt.clone(),
             request_input: Box::new(move |questions| {

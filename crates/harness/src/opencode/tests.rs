@@ -1508,6 +1508,7 @@ fn tool_names_type_the_common_calls() {
             {"content": "step two", "status": "in_progress"},
             {"content": "step three", "status": "pending"},
             {"content": "step four", "status": "cancelled"},
+            {"content": "step five", "status": "blocked"},
         ]}),
     );
     assert_eq!(
@@ -1517,7 +1518,12 @@ fn tool_names_type_the_common_calls() {
                 TodoItem::new("step one", TodoStatus::Completed),
                 TodoItem::new("step two", TodoStatus::InProgress),
                 TodoItem::new("step three", TodoStatus::Pending),
-                TodoItem::new("step four", TodoStatus::Pending),
+                // A cancelled step survives as cancelled — the panel strikes it
+                // through instead of showing unfinished work.
+                TodoItem::new("step four", TodoStatus::Cancelled),
+                // A status this build does not know is pending, never a dying
+                // tool call.
+                TodoItem::new("step five", TodoStatus::Pending),
             ]
         }
     );
@@ -3298,6 +3304,7 @@ http.createServer((req, res) => {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        user_message_id: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),
@@ -3459,6 +3466,7 @@ async fn scripted_run(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        user_message_id: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),
@@ -3745,6 +3753,7 @@ async fn a_stopped_server_process_fails_the_turn_and_is_torn_down() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        user_message_id: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: tokio_util::sync::CancellationToken::new(),

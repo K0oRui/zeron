@@ -100,6 +100,7 @@ async fn start(harness: &AcpHarness, req: RunRequest) -> Run {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
+        user_message_id: None,
         request_input: Box::new(move |_questions| {
             let (tx, rx) = oneshot::channel();
             let _ = answer_tx.send(tx);
