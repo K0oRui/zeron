@@ -199,3 +199,42 @@ Locally, the edited files were only checked against tree-sitter's Rust grammar
 ```sh
 cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
 ```
+
+### Repairs made to get the branch green
+
+The run above was red, and every red job is now fixed (`a31cfe4`, `7f9ae3a`).
+Two waves, all of them outside the row model:
+
+1. **Compile**: test-side `RunControls` literals missed `user_message_id`
+   (`crates/harness/tests/*`, `opencode/tests.rs`) — E0063 failed the harness,
+   engine and offline-Linux jobs before any test ran.
+2. **Stale expectations**: grok's ladder stops at `High` and its catalog copy is
+   `xAI's coding model — 500k context` (engine registry + ACP descriptor + ACP
+   enrichment tests); an OpenCode `cancelled` todo stays `Cancelled` and an
+   unknown status is `Pending`; an ACP edit call carries the diff it mapped
+   (`old_string`/`new_string`); an empty OpenCode provider list falls back to the
+   curated free tier instead of failing the probe.
+3. **Real behaviour gaps the tests exposed**:
+   - `pickers::resolve_typed_path` resolved a single-backslash-rooted Windows
+     path (`\Projects`, or `/Projects` swapped to it) through
+     `typed_path_target`, which answered it as a "windows-flavored" absolute —
+     the drive-root arm was unreachable and the result normalized to
+     `/\Projects`. It now resolves against the base's drive root first; UNC and
+     extended roots keep their two backslashes.
+   - `proto::providers::login_options` had no Codex arm, so the desktop offered
+     one Codex login while the engine and the API-key dialog already supported
+     `oauth` and `api-key`. Codex now offers both.
+   - `finish_sidebar_pin_write` cleared the whole queue on a failure, discarding
+     a drop made while an older write was in flight. It now pops only the
+     resolved change: the queue holds deltas applied to the latest watch state,
+     so the newer drop survives and is still sent.
+   - The devin fixture's session advertised a fixed plan model, so the model
+     refresh/retention tests could never observe a new state (the plan filters
+     the catalog by id). The fixture's session now reports the fixture's model
+     state.
+
+Final state: `Windows tests`, `macOS tests`, `Native Codex voice`, `Android`,
+`Preview networking`, `Cursor compatibility` and `core-tests` pass. Both Linux
+UI jobs in that run stopped in the CI action's `apt` step
+(`libwebkit2gtk-4.1-0`: `download failed` after ~150 s) before compiling, the
+same step that succeeded on the previous run; they are re-run with this commit.
