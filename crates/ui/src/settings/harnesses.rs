@@ -2216,23 +2216,23 @@ fn install_phase_copy_and_cancel_target_match_install() {
 fn headroom_detail_names_what_the_proxy_is_doing() {
     use zeron_proto::headroom::HeadroomStatus;
     let mut status = HeadroomStatus::unavailable();
-    assert!(super::headroom_detail(&status, false).starts_with("Not installed"));
+    assert!(headroom_detail(&status, false).starts_with("Not installed"));
     status.installed = true;
     status.version = Some("0.41.0".into());
     assert_eq!(
-        super::headroom_detail(&status, false),
+        headroom_detail(&status, false),
         "Off · rides 127.0.0.1:8787 when enabled · v0.41.0"
     );
     status.enabled = true;
     status.running = true;
     assert_eq!(
-        super::headroom_detail(&status, false),
+        headroom_detail(&status, false),
         "Running on 127.0.0.1:8787 · v0.41.0"
     );
     // An error outranks every state: it is what the user has to act on.
     status.error = Some("boom".into());
-    assert_eq!(super::headroom_detail(&status, false), "Error — boom");
-    assert_eq!(super::headroom_detail(&status, true), "Installing the proxy…");
+    assert_eq!(headroom_detail(&status, false), "Error — boom");
+    assert_eq!(headroom_detail(&status, true), "Installing the proxy…");
 }
 
 #[cfg(test)]
@@ -2241,10 +2241,10 @@ fn headroom_button_offers_the_action_the_device_needs() {
     use zeron_proto::headroom::HeadroomStatus;
     let mut status = HeadroomStatus::unavailable();
     // A missing runtime is exactly when Install must be clickable.
-    assert_eq!(super::headroom_action_label(&status, false), "Install");
+    assert_eq!(headroom_action_label(&status, false), "Install");
     status.installed = true;
-    assert_eq!(super::headroom_action_label(&status, false), "Reinstall");
+    assert_eq!(headroom_action_label(&status, false), "Reinstall");
     status.update_available = true;
-    assert_eq!(super::headroom_action_label(&status, false), "Update");
-    assert_eq!(super::headroom_action_label(&status, true), "Installing…");
+    assert_eq!(headroom_action_label(&status, false), "Update");
+    assert_eq!(headroom_action_label(&status, true), "Installing…");
 }
