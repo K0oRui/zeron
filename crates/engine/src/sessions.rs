@@ -548,6 +548,14 @@ impl SessionsEngine {
         lock(&self.inner.runs).get(chat_id).map(|h| h.runtime_config.harness_id)
     }
 
+    /// Mark the provider-switch seam for a send about to run on `harness_id`
+    /// now, with its message, rather than once the dispatch has replaced the
+    /// outgoing provider's runtime (seconds later). Idempotent: the dispatch's
+    /// own note finds the seam already written.
+    pub fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
+        self.inner.note_provider_switch(chat_id, harness_id, doc);
+    }
+
     /// Whether an accepted agent update gates the chat's live run, so a new
     /// prompt waits in the queue rather than joining that run's transcript.
     pub fn live_run_update_pending(&self, chat_id: &str) -> bool {
@@ -3786,6 +3794,12 @@ async fn drive_run(
                     wire_request.prompt =
                         zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
                 }
+                // Everything the agent starts inherits its chat, which is how
+                // preview discovery tells its dev servers from the user's own.
+                wire_request.env.insert(
+                    zeron_proto::ORIGIN_ENV.into(),
+                    zeron_proto::chat_origin(&chat_id),
+                );
                 // Host-resolved spawn env (a Cloud device's credential broker);
                 // `RunRequest::env` is serde-skipped, never persisted.
                 match inner

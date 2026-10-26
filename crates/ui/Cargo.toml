@@ -53,12 +53,24 @@ name = "pull-request-fixture"
 required-features = ["pull-request-fixture"]
 
 [[example]]
+name = "pull-request-destination-fixture"
+required-features = ["pull-request-fixture", "browser-fixture"]
+
+[[example]]
 name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 
 [[example]]
 name = "new-project-path-fixture"
 required-features = ["project-path-fixture"]
+
+[[example]]
+name = "rail-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "message-captions-fixture"
+required-features = ["appshots-fixture"]
 
 [[example]]
 name = "sidebar-fixture"

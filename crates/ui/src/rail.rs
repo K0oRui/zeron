@@ -1,7 +1,9 @@
 //! MessageRail (feature-inventory §1.8): a left vertical minimap of the user's
 //! prompts. The active tick brightens, hover grows the tick and shows a preview
 //! card (prompt + reply opening), click smooth-scrolls the transcript to that
-//! row. Hidden below a 48rem container width.
+//! row. A conversation too long for the rail's window scrolls its ticks (the
+//! Codex prompt rail), following the prompts on screen. Hidden below a 48rem
+//! container width.
 //!
 //! Pure logic (tick extraction, active detection, width gate, previews) lives
 //! in free functions with unit tests; rendering is an `impl Transcript`
@@ -123,19 +125,53 @@ pub const TICK_SPACING: f32 = 8.0;
 /// One tick's hit-row height: the stack pads half of it above the first tick
 /// and below the last so the end ticks stay as easy to hit as the rest.
 pub const TICK_SLOT: f32 = 10.0;
-/// Vertical room kept clear of the stack (NeverWrite `100vh - 18rem`), so a
-/// long conversation compresses its ticks instead of overflowing.
-pub const RAIL_RESERVED_V: f32 = 288.0;
+/// The rail's tallest window, as a share of the band between the titlebar
+/// and the bottom chrome, and in absolute terms (Codex `min(70vh, 40rem)`).
+/// A longer conversation scrolls its ticks inside it.
+pub const RAIL_HEIGHT_SHARE: f32 = 0.7;
+pub const RAIL_MAX_HEIGHT: f32 = 640.0;
+/// The fade at a scrolled rail's clipped ends; following keeps lit ticks
+/// clear of it.
+pub const RAIL_EDGE_FADE: f32 = 24.0;
 /// The rail's hit strip width (the widest tick plus breathing room).
 pub const RAIL_HIT_WIDTH: f32 = 32.0;
 
-/// The tick stack's height: one [`TICK_SPACING`] per gap while it fits, then
-/// every prompt shares the available height — every prompt keeps its own tick
-/// at any conversation length.
-pub fn rail_height(n: usize, viewport_height: f32) -> f32 {
-    let natural = n.saturating_sub(1) as f32 * TICK_SPACING;
-    let available = (viewport_height - RAIL_RESERVED_V).max(TICK_SPACING);
-    natural.min(available)
+/// The tick stack's height from first tick to last: one [`TICK_SPACING`] per
+/// gap at any conversation length (it scrolls rather than compresses).
+pub fn rail_height(n: usize) -> f32 {
+    n.saturating_sub(1) as f32 * TICK_SPACING
+}
+
+/// The rail window's height for a stack `content` tall (ticks plus their
+/// slot) in a `band`-tall space: all of it while it fits, else the cap.
+pub fn rail_window(content: f32, band: f32) -> f32 {
+    let cap = (band * RAIL_HEIGHT_SHARE)
+        .min(RAIL_MAX_HEIGHT)
+        .max(TICK_SLOT * 4.0);
+    content.min(cap)
+}
+
+/// The rail scroll position that brings the stack span `top..bottom` into a
+/// `window`-tall view now at `scroll`, `margin` clear of either edge (the
+/// fade): the least movement, the span's top winning when it can't all fit.
+/// Clamped to a stack `content` tall.
+pub fn follow_scroll(
+    scroll: f32,
+    window: f32,
+    content: f32,
+    top: f32,
+    bottom: f32,
+    margin: f32,
+) -> f32 {
+    let margin = margin.min(((window - (bottom - top)) / 2.0).max(0.0));
+    let mut scroll = scroll;
+    if bottom + margin > scroll + window {
+        scroll = bottom + margin - window;
+    }
+    if top - margin < scroll {
+        scroll = top - margin;
+    }
+    scroll.clamp(0.0, (content - window).max(0.0))
 }
 
 /// Tick `ix`'s offset from the stack's first tick: evenly spread over
@@ -425,6 +461,25 @@ impl Transcript {
         }));
     }
 
+    /// Row `row`'s top and bottom in window coordinates, `None` while it's
+    /// unmeasured. Glued to the bottom, the list reports no row bounds (its
+    /// anchor sits past the last row), but the content's end rests on the
+    /// viewport's bottom, so measured rows place from there.
+    fn row_span(&self, row: usize) -> Option<(f32, f32)> {
+        let list = self.list_state();
+        if let Some(bounds) = list.bounds_for_item(row) {
+            return Some((f32::from(bounds.top()), f32::from(bounds.bottom())));
+        }
+        if !self.is_glued() {
+            return None;
+        }
+        let end = list.offset_for_item(list.item_count());
+        let bottom = f32::from(list.viewport_bounds().bottom());
+        let top = bottom - f32::from(end - list.offset_for_item(row));
+        let row_bottom = bottom - f32::from(end - list.offset_for_item(row + 1));
+        (row_bottom > top).then_some((top, row_bottom))
+    }
+
     /// The rail element — an absolute overlay along the transcript's left edge.
     pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.rail_enabled() {
@@ -461,17 +516,27 @@ impl Transcript {
         // (user report). Walk forward over measured rows whose tops are at or
         // above the reading line; unmeasured rows (None bounds) stop the walk,
         // leaving the raw top row — the pre-fix behavior.
-        let mut top_row = self.list_state().logical_scroll_top().item_ix;
         let read_top = f32::from(self.list_state().viewport_bounds().top())
             + crate::transcript::OWN_SEND_TOP_INSET_PX
             + 0.5;
-        while let Some(bounds) = self.list_state().bounds_for_item(top_row + 1) {
-            if f32::from(bounds.top()) <= read_top {
-                top_row += 1;
-            } else {
-                break;
+        let top_row = if self.is_glued() {
+            // Glued to the bottom the list reports no row bounds; place them
+            // from the end instead.
+            (0..self.rows().len())
+                .rev()
+                .find(|&row| self.row_span(row).is_some_and(|(top, _)| top <= read_top))
+                .unwrap_or(0)
+        } else {
+            let mut top_row = self.list_state().logical_scroll_top().item_ix;
+            while let Some(bounds) = self.list_state().bounds_for_item(top_row + 1) {
+                if f32::from(bounds.top()) <= read_top {
+                    top_row += 1;
+                } else {
+                    break;
+                }
             }
-        }
+            top_row
+        };
         let active = active_tick(&tick_rows, top_row);
         // Every prompt whose row shows between the titlebar and the bottom
         // chrome lights its tick; with none on screen (a long reply), the
@@ -482,24 +547,57 @@ impl Transcript {
         let in_view: Vec<bool> = tick_rows
             .iter()
             .map(|&row| {
-                self.list_state().bounds_for_item(row).is_some_and(|b| {
-                    f32::from(b.bottom()) > view_top && f32::from(b.top()) < view_bottom
-                })
+                self.row_span(row)
+                    .is_some_and(|(top, bottom)| bottom > view_top && top < view_bottom)
             })
             .collect();
         let any_in_view = in_view.iter().any(|&v| v);
         let n = pairs.len();
+        let lit: Vec<bool> = (0..n)
+            .map(|ix| in_view[ix] || (!any_in_view && active == Some(ix)))
+            .collect();
         let hover = self.rail_hover().filter(|&ix| ix < n);
         let theme = Theme::of(cx).clone();
 
-        // Pre-layout the viewport reads 0; assume a typical height for that
-        // one frame rather than collapsing the stack.
-        let viewport_h = f32::from(viewport.size.height);
-        let height = rail_height(n, if viewport_h > 0.0 { viewport_h } else { 600.0 });
+        // The rail centres in the band between the titlebar and the bottom
+        // chrome. Pre-layout the viewport reads 0; assume a typical height
+        // for that one frame rather than collapsing the stack.
+        let band_top = crate::transcript::OWN_SEND_TOP_INSET_PX;
+        let band_bottom = self.bottom_clearance();
+        let viewport_h = match f32::from(viewport.size.height) {
+            h if h > 0.0 => h,
+            _ => 600.0,
+        };
+        let height = rail_height(n);
+        let content = height + TICK_SLOT;
+        let window_h = rail_window(content, viewport_h - band_top - band_bottom);
+        let scrolls = content > window_h + 0.5;
         let ids: std::rc::Rc<[SharedString]> = pairs
             .iter()
             .map(|(tick, _)| SharedString::from(tick.message_id.clone()))
             .collect();
+        // A scrolling rail keeps the lit ticks in view, moving only when
+        // what's lit changes (and not under the pointer), so scrolling it by
+        // hand holds.
+        let first_lit = lit.iter().position(|&l| l);
+        let last_lit = lit.iter().rposition(|&l| l);
+        if let (true, None, Some(first), Some(last)) = (scrolls, hover, first_lit, last_lit) {
+            let key = (ids[first].clone(), ids[last].clone());
+            if self.rail_followed_mut().as_ref() != Some(&key) {
+                let scroll = self.rail_scroll().clone();
+                let target = follow_scroll(
+                    -f32::from(scroll.offset().y),
+                    window_h,
+                    content,
+                    tick_offset(first, n, height),
+                    tick_offset(last, n, height) + TICK_SLOT,
+                    RAIL_EDGE_FADE,
+                );
+                scroll.set_offset(gpui::point(px(0.0), px(-target)));
+                *self.rail_followed_mut() = Some(key);
+            }
+        }
+        let rail_scroll = self.rail_scroll().clone();
         let bounds_cell = self.rail_bounds().clone();
         let tick_under = {
             let bounds_cell = bounds_cell.clone();
@@ -513,8 +611,7 @@ impl Transcript {
         let ticks =
             pairs.into_iter().enumerate().map(|(ix, (tick, _))| {
                 let distance = hover.map(|h| h.abs_diff(ix));
-                let lit = in_view[ix] || (!any_in_view && active == Some(ix));
-                let bar_color = if distance == Some(0) || lit {
+                let bar_color = if distance == Some(0) || lit[ix] {
                     theme.text.opacity(0.8)
                 } else {
                     crate::theme::ink(0.16)
@@ -579,61 +676,89 @@ impl Transcript {
                     })
             });
 
+        let stack = div()
+            .id("rail-ticks")
+            .relative()
+            .w_full()
+            .h(px(content))
+            .cursor_pointer()
+            .child(
+                canvas(
+                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            // One hit strip resolves the nearest tick from the pointer,
+            // so dense stacks never fall between per-tick hitboxes.
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                let ix = move_under(event.position.y);
+                if this.rail_hover() != ix {
+                    this.set_rail_hover(ix);
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered && this.rail_hover().is_some() {
+                    this.set_rail_hover(None);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                let ix = match event {
+                    ClickEvent::Mouse(_) => tick_under(event.position().y),
+                    _ => None,
+                }
+                .or(this.rail_hover());
+                // Resolve the row at click time: rows can splice
+                // between the render that drew the tick and the click.
+                let Some(id) = ix.and_then(|ix| ids.get(ix)) else {
+                    return;
+                };
+                if let Some(row) = this.rows().iter().position(|r| r.id == *id) {
+                    this.scroll_to_row(row, cx);
+                }
+            }))
+            .children(ticks);
+        let body = if scrolls {
+            crate::edge_fade::edge_faded(
+                RAIL_EDGE_FADE,
+                true,
+                true,
+                div()
+                    .id("rail-scroll")
+                    .w_full()
+                    .h(px(window_h))
+                    .overflow_y_scroll()
+                    .track_scroll(&rail_scroll)
+                    .child(stack),
+            )
+            .fade_overflow_y(&rail_scroll)
+            .into_any_element()
+        } else {
+            stack.into_any_element()
+        };
+
         div()
             .absolute()
             .left(px(16.0))
-            .top_0()
-            .bottom_0()
+            .top(px(band_top))
+            .bottom(px(band_bottom))
             .w(px(RAIL_HIT_WIDTH))
             .flex()
             .flex_col()
             .justify_center()
             .child(
                 div()
-                    .id("rail-ticks")
-                    .relative()
+                    .id("rail")
                     .w_full()
-                    .h(px(height + TICK_SLOT))
-                    .cursor_pointer()
-                    .child(
-                        canvas(
-                            move |bounds, _, _| bounds_cell.set(Some(bounds)),
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    // One hit strip resolves the nearest tick from the pointer,
-                    // so dense stacks never fall between per-tick hitboxes.
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                        let ix = move_under(event.position.y);
-                        if this.rail_hover() != ix {
-                            this.set_rail_hover(ix);
-                            cx.notify();
-                        }
-                    }))
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        if !*hovered && this.rail_hover().is_some() {
-                            this.set_rail_hover(None);
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        let ix = match event {
-                            ClickEvent::Mouse(_) => tick_under(event.position().y),
-                            _ => None,
-                        }
-                        .or(this.rail_hover());
-                        // Resolve the row at click time: rows can splice
-                        // between the render that drew the tick and the click.
-                        let Some(id) = ix.and_then(|ix| ids.get(ix)) else {
-                            return;
-                        };
-                        if let Some(row) = this.rows().iter().position(|r| r.id == *id) {
-                            this.scroll_to_row(row, cx);
-                        }
-                    }))
-                    .children(ticks),
+                    // A scrolling rail keeps the wheel at its ends instead of
+                    // handing it on to the transcript underneath.
+                    .when(scrolls, |rail| {
+                        rail.on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    })
+                    .child(body),
             )
             .into_any_element()
     }
@@ -661,15 +786,43 @@ mod tests {
     }
 
     #[test]
-    fn rail_height_spaces_ticks_then_compresses() {
-        // Natural spacing while it fits.
-        assert_eq!(rail_height(2, 900.0), TICK_SPACING);
-        assert_eq!(rail_height(10, 900.0), 9.0 * TICK_SPACING);
-        // A long conversation shares the available height instead of growing.
-        assert_eq!(rail_height(500, 900.0), 900.0 - RAIL_RESERVED_V);
-        // Tiny (or unmeasured) heights still leave a usable stack.
-        assert_eq!(rail_height(500, 0.0), TICK_SPACING);
-        assert_eq!(rail_height(1, 900.0), 0.0);
+    fn rail_keeps_natural_spacing_and_windows_long_stacks() {
+        assert_eq!(rail_height(2), TICK_SPACING);
+        assert_eq!(rail_height(10), 9.0 * TICK_SPACING);
+        // Long conversations keep their spacing; the window scrolls instead.
+        assert_eq!(rail_height(500), 499.0 * TICK_SPACING);
+        assert_eq!(rail_height(1), 0.0);
+        // A short stack shows whole; a long one caps at 70% of the band, and
+        // at RAIL_MAX_HEIGHT on a tall window.
+        assert_eq!(rail_window(90.0, 700.0), 90.0);
+        assert_eq!(rail_window(4000.0, 700.0), 490.0);
+        assert_eq!(rail_window(4000.0, 2000.0), RAIL_MAX_HEIGHT);
+        // A cramped band still leaves a usable window.
+        assert_eq!(rail_window(4000.0, 0.0), TICK_SLOT * 4.0);
+    }
+
+    #[test]
+    fn follow_scroll_moves_least_and_clears_the_fade() {
+        // Already comfortably in view: no movement.
+        assert_eq!(
+            follow_scroll(100.0, 200.0, 1000.0, 150.0, 160.0, 24.0),
+            100.0
+        );
+        // Below the window: lands just above the bottom fade.
+        assert_eq!(follow_scroll(0.0, 200.0, 1000.0, 400.0, 410.0, 24.0), 234.0);
+        // Above it: lands just below the top fade.
+        assert_eq!(
+            follow_scroll(500.0, 200.0, 1000.0, 300.0, 310.0, 24.0),
+            276.0
+        );
+        // A span taller than the window shows its top.
+        assert_eq!(follow_scroll(0.0, 200.0, 1000.0, 400.0, 700.0, 24.0), 400.0);
+        // Clamped to the stack's ends.
+        assert_eq!(
+            follow_scroll(0.0, 200.0, 1000.0, 990.0, 1000.0, 24.0),
+            800.0
+        );
+        assert_eq!(follow_scroll(300.0, 200.0, 1000.0, 0.0, 10.0, 24.0), 0.0);
     }
 
     #[test]
@@ -685,7 +838,7 @@ mod tests {
     #[test]
     fn pointer_maps_to_every_tick() {
         for n in [2usize, 7, 12, 13, 80, 300] {
-            let height = rail_height(n, 900.0);
+            let height = rail_height(n);
             for ix in 0..n {
                 let y = tick_offset(ix, n, height);
                 assert_eq!(tick_at(n, height, y), Some(ix), "n={n} ix={ix}");
