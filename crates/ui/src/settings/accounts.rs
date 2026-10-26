@@ -195,6 +195,10 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
             "Paste an OpenAI API key. It is stored next to your current login — nothing \
              changes until you switch. API keys have no plan usage meters."
         }
+        (HarnessId::NvidiaNim, _) => {
+            "Paste an NVIDIA API key (`nvapi-…`). The first key is selected automatically; \
+             adding another never switches your current account for you."
+        }
         (HarnessId::Codex, _) => {
             "Finish signing in to ChatGPT in your browser. The new login is saved next to \
              your current one — nothing changes until you switch."
@@ -374,8 +378,8 @@ enum LoginStep {
         submitting: bool,
         error: Option<SharedString>,
     },
-    /// Codex API key entry: the user pastes `OPENAI_API_KEY`, saved via
-    /// `SaveCodexApiKey` with no browser flow.
+    /// Raw provider key entry (OpenAI or NVIDIA), completed through the
+    /// engine's expiring API-key login flow with no browser round-trip.
     ApiKey {
         submitting: bool,
         error: Option<SharedString>,
@@ -386,7 +390,7 @@ enum LoginStep {
 
 impl LoginFlow {
     fn title(&self) -> String {
-        if self.harness == HarnessId::Codex && self.provider == Some("api-key") {
+        if self.provider == Some("api-key") {
             return format!("Add an API key for {}", provider_name(self.harness));
         }
         let option = login_options(self.harness)
@@ -486,7 +490,11 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
+        let code_input = cx.new(|cx| {
+            ComposerInput::new("Paste the authorization code", cx)
+                .with_single_line()
+                .with_masked()
+        });
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 match &this.login.as_ref().map(|flow| &flow.step) {
@@ -798,35 +806,14 @@ impl AccountsPage {
     // ---- add-account flows ----
 
     /// Start (or Retry) a sign-in: the same dialog for every provider.
-    /// Codex API keys skip the engine round-trip entirely — the key dialog
-    /// opens locally and saves via `SaveCodexApiKey` on submit.
+    /// API-key starts return an ordinary expiring login id, so desktop and
+    /// mobile complete them through the same engine flow.
     fn start_login(
         &mut self,
         harness: HarnessId,
         provider: Option<&'static str>,
         cx: &mut Context<Self>,
     ) {
-        if harness == HarnessId::Codex && provider == Some("api-key") {
-            self.login_attempts += 1;
-            let attempt = self.login_attempts;
-            self.login = Some(LoginFlow {
-                harness,
-                provider,
-                attempt,
-                login_id: None,
-                url: None,
-                step: LoginStep::ApiKey {
-                    submitting: false,
-                    error: None,
-                },
-            });
-            self.poll_task = None;
-            self.error = None;
-            self.code_input
-                .update(cx, |input, cx| input.set_text("", cx));
-            cx.notify();
-            return;
-        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -885,16 +872,25 @@ impl AccountsPage {
                             submitting: false,
                             error: None,
                         };
-                        self.code_input
-                            .update(cx, |input, cx| input.set_text("", cx));
+                        self.code_input.update(cx, |input, cx| {
+                            input.set_placeholder("Paste the authorization code", cx);
+                            input.set_text("", cx);
+                        });
                     }
                     AgentLoginMode::ApiKey => {
                         flow.step = LoginStep::ApiKey {
                             submitting: false,
                             error: None,
                         };
-                        self.code_input
-                            .update(cx, |input, cx| input.set_text("", cx));
+                        let placeholder = if flow.harness == HarnessId::NvidiaNim {
+                            "nvapi-…"
+                        } else {
+                            "sk-…"
+                        };
+                        self.code_input.update(cx, |input, cx| {
+                            input.set_placeholder(placeholder, cx);
+                            input.set_text("", cx);
+                        });
                     }
                     AgentLoginMode::Browser => self.spawn_poll(cx),
                 }
@@ -963,6 +959,7 @@ impl AccountsPage {
         let Some(LoginFlow {
             step: LoginStep::ApiKey { submitting, .. },
             attempt,
+            login_id,
             ..
         }) = &mut self.login
         else {
@@ -983,16 +980,27 @@ impl AccountsPage {
             return;
         }
         let attempt = *attempt;
+        let login_id = login_id.clone();
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         *submitting = true;
-        let params = self.params(serde_json::json!({ "apiKey": key }));
+        let (method, params) = match login_id {
+            Some(login_id) => (
+                methods::COMPLETE_AGENT_LOGIN,
+                self.params(serde_json::json!({ "loginId": login_id, "code": key })),
+            ),
+            // Compatibility with a flow restored by an older desktop build.
+            None => (
+                methods::SAVE_CODEX_API_KEY,
+                self.params(serde_json::json!({ "apiKey": key })),
+            ),
+        };
         let target = self.target_device.clone();
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
-                .call(methods::SAVE_CODEX_API_KEY, params)
+                .call(method, params)
                 .await
                 .map_err(|err| err.to_string())
                 .and_then(|value| {
@@ -1118,9 +1126,8 @@ impl AccountsPage {
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
         let login_id = match self.login.take() {
-            // A failed login is already over engine-side. An API key entry
-            // never started one — but a remote ApiKey start did hand out a
-            // login id, so cancel it best-effort all the same.
+            // A failed login is already over engine-side. Browser, paste-code
+            // and API-key starts all own an expiring engine flow to cancel.
             Some(LoginFlow {
                 login_id: Some(login_id),
                 step:
@@ -2192,6 +2199,7 @@ impl Render for AccountsPage {
             HarnessId::Kilo => (crate::icons::KILO_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
+            HarnessId::NvidiaNim => (crate::icons::NIM_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -2676,6 +2684,11 @@ mod tests {
             ..waiting(HarnessId::Codex, 1)
         };
         assert_eq!(api_flow.title(), "Add an API key for Codex");
+        let nim = login_options(HarnessId::NvidiaNim);
+        assert_eq!(nim.len(), 1);
+        assert_eq!(nim[0].provider, Some("api-key"));
+        assert!(!reports_usage(HarnessId::NvidiaNim));
+        assert!(login_copy(HarnessId::NvidiaNim, Some("api-key")).contains("nvapi-"));
         let opencode = login_options(HarnessId::Opencode);
         let labels: Vec<_> = opencode.iter().map(|o| o.label).collect();
         assert_eq!(labels, ["ChatGPT", "GitHub Copilot"]);

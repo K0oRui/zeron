@@ -1403,8 +1403,9 @@ pub enum AgentLoginMode {
     /// A loopback callback completes the sign-in in the browser (every
     /// provider's default); poll until done.
     Browser,
-    /// The user pastes a raw provider API key (Codex `OPENAI_API_KEY`).
-    /// No browser flow runs; the key is saved via `SaveCodexApiKey`.
+    /// The user pastes a raw provider API key (Codex `OPENAI_API_KEY`,
+    /// NVIDIA `NVIDIA_API_KEY`). No browser flow runs; `CompleteAgentLogin`
+    /// saves it into the same account store as an OAuth login.
     ApiKey,
 }
 

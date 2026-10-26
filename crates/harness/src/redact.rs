@@ -17,7 +17,7 @@
 /// - an `Authorization` / `Proxy-Authorization` value through end-of-line
 ///   (only its scheme word — `Bearer`, `Digest`, … — stays);
 /// - JWTs (`eyJ…`), vendor-prefixed keys (`sk-…`, `ghp_…`, `gho_…`, `xai-…`,
-///   …), the value after `Bearer`, and long base64 / hex runs.
+///   …), NVIDIA `nvapi-…` keys, the value after `Bearer`, and long base64 / hex runs.
 pub fn redact_output(text: &str) -> String {
     let text = strip_ansi(text);
     let mut redactor = Redactor::default();
@@ -450,6 +450,7 @@ const SECRET_PREFIXES: &[&str] = &[
     "ghr_",
     "github_pat_",
     "xai-",
+    "nvapi-",
     "xoxb-",
     "xoxp-",
     "glpat-",
@@ -824,6 +825,10 @@ mod tests {
         );
         assert_eq!(
             redact_output("key sk-ant-api03-abcdefghijklmnop"),
+            "key [redacted]"
+        );
+        assert_eq!(
+            redact_output("key nvapi-fixture-key-123456"),
             "key [redacted]"
         );
         assert_eq!(

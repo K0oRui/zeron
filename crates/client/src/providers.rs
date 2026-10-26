@@ -113,7 +113,8 @@ impl Client {
         Ok(poll)
     }
 
-    /// `CompleteAgentLogin`: the code Claude's page showed, pasted back.
+    /// `CompleteAgentLogin`: finish a paste-code OAuth flow, or save the raw
+    /// key from an API-key flow. The engine's login id determines which.
     pub async fn device_login_complete(
         &self,
         device_id: &str,

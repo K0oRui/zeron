@@ -29,7 +29,7 @@ pub enum HarnessId {
     /// Meta's Muse Code agent, driven natively over the Muse Session Protocol
     /// (MSP: `muse` speaking JSON-RPC on stdio).
     Muse,
-    /// NVIDIA NIM — model catalog endpoint serving free and paid NIM models.
+    /// NVIDIA NIM — authenticated OpenAI-compatible hosted inference.
     NvidiaNim,
     /// Test harness; never shown in production pickers.
     Mock,

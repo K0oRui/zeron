@@ -182,7 +182,7 @@ fun ProvidersScreen(model: AppModel, target: String?, onBack: () -> Unit, onOpen
             val footer = when {
                 onCloud -> "Cloud agents use the account marked in use. Signing in here stores the login in Cloud, not on this phone."
                 !online -> "$name is offline — showing what it last reported."
-                else -> "Agents run with the logins on $name. Switch accounts here; to add one, sign in from Zeron on that computer."
+                else -> "Agents run with the logins on $name. Open a provider to add, switch, or remove its accounts."
             }
             cloudSection("Agents", footer = footer, key = "agents-$selected") {
                 if (onCloud) {

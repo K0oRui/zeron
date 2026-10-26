@@ -205,6 +205,10 @@ pub(super) fn unsupported_login(harness: HarnessId, provider: &str) -> EngineErr
              logins for Claude Code."
                 .to_string()
         }
+        (HarnessId::NvidiaNim, _) => {
+            "NVIDIA NIM accepts an NVIDIA API key (`nvapi-…`), not that login method."
+                .to_string()
+        }
         _ => format!(
             "zeron can't add a {provider} login for {} — sign in with `{}` itself.",
             cli_name(harness),

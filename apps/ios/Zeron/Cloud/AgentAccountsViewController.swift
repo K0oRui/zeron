@@ -243,7 +243,7 @@ final class AgentAccountsViewController: UITableViewController {
         case .cloud:
             "Cloud sessions use the account in use. Sign-ins and keys are kept in Cloud, never on this phone."
         case let .device(_, name, _, _):
-            "Account changes affect new sessions on \(name). Signing in runs on \(name); you finish in the browser here."
+            "Account changes affect new sessions on \(name). Browser sign-ins and API-key entries are completed here; credentials stay on \(name)."
         }
         c.text = [rules.note, where_].compactMap { $0 }.joined(separator: "\n\n")
         footer.contentConfiguration = c
@@ -503,8 +503,9 @@ final class DeviceSignIn: NSObject, ASWebAuthenticationPresentationContextProvid
         let done = ProviderSignIn.doneURL
         let start = try await client.deviceLoginStart(deviceId: device, harness: harness, provider: provider, doneUrl: done)
         if start.pasteCode {
-            open(start.url)
-            guard let code = await askForCode() else {
+            // API-key flows have no page; Claude's paste-code fallback does.
+            if !start.url.isEmpty { open(start.url) }
+            guard let code = await askForCode(apiKey: start.url.isEmpty, harness: harness) else {
                 client.deviceLoginCancel(deviceId: device, loginId: start.loginId)
                 throw CancellationError()
             }
@@ -563,17 +564,27 @@ final class DeviceSignIn: NSObject, ASWebAuthenticationPresentationContextProvid
         s.start()
     }
 
-    private func askForCode() async -> String? {
+    private func askForCode(apiKey: Bool = false, harness: String = "") async -> String? {
         guard let host else { return nil }
+        let nvidia = apiKey && harness == "nvidia-nim"
         return await withCheckedContinuation { cont in
-            let alert = UIAlertController(title: "Paste the code", message: "Copy the code the sign-in page shows, then paste it here.", preferredStyle: .alert)
+            let alert = UIAlertController(
+                title: apiKey ? (nvidia ? "NVIDIA API key" : "OpenAI API key") : "Paste the code",
+                message: apiKey
+                    ? (nvidia
+                        ? "Paste the key from NVIDIA API Catalog. It is sent only to the computer hosting NIM."
+                        : "Paste your OpenAI API key. It is sent only to the computer hosting Codex.")
+                    : "Copy the code the sign-in page shows, then paste it here.",
+                preferredStyle: .alert
+            )
             alert.addTextField { field in
-                field.placeholder = "Authorization code"
+                field.placeholder = apiKey ? (nvidia ? "nvapi-…" : "sk-…") : "Authorization code"
+                field.isSecureTextEntry = apiKey
                 field.autocorrectionType = .no
                 field.autocapitalizationType = .none
             }
             alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in cont.resume(returning: nil) })
-            alert.addAction(UIAlertAction(title: "Continue", style: .default) { [weak alert] _ in
+            alert.addAction(UIAlertAction(title: apiKey ? "Save Key" : "Continue", style: .default) { [weak alert] _ in
                 let code = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
                 cont.resume(returning: code?.nonEmpty)
             })

@@ -53,6 +53,9 @@ fn providers_of(harness: HarnessId) -> Option<(VaultProvider, VaultProvider)> {
     }
 }
 
+// Cloud's vault broker currently has grant types for Codex and Claude only.
+// NIM remains a device-native provider; do not show a Cloud login that cannot
+// be fulfilled by a session machine.
 const CLOUD_HARNESSES: [HarnessId; 2] = [HarnessId::ClaudeCode, HarnessId::Codex];
 
 fn failed(error: impl std::fmt::Display) -> RpcError {

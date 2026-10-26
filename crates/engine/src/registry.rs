@@ -183,7 +183,8 @@ pub struct HarnessRegistry {
     /// Spawn-time environment provider (Cloud runner only).
     run_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Spawn-time environment of the agent accounts zeron keeps itself
-    /// (Muse's per-account roots); after the Cloud broker, never over it.
+    /// (Muse's per-account roots and NIM's selected API key); after the Cloud
+    /// broker, never over it.
     account_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
     commit_credit: std::sync::OnceLock<Arc<crate::commit_credit::CommitCredit>>,
@@ -967,12 +968,13 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
     );
-    // NVIDIA NIM — model catalog served over HTTP, filtered to free-plan models.
+    // NVIDIA NIM — authenticated OpenAI-compatible inference over HTTP.
+    // Its direct driver parks between turns and accepts the next prompt there.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::NvidiaNim,
             name: "NVIDIA NIM".into(),
-            supports_steering: false,
+            supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
             installed: true,

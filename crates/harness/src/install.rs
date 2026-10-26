@@ -194,7 +194,8 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
         Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
-        NvidiaNim => ("nvidia-nim", "PATH"),
+        // NIM is an in-process HTTP provider; there is no `nvidia-nim` CLI.
+        NvidiaNim => ("", "built into Zeron"),
     }
 }
 
@@ -213,12 +214,15 @@ pub fn installed(id: HarnessId) -> bool {
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Muse => crate::MuseHarness::new().installed(),
         Mock => false,
-        NvidiaNim => false,
+        NvidiaNim => crate::NvidiaNimHarness::new().installed(),
     }
 }
 
 fn invalidate_versions(id: HarnessId) {
     let (cli, _) = cli_and_dir(id);
+    if cli.is_empty() {
+        return;
+    }
     if id == HarnessId::Cursor {
         crate::executable::invalidate_versions(&[cli, "agent"]);
     } else {
@@ -581,7 +585,8 @@ mod tests {
                 )
             );
             let (cli, dir) = cli_and_dir(id);
-            assert!(!cli.is_empty() && !dir.is_empty());
+            assert_eq!(cli.is_empty(), id == HarnessId::NvidiaNim);
+            assert!(!dir.is_empty());
         }
         assert!(
             post_install(HarnessId::Mock)

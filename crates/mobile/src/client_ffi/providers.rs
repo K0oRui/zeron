@@ -66,8 +66,9 @@ impl From<zeron_proto::AgentAccount> for DeviceAccountInfo {
 }
 
 /// A computer's sign-in under way: open `url` in an auth sheet waiting for
-/// the `done_url` scheme; poll until done — or, `paste_code`, take the code
-/// the page shows back with `device_login_complete`.
+/// the `done_url` scheme; poll until done — or, `paste_code`, securely paste
+/// the page's code (or an API key when `url` is empty) back with
+/// `device_login_complete`.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct DeviceLoginInfo {
     pub login_id: String,
@@ -227,7 +228,10 @@ impl CoreClient {
         .map(|start| DeviceLoginInfo {
             login_id: start.login_id,
             url: start.url,
-            paste_code: start.mode == zeron_proto::AgentLoginMode::PasteCode,
+            paste_code: matches!(
+                start.mode,
+                zeron_proto::AgentLoginMode::PasteCode | zeron_proto::AgentLoginMode::ApiKey
+            ),
         })
     }
 
