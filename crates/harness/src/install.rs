@@ -117,6 +117,7 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
             "curl -fsSL https://cli.devin.ai/install.sh | bash",
             "bash",
         )],
+        NvidiaNim => vec![],
     }
 }
 
@@ -174,6 +175,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
         Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
         Antigravity | Mock => return None,
+        NvidiaNim => return None,
     })
 }
 
@@ -192,6 +194,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Antigravity => ("agy_acp_server", "~/.zeron/adapters"),
         Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
+        NvidiaNim => ("nvidia-nim", "PATH"),
     }
 }
 
@@ -210,6 +213,7 @@ pub fn installed(id: HarnessId) -> bool {
         Antigravity => crate::AcpHarness::antigravity().installed(),
         Muse => crate::MuseHarness::new().installed(),
         Mock => false,
+        NvidiaNim => false,
     }
 }
 
@@ -410,7 +414,7 @@ async fn run(
 mod tests {
     use super::*;
 
-    const IDS: [HarnessId; 11] = [
+    const IDS: [HarnessId; 12] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -422,6 +426,7 @@ mod tests {
         HarnessId::Devin,
         HarnessId::Antigravity,
         HarnessId::Mock,
+        HarnessId::NvidiaNim,
     ];
 
     #[test]
@@ -429,7 +434,10 @@ mod tests {
         for platform in [Platform::Unix, Platform::Mac, Platform::Windows] {
             for id in IDS {
                 let list = methods(id, platform);
-                assert_eq!(list.is_empty(), id == HarnessId::Mock);
+                assert_eq!(
+                    list.is_empty(),
+                    matches!(id, HarnessId::Mock | HarnessId::NvidiaNim)
+                );
                 for method in list {
                     assert!(available(method, platform, &|_| true, true));
                     assert!(!available(method, platform, &|_| false, false));
@@ -567,7 +575,10 @@ mod tests {
         for id in IDS {
             assert_eq!(
                 manual_command(id).is_some(),
-                !matches!(id, HarnessId::Mock | HarnessId::Antigravity)
+                !matches!(
+                    id,
+                    HarnessId::Mock | HarnessId::Antigravity | HarnessId::NvidiaNim
+                )
             );
             let (cli, dir) = cli_and_dir(id);
             assert!(!cli.is_empty() && !dir.is_empty());

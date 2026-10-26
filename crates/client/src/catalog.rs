@@ -168,6 +168,7 @@ pub fn harness_label(id: &str) -> String {
         "kilo" => "Kilo Code",
         "antigravity" => "Antigravity",
         "muse" => "Muse Code",
+        "nvidia-nim" => "NVIDIA NIM",
         "mock" => "Mock",
         other => return other.to_owned(),
     }
@@ -366,6 +367,13 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
+        "nvidia-nim" => vec![model(
+            "nvidia/nemotron-3-super-120b-a12b",
+            "Nemotron 3 Super 120B",
+            "NVIDIA Nemotron 3 Super model through NIM",
+            &[],
+            vec![],
+        )],
         // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
         _ => vec![
             model(

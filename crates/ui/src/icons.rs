@@ -230,6 +230,8 @@ icon_assets![
     (OPENCODE_MARK, "opencode-mark"),
     // Kilo Code's pixel-"K" mark (from their provider icon), monochrome.
     (KILO_MARK, "kilo-mark"),
+    // NVIDIA NIM mark.
+    (NIM_MARK, "nim-mark"),
     // GitHub's mark (Octicons `mark-github`, MIT) for the Cloud page's
     // GitHub connection.
     (GITHUB_MARK, "github-mark"),

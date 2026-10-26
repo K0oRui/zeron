@@ -343,6 +343,7 @@ pub(crate) mod jsonrpc;
 pub(crate) mod lossy_lines;
 pub mod mock;
 pub mod muse;
+pub mod nvidia_nim;
 mod model_context;
 pub mod opencode;
 pub mod pi;
@@ -648,6 +649,7 @@ pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
 pub use muse::MuseHarness;
+pub use nvidia_nim::NvidiaNimHarness;
 pub use pi::PiHarness;
 
 // ---------------------------------------------------------------------------

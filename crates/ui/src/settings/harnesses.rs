@@ -26,8 +26,8 @@ use gpui::{
 use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 
 use zeron_proto::{
-    HarnessId, HarnessUpdateFailureKind, HarnessUpdatePhase, HarnessUpdatePolicy,
-    HarnessUpdateStatus,
+    headroom::HeadroomStatus, HarnessId, HarnessUpdateFailureKind, HarnessUpdatePhase,
+    HarnessUpdatePolicy, HarnessUpdateStatus,
 };
 
 use zeron_rpc::methods;
@@ -127,7 +127,31 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
+        HarnessId::NvidiaNim => "nvidia-nim",
     }
+}
+
+/// The provider names Headroom routes, in the engine's order.
+fn headroom_provider_labels(providers: &[HarnessId]) -> String {
+    let names: Vec<_> = providers
+        .iter()
+        .map(|id| match id {
+            HarnessId::ClaudeCode => "Claude Code",
+            HarnessId::Codex => "Codex",
+            HarnessId::Cursor => "Cursor",
+            HarnessId::Devin => "Devin",
+            HarnessId::Grok => "Grok",
+            HarnessId::Hermes => "Hermes",
+            HarnessId::Pi => "Pi",
+            HarnessId::Opencode => "OpenCode",
+            HarnessId::Kilo => "Kilo",
+            HarnessId::Antigravity => "Antigravity",
+            HarnessId::Muse => "Muse",
+            HarnessId::Mock => "Mock",
+            HarnessId::NvidiaNim => "NVIDIA NIM",
+        })
+        .collect();
+    names.join(", ")
 }
 
 /// The failure was the update itself (its release is still known, so it can
@@ -228,6 +252,14 @@ pub struct HarnessesPage {
     installing: Option<HarnessId>,
     install_task: Option<Task<()>>,
 
+    /// The target device's Headroom runtime (install state, proxy health).
+    headroom: Loadable<HeadroomStatus>,
+    headroom_task: Option<Task<()>>,
+    headroom_action_task: Option<Task<()>>,
+    headroom_install_task: Option<Task<()>>,
+    pending_headroom_toggle: Option<bool>,
+    installing_headroom: bool,
+
     expanded_harness: Option<HarnessId>,
     /// A transcript's "Log in": open this provider and start its sign-in
     /// once the rows land.
@@ -267,6 +299,13 @@ impl HarnessesPage {
             pending_toggle: None,
             installing: None,
             install_task: None,
+
+            headroom: Loadable::Idle,
+            headroom_task: None,
+            headroom_action_task: None,
+            headroom_install_task: None,
+            pending_headroom_toggle: None,
+            installing_headroom: false,
 
             expanded_harness: None,
             pending_sign_in: None,
@@ -905,6 +944,200 @@ impl HarnessesPage {
         }));
     }
 
+    /// Whether the target device's engine knows about Headroom. Cloud is a
+    /// different world and never shows the card.
+    fn supports_headroom(&self, cx: &Context<Self>) -> bool {
+        let state = self.state.read(cx);
+        let Some(engine) = state.engine() else {
+            return false;
+        };
+        self.target_device.as_deref().map_or_else(
+            || {
+                engine
+                    .engine_info()
+                    .supports(zeron_proto::capabilities::HEADROOM_V1)
+            },
+            |device| state.device_supports(device, zeron_proto::capabilities::HEADROOM_V1),
+        )
+    }
+
+    /// Read the target device's Headroom runtime, keeping the painted card.
+    fn load_headroom(&mut self, cx: &mut Context<Self>) {
+        if !self.supports_headroom(cx) {
+            self.headroom = Loadable::Idle;
+            self.headroom_task = None;
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({}));
+        self.headroom = Loadable::Loading;
+        self.headroom_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::GET_HEADROOM, params).await;
+            this.update(cx, |page, cx| {
+                page.headroom = match result {
+                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
+                        Ok(status) => Loadable::Ready(status),
+                        Err(error) => Loadable::Error(error.to_string()),
+                    },
+                    Err(error) => Loadable::Error(error.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn headroom_failed(&mut self, _error: String, cx: &mut Context<Self>) {
+        self.load_headroom(cx);
+    }
+
+    fn set_headroom_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if !self.supports_headroom(cx) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({ "enabled": enabled }));
+        self.error = None;
+        self.pending_headroom_toggle = Some(enabled);
+        self.headroom_task = None;
+        self.headroom_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SET_HEADROOM_ENABLED, params)
+                .await;
+            this.update(cx, |page, cx| {
+                page.pending_headroom_toggle = None;
+                match result {
+                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
+                        Ok(status) => page.headroom = Loadable::Ready(status),
+                        Err(error) => page.headroom_failed(error.to_string(), cx),
+                    },
+                    Err(error) => page.headroom_failed(error.to_string(), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn install_headroom(&mut self, cx: &mut Context<Self>) {
+        if !self.supports_headroom(cx) || self.installing_headroom {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({}));
+        self.installing_headroom = true;
+        self.headroom_task = None;
+        self.headroom_install_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::INSTALL_HEADROOM, params).await;
+            this.update(cx, |page, cx| {
+                page.installing_headroom = false;
+                match result {
+                    Ok(value) => match serde_json::from_value::<HeadroomStatus>(value) {
+                        Ok(status) => page.headroom = Loadable::Ready(status),
+                        Err(error) => page.headroom_failed(error.to_string(), cx),
+                    },
+                    Err(error) => page.headroom_failed(error.to_string(), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The device's Headroom proxy: install/update, on/off, and what it
+    /// routes.
+    fn render_headroom(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.supports_headroom(cx) {
+            return None;
+        }
+        let Some(status) = self.headroom.ready() else {
+            return None;
+        };
+        let installing = self.installing_headroom || status.installing;
+        let enabled = self.pending_headroom_toggle.unwrap_or(status.enabled);
+        let enabled_copy = enabled;
+        let providers = headroom_provider_labels(&status.providers);
+        let toggle = widgets::toggle_switch(theme, enabled, "headroom-switch")
+            .id("headroom-toggle")
+            .when(self.pending_headroom_toggle.is_some() || installing, |el| {
+                el.opacity(0.55)
+            })
+            .when(installing, |el| {
+                el.cursor_not_allowed()
+            })
+            .when(!installing, |el| {
+                let enabled_copy = enabled_copy;
+                el.cursor_pointer()
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("Headroom")
+                    .aria_toggled(if enabled_copy {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .focus_visible(|s| {
+                        s.border_2().border_color(theme.accent).opacity(1.0)
+                    })
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.set_headroom_enabled(!enabled_copy, cx);
+                    }))
+            });
+        let install = widgets::ghost_action(&theme)
+            .id("headroom-install")
+            .when(!status.installed || installing, |el| {
+                el.opacity(0.55)
+            })
+            .when(status.installed && !installing, |el| {
+                el.cursor_pointer()
+                    .tab_index(0)
+                    .role(gpui::Role::Button)
+                    .on_click(cx.listener(|page, _, _, cx| {
+                        page.install_headroom(cx);
+                    }))
+            })
+            .child(if installing {
+                SharedString::from("Installing…")
+            } else if status.installed {
+                SharedString::from("Installed")
+            } else {
+                SharedString::from("Install")
+            });
+        let detail = if installing {
+            SharedString::from("Installing Headroom proxy…")
+        } else if let Some(message) = &status.error {
+            SharedString::from(format!("Error — {message}"))
+        } else if !providers.is_empty() {
+            SharedString::from(format!("Routes {providers}"))
+        } else {
+            SharedString::from("Idle")
+        };
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(theme, "Headroom"))
+                        .child(widgets::meta_line(theme, vec![div().child(detail).into_any_element()])),
+                )
+                .child(toggle)
+                .child(install)
+                .into_any_element(),
+        )
+    }
+
     fn set_update_policy(
         &mut self,
         harness: HarnessId,
@@ -1375,9 +1608,6 @@ impl HarnessesPage {
                                     .focus_visible(|s| {
                                         s.border_2().border_color(theme.accent).opacity(1.0)
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle(harness, !enabled, cx);
-                                    }))
                                     .on_key_down(cx.listener(
                                         move |this, event: &gpui::KeyDownEvent, _, cx| {
                                             if !event.is_held
@@ -1547,6 +1777,7 @@ impl Render for HarnessesPage {
                                         .child(toolbar),
                                 )
                                 .children(update_error)
+                                .children(self.render_headroom(&theme, cx))
                                 .child(body),
                         ),
                 )
@@ -1770,6 +2001,22 @@ mod tests {
 fn account_counts_read_naturally() {
     assert_eq!(account_count_label(1), "1 account");
     assert_eq!(account_count_label(3), "3 accounts");
+}
+
+#[cfg(test)]
+#[test]
+fn headroom_provider_labels_join_in_engine_order() {
+    assert_eq!(
+        headroom_provider_labels(&[
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Grok,
+            HarnessId::Opencode,
+            HarnessId::Antigravity,
+        ]),
+        "Claude Code, Codex, Grok, OpenCode, Antigravity"
+    );
+    assert_eq!(headroom_provider_labels(&[]), "");
 }
 
 #[cfg(test)]

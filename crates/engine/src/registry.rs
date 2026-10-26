@@ -967,6 +967,23 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
     );
+    // NVIDIA NIM — model catalog served over HTTP, filtered to free-plan models.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::NvidiaNim,
+            name: "NVIDIA NIM".into(),
+            supports_steering: false,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::NvidiaNimHarness::new().installed()),
+        Box::new(|| {
+            Ok(Arc::new(zeron_harness::NvidiaNimHarness::new()) as Arc<dyn Harness>)
+        }),
+    );
     registry
 }
 
@@ -1051,7 +1068,8 @@ mod tests {
                 HarnessId::Opencode,
                 HarnessId::Kilo,
                 HarnessId::Antigravity,
-                HarnessId::Muse
+                HarnessId::Muse,
+                HarnessId::NvidiaNim,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());

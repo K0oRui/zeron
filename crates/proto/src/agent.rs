@@ -29,13 +29,15 @@ pub enum HarnessId {
     /// Meta's Muse Code agent, driven natively over the Muse Session Protocol
     /// (MSP: `muse` speaking JSON-RPC on stdio).
     Muse,
+    /// NVIDIA NIM — model catalog endpoint serving free and paid NIM models.
+    NvidiaNim,
     /// Test harness; never shown in production pickers.
     Mock,
 }
 
 impl HarnessId {
     /// Every harness, in declaration order.
-    pub const ALL: [HarnessId; 12] = [
+    pub const ALL: [HarnessId; 13] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -47,6 +49,7 @@ impl HarnessId {
         HarnessId::Kilo,
         HarnessId::Antigravity,
         HarnessId::Muse,
+        HarnessId::NvidiaNim,
         HarnessId::Mock,
     ];
 
@@ -64,6 +67,7 @@ impl HarnessId {
             HarnessId::Kilo => "kilo",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Muse => "muse",
+            HarnessId::NvidiaNim => "nvidia-nim",
             HarnessId::Mock => "mock",
         }
     }
