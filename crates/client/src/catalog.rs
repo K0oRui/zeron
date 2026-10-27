@@ -367,15 +367,8 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        "nvidia-nim" => zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK
-            .iter()
-            .map(|(id, label, context, output)| {
-                let description = format!(
-                    "{context} token context window · up to {output} output tokens"
-                );
-                model(id, label, &description, &[], vec![])
-            })
-            .collect(),
+        // NIM has no authoritative static catalog or offline entitlement list.
+        "nvidia-nim" => Vec::new(),
         // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
         _ => vec![
             model(
@@ -517,6 +510,11 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
 /// rows exist, fold `[1m]`/`-1m` variants into a Context Window option, and
 /// prefer curated labels (legacy `HarnessCatalog.normalize`).
 pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    // These are provider wire IDs, not Claude CLI aliases. Folding a real
+    // `-1m`/`[1m]` NIM ID would create a different, possibly nonexistent model.
+    if harness == "nvidia-nim" {
+        return models;
+    }
     let catalog = curated_catalog(harness);
     // Account balance filtering belongs to the host. Re-filtering here would
     // hide paid models even after a funded account's host offered them.
@@ -599,6 +597,7 @@ pub fn model_label(harness: &str, model_id: &str) -> String {
 /// Last-known live catalogs on disk (`{data_dir}/catalogs/{device}.json`):
 /// pickers open instantly with the device's real list, and an unreachable
 /// device still shows what it offered last time before the static fallback.
+/// NIM is excluded: its account inventory must not be resurrected offline.
 #[derive(Debug, Clone)]
 pub(crate) struct DiskCatalog {
     dir: std::path::PathBuf,
@@ -636,10 +635,14 @@ impl DiskCatalog {
     }
 
     fn load(&self, device_id: &str) -> DeviceCatalog {
-        std::fs::read(self.path(device_id))
+        let mut catalog: DeviceCatalog = std::fs::read(self.path(device_id))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Retire legacy NIM rows rather than treating another login's old
+        // inventory or a built-in suggestion as currently runnable.
+        catalog.models.remove("nvidia-nim");
+        catalog
     }
 
     fn store(&self, device_id: &str, catalog: &DeviceCatalog) {
@@ -682,6 +685,9 @@ impl DiskCatalog {
                 continue;
             };
             for (harness, models) in &catalog.models {
+                if harness == "nvidia-nim" {
+                    continue;
+                }
                 learn_labels(harness, models);
             }
         }
@@ -690,7 +696,9 @@ impl DiskCatalog {
     pub(crate) fn put_models(&self, device_id: &str, harness: &str, list: &[ModelInfo]) {
         learn_labels(harness, list);
         let mut catalog = self.load(device_id);
-        catalog.models.insert(harness.to_owned(), list.to_vec());
+        if harness != "nvidia-nim" {
+            catalog.models.insert(harness.to_owned(), list.to_vec());
+        }
         self.store(device_id, &catalog);
     }
 }
@@ -721,18 +729,42 @@ mod tests {
     }
 
     #[test]
-    fn nim_fallback_uses_the_shared_chat_catalog() {
-        let models = fallback_models("nvidia-nim");
-        assert_eq!(models.len(), zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK.len());
-        assert_eq!(models[0].id, "nvidia/nemotron-3-ultra-550b-a55b");
-        assert!(models.iter().all(|model| {
-            !model
-                .description
-                .as_deref()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .contains("free")
-        }));
+    fn nim_never_invents_static_models_or_rewrites_provider_ids() {
+        assert!(fallback_models("nvidia-nim").is_empty());
+        let rows = vec![
+            model("vendor/model-1m", "Model 1M", "", &[], vec![]),
+            model("vendor/other[1m]", "Other", "", &[], vec![]),
+            model("default", "Default", "", &[], vec![]),
+        ];
+        assert_eq!(normalize_models("nvidia-nim", rows.clone()), rows);
+    }
+
+    #[test]
+    fn nim_legacy_disk_rows_are_retired_and_live_rows_are_not_offline_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCatalog::new(dir.path());
+        let mut legacy = DeviceCatalog::default();
+        legacy.models.insert(
+            "nvidia-nim".into(),
+            vec![model("old/guessed", "Old", "", &[], vec![])],
+        );
+        legacy
+            .models
+            .insert("codex".into(), fallback_models("codex"));
+        cache.store("device", &legacy);
+        assert!(cache.models("device", "nvidia-nim").is_none());
+        assert!(!cache.models("device", "codex").unwrap().is_empty());
+        cache.put_models(
+            "device",
+            "nvidia-nim",
+            &[model("live/chat", "Live Chat", "", &[], vec![])],
+        );
+        assert!(cache.models("device", "nvidia-nim").is_none());
+        assert_eq!(model_label("nvidia-nim", "live/chat"), "Live Chat");
+        let stored: DeviceCatalog =
+            serde_json::from_slice(&std::fs::read(cache.path("device")).unwrap()).unwrap();
+        assert!(!stored.models.contains_key("nvidia-nim"));
+        assert!(!stored.models["codex"].is_empty());
     }
 
     #[test]

@@ -1,11 +1,20 @@
-//! A failed refresh is not a new catalog. Keep the last successful response
-//! for the same credential context, coalesce callers, and respect rate limits.
+//! Coalesce bounded refreshes by credential context and respect rate limits.
+//! CLI catalogs retain their last good response; inventory-only HTTP catalogs
+//! honor successful empty replies and discard stale rows on refresh failure.
 use crate::{CatalogFailure, CatalogFailureCode, HarnessError, ModelCatalog};
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
 use zeron_proto::Model;
+
+/// Most CLI catalogs retain their last good result. Inventory-backed HTTP
+/// providers must instead honor empty results and fail closed on refresh errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogPolicy {
+    LastGood,
+    InventoryOnly,
+}
 
 #[derive(Default)]
 pub(crate) struct Catalog {
@@ -68,6 +77,23 @@ impl Catalog {
         force: bool,
         timeout: Duration,
         context: K,
+        discover: F,
+    ) -> Result<ModelCatalog, HarnessError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<Vec<Model>, HarnessError>>,
+        K: Fn() -> Result<[u8; 32], HarnessError>,
+    {
+        self.get_with_policy(force, timeout, CatalogPolicy::LastGood, context, discover)
+            .await
+    }
+
+    pub(crate) async fn get_with_policy<F, Fut, K>(
+        &self,
+        force: bool,
+        timeout: Duration,
+        policy: CatalogPolicy,
+        context: K,
         mut discover: F,
     ) -> Result<ModelCatalog, HarnessError>
     where
@@ -102,7 +128,9 @@ impl Catalog {
                     tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
                 }
                 match discover().await {
-                    Ok(models) if !models.is_empty() => return Ok(models),
+                    Ok(models) if !models.is_empty() || policy == CatalogPolicy::InventoryOnly => {
+                        return Ok(models);
+                    }
                     Ok(_) => {
                         error = CatalogFailure {
                             code: CatalogFailureCode::Failed,
@@ -143,7 +171,7 @@ impl Catalog {
                 state.retry_at = Some(Instant::now() + Duration::from_secs(60));
             }
             Err(error) => {
-                if !error.code.allows_stale() {
+                if policy == CatalogPolicy::InventoryOnly || !error.code.allows_stale() {
                     state.models = None;
                 }
                 tracing::warn!(code = %error.code, %error, retaining_catalog = state.models.is_some(), "Harness model refresh failed");
@@ -209,6 +237,82 @@ mod tests {
     }
     async fn expire(catalog: &Catalog) {
         catalog.state.lock().await.retry_at = None;
+    }
+
+    #[tokio::test]
+    async fn authoritative_inventory_accepts_empty_and_discards_failed_refreshes() {
+        let cache = Catalog::default();
+        let policy = CatalogPolicy::InventoryOnly;
+        let timeout = Duration::from_secs(2);
+        let first = cache
+            .get_with_policy(
+                true,
+                timeout,
+                policy,
+                || Ok([1; 32]),
+                || async { Ok(models("old")) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.models, models("old"));
+        let empty = cache
+            .get_with_policy(
+                true,
+                timeout,
+                policy,
+                || Ok([1; 32]),
+                || async { Ok(vec![]) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.source, "live");
+        assert!(empty.models.is_empty());
+        let cached = cache
+            .get_with_policy(
+                false,
+                timeout,
+                policy,
+                || Ok([1; 32]),
+                || async { panic!("successful empty inventory must be cached") },
+            )
+            .await
+            .unwrap();
+        assert!(cached.models.is_empty());
+        cache
+            .get_with_policy(
+                true,
+                timeout,
+                policy,
+                || Ok([1; 32]),
+                || async { Ok(models("old")) },
+            )
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .get_with_policy(
+                    true,
+                    timeout,
+                    policy,
+                    || Ok([1; 32]),
+                    || async { Err(HarnessError::Protocol("offline".into())) }
+                )
+                .await
+                .is_err()
+        );
+        assert!(cache.cached_for([1; 32]).is_none());
+        assert!(
+            cache
+                .get_with_policy(
+                    false,
+                    timeout,
+                    policy,
+                    || Ok([1; 32]),
+                    || async { panic!("failed inventory cooldown must not return old rows") }
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

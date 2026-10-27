@@ -11,16 +11,36 @@ The picker reads the complete `/v1/models` inventory, not just the featured
 models. Featured metadata supplies labels and context limits when available;
 a missing featured feed does not hide other inventory models. Explicit non-chat
 tasks and known embedding, reranking, reward, speech and image-generation
-families are excluded from the chat picker. Inventory membership does **not**
-prove that NVIDIA's backing deployment is live or accessible to the selected key;
-Zeron does not send inference prompts just to test the catalog.
+families are excluded from the chat picker. Declared tasks, chat capabilities,
+supported endpoints and explicit availability flags also filter out models for
+other APIs. Unknown/new chat models do not have to appear in a static allow-list.
+Inventory membership still does **not** prove that NVIDIA's backing deployment
+is live or accessible to the selected key; Zeron does not send inference prompts
+just to test the catalog.
+
+NIM now requires a key and uses **inventory only**: public featured metadata can
+enrich an inventory row, but cannot create an offered ID. Built-in NIM model
+suggestions have been removed. An empty inventory stays empty; a failed refresh
+shows an error instead of falling back to featured, static or previous rows.
+The harness keeps only a short-lived, key/endpoint-scoped memory inventory and
+clears it on refresh failure. The engine ignores legacy NIM disk catalogs, and
+mobile retires old NIM disk rows rather than using them offline. Other providers'
+fallback behavior is unchanged.
+
+Desktop clears NIM rows while refreshing and on refresh failure. Saved selections
+absent from NIM's current inventory are not synthesized as picker choices. Desktop
+and mobile preserve NIM wire IDs exactly: CLI-specific `default`/`-1m`/`[1m]`
+alias normalization must not turn a real provider ID into a different model.
+An omitted model is chosen from the actual request key's inventory, never a
+hardcoded default. Update both the app and the device running chats for these
+rules to apply; no manual cache-file deletion is needed.
 
 If an actual chat request returns NVIDIA's `404` / `Function …: Not found for
 account …` response (or a structured `model_not_found` rejection), that model is
 hidden for **15 minutes**, scoped to the exact endpoint and API key. This filter
-runs after live, memory, disk and static catalog selection, including when every
-row is rejected. Refreshing the inventory cannot immediately resurrect the same
-broken model. Other models, accounts and endpoints are unaffected.
+runs after inventory loading (including the short-lived memory cache), including
+when every row is rejected. Refreshing the inventory cannot immediately resurrect
+the same broken model. Other models, accounts and endpoints are unaffected.
 
 The short-lived evidence survives an app restart in private files containing
 only model IDs and timestamps under a hashed endpoint/key namespace. It expires
@@ -85,12 +105,16 @@ storage, and authoritative empty results across live, disk and static sources.
 The HTTP fixtures assert that discovery does not send inference prompts and
 that a failed model is never silently replaced.
 
-In the restricted development sandbox, 23 focused checks passed using the
-production availability store, extracted production error helpers/tests, the
-existing redaction/free-model policy modules, and real Serde/JSON dependencies.
-These are not a full production-crate build. Changed Rust files passed parser
-checks, workspace manifests and the lockfile passed offline metadata validation,
-and `git diff --check` was clean. The full workspace test command could not run
-because required Git/registry dependencies were not locally cached. Async HTTP
-and engine-cache fixture tests and live authenticated provider calls still need
-to run in the normal build environment.
+The prior model-specific 404 change passed GitHub core, engine, UI, app and
+cross-platform checks. For the inventory-only follow-up, **42 focused checks**
+passed locally using the production client catalog, availability and discovery
+logic; extracted production inventory/cache/error logic and type definitions;
+and real Serde, JSON, Tokio, Tracing and Thiserror dependencies. The focused
+client tests use a standard-library temporary-directory fixture. These checks
+are not a full production-workspace build.
+
+Changed Rust passed parser checks, offline workspace metadata validation and
+`git diff --check`. Full local workspace tests remain blocked by the uncached
+`gpui` Git dependency. New HTTP/default-model, engine-cache and desktop-picker
+fixtures are included for normal CI. Live authenticated NVIDIA calls have not
+been run in this sandbox.

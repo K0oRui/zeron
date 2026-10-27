@@ -126,6 +126,18 @@ async fn list_inner(
             .await
             .map(|catalog| catalog.models);
     };
+    if harness.id() == zeron_proto::HarnessId::NvidiaNim {
+        // NIM's public/featured/static lists are not account entitlement data.
+        // Its harness owns a short-lived, inventory-only memory cache. Never
+        // revive an older disk catalog (including pre-v3 unfiltered rows).
+        let catalog = harness.model_catalog(force).await?;
+        if !unchanged(harness.as_ref(), &context) {
+            return Err(HarnessError::Protocol(
+                "model discovery context changed; retry".into(),
+            ));
+        }
+        return Ok(catalog.models); // Empty is a successful inventory, not a fallback signal.
+    }
     let path = location(root, harness.as_ref(), &context);
     let disk = read(&path, &context);
     // The refresh owns its lifetime; returning disk early must not cancel it.
@@ -249,6 +261,7 @@ mod tests {
         forced: std::sync::atomic::AtomicBool,
         cached: std::sync::atomic::AtomicBool,
         hidden: std::sync::atomic::AtomicBool,
+        empty: std::sync::atomic::AtomicBool,
         failure: std::sync::Mutex<String>,
         harness: zeron_proto::HarnessId,
     }
@@ -261,6 +274,7 @@ mod tests {
                 forced: false.into(),
                 cached: false.into(),
                 hidden: false.into(),
+                empty: false.into(),
                 failure: std::sync::Mutex::new("offline".into()),
                 harness: zeron_proto::HarnessId::Codex,
             })
@@ -311,7 +325,11 @@ mod tests {
                 return Err(HarnessError::Protocol(self.failure.lock().unwrap().clone()));
             }
             Ok(ModelCatalog {
-                models: models(),
+                models: if self.empty.load(SeqCst) {
+                    vec![]
+                } else {
+                    models()
+                },
                 source: if self.cached.load(SeqCst) {
                     "cache"
                 } else {
@@ -330,6 +348,28 @@ mod tests {
             unreachable!()
         }
     }
+    #[tokio::test]
+    async fn nim_never_revives_disk_or_static_rows_on_empty_or_failed_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = Probe::new();
+        Arc::get_mut(&mut probe).unwrap().harness = zeron_proto::HarnessId::NvidiaNim;
+        let context = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &context);
+        save(&path, &context, &models()).unwrap(); // Simulate a pre-upgrade catalog.
+        probe.empty.store(true, SeqCst);
+        assert!(
+            list(dir.path(), probe.clone(), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        probe.fail.store(true, SeqCst);
+        assert!(list(dir.path(), probe.clone(), true).await.is_err());
+        probe.fail.store(false, SeqCst);
+        probe.empty.store(false, SeqCst);
+        assert_eq!(list(dir.path(), probe, true).await.unwrap(), models());
+    }
+
     #[tokio::test]
     async fn availability_filter_preserves_raw_inventory_and_authoritative_empty_results() {
         let dir = tempfile::tempdir().unwrap();

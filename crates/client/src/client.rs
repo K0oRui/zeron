@@ -1345,7 +1345,8 @@ impl Client {
     }
 
     /// Model catalog for `harness` on `device_id` (normalized live reply,
-    /// else the cached one, else the curated static list).
+    /// else the cached one, else the curated static list). NIM requires a live
+    /// inventory: neither disk nor static rows may claim account availability.
     pub async fn list_models(&self, device_id: &str, harness: &str) -> Vec<ModelInfo> {
         match self.inner.backend() {
             Backend::Demo(demo) => demo.list_models(harness).await,

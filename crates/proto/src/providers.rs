@@ -4,32 +4,6 @@
 
 use crate::HarnessId;
 
-/// Last known NVIDIA featured chat models, shared by the engine and clients
-/// when live discovery is unavailable. Inventory membership alone does not
-/// establish chat support or free access, so arbitrary `/v1/models` rows are
-/// deliberately not copied into these static catalogs.
-pub const NVIDIA_NIM_FEATURED_FALLBACK: [(&str, &str, u64, u64); 4] = [
-    (
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "Nemotron 3 Ultra 550B",
-        1_048_576,
-        8_192,
-    ),
-    (
-        "nvidia/nemotron-3.5-super-vl-120b-a12b",
-        "Nemotron 3.5 Super VL",
-        1_048_576,
-        8_192,
-    ),
-    ("z-ai/glm-5-3", "GLM 5.3", 1_048_576, 8_192),
-    (
-        "deepseek-ai/deepseek-v4.1-flash",
-        "DeepSeek V4.1 Flash",
-        1_048_576,
-        16_384,
-    ),
-];
-
 /// The providers zeron can sign into, in display order: (harness, name, CLI
 /// command or login label — named in the empty-state copy, zeron
 /// settings.agents.tsx `PROVIDERS`). Every agent with a login of its own is
@@ -93,9 +67,9 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
         ),
         HarnessId::NvidiaNim => Some(
-            "Connect an API key from NVIDIA API Catalog. The model list uses your selected key. \
-             NVIDIA's inventory does not report prices or account balances, so unpriced models \
-             are not labeled as free.",
+            "Connect an API key from NVIDIA API Catalog. Models come only from your selected \
+             key's inventory, not built-in suggestions. NVIDIA does not report prices or account \
+             balances, so unpriced models are not labeled as free.",
         ),
         _ => None,
     }
