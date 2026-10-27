@@ -4,7 +4,9 @@
 //! featured metadata (not restricted to featured models). Explicit non-chat
 //! tasks and known embedding/reward endpoints stay out of the chat picker.
 //! NVIDIA exposes neither a balance nor prices here, so inventory membership
-//! is never treated as evidence of free access. Runs use
+//! is never treated as evidence of free access or a working deployment.
+//! Confirmed model-not-found responses are temporarily excluded per endpoint/key.
+//! Runs use
 //! `POST /v1/chat/completions` with the selected
 //! account's `NVIDIA_API_KEY`, stream text/reasoning/usage over SSE, and keep
 //! a private local transcript so a resumed runtime retains the conversation.
@@ -28,9 +30,12 @@ use zeron_proto::{
 };
 
 use crate::{
-    CancellationToken, Harness, HarnessError, ModelCatalog, ModelContext, RevertTarget, RunControls,
-    SteerMessage, TurnControl,
+    CancellationToken, Harness, HarnessError, ModelCatalog, ModelContext, RevertTarget,
+    RunControls, SteerMessage, TurnControl,
 };
+
+mod availability;
+use availability::{AvailabilityScope, AvailabilityStore};
 
 const NIM_BASE_URL: &str = "https://integrate.api.nvidia.com";
 const NIM_FEATURED_URL: &str =
@@ -78,6 +83,7 @@ pub struct NvidiaNimHarness {
     featured_url: String,
     api_key_source: Option<Arc<ApiKeySource>>,
     models_cache: crate::catalog::Catalog,
+    availability_store: Arc<AvailabilityStore>,
     store_root: Option<PathBuf>,
 }
 
@@ -103,6 +109,9 @@ impl Default for NvidiaNimHarness {
             featured_url,
             api_key_source: None,
             models_cache: Default::default(),
+            availability_store: Arc::new(AvailabilityStore::new(
+                data_root().join("nvidia-nim").join("model-availability"),
+            )),
             store_root: None,
         }
     }
@@ -126,10 +135,13 @@ impl NvidiaNimHarness {
         self
     }
 
-    /// Keep resumed conversations below `root` instead of the device default.
+    /// Keep transcripts and model-availability evidence below `root` instead of
+    /// the device default.
     #[doc(hidden)]
     pub fn with_store_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.store_root = Some(root.into());
+        let root = root.into();
+        self.availability_store = Arc::new(AvailabilityStore::new(root.join("model-availability")));
+        self.store_root = Some(root);
         self
     }
 
@@ -153,6 +165,13 @@ impl NvidiaNimHarness {
             .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
             .map(|key| key.trim().to_owned())
             .filter(|key| !key.is_empty()))
+    }
+
+    fn availability(&self, api_key: &str) -> AvailabilityScope {
+        self.availability_store.scope(
+            Sha256::digest(format!("nim-availability-v1\0{}\0{api_key}", self.base_url).as_bytes())
+                .into(),
+        )
     }
 
     fn context(&self) -> Result<ModelContext, HarnessError> {
@@ -478,7 +497,7 @@ impl Harness for NvidiaNimHarness {
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        match self.model_catalog(false).await {
+        let models = match self.model_catalog(false).await {
             Ok(catalog) => Ok(catalog.models),
             Err(error) => {
                 // The registry's direct discovery API historically had a
@@ -493,7 +512,17 @@ impl Harness for NvidiaNimHarness {
                     Ok(models)
                 }
             }
-        }
+        }?;
+        self.filter_model_catalog(models)
+    }
+
+    fn filter_model_catalog(&self, mut models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
+        let key = self.api_key()?;
+        let unavailable = self
+            .availability(key.as_deref().unwrap_or_default())
+            .unavailable();
+        models.retain(|model| !unavailable.contains(&model.id));
+        Ok(models)
     }
 
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -543,19 +572,36 @@ impl Harness for NvidiaNimHarness {
                     .into(),
             )
         })?;
+        let availability = self.availability(&api_key);
+        let unavailable = availability.unavailable();
         let model = request
             .model
             .clone()
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| {
+            .or_else(|| {
                 self.context()
                     .ok()
                     .and_then(|context| self.models_cache.cached_for(context.key()))
-                    .and_then(|models| models.into_iter().next())
+                    .and_then(|models| {
+                        models
+                            .into_iter()
+                            .find(|model| !unavailable.contains(&model.id))
+                    })
                     .map(|model| model.id)
-                    .unwrap_or_else(|| NVIDIA_NIM_FEATURED_FALLBACK[0].0.into())
-            });
+                    .or_else(|| {
+                        NVIDIA_NIM_FEATURED_FALLBACK
+                            .iter()
+                            .find(|(id, ..)| !unavailable.contains(*id))
+                            .map(|(id, ..)| (*id).to_owned())
+                    })
+            })
+            .ok_or_else(|| {
+                HarnessError::Protocol(
+                    "No currently available NVIDIA NIM model. Choose another model or retry later."
+                        .into(),
+                )
+            })?;
         let session_id = request
             .resume
             .clone()
@@ -578,6 +624,7 @@ impl Harness for NvidiaNimHarness {
             attachments: request.attachments,
             cwd: request.cwd,
             store: self.sessions(),
+            availability,
             controls,
             event_tx,
         }));
@@ -808,6 +855,7 @@ struct Session {
     attachments: Vec<String>,
     cwd: String,
     store: HistoryStore,
+    availability: AvailabilityScope,
     controls: RunControls,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
 }
@@ -825,6 +873,7 @@ async fn run_session(session: Session) {
         attachments,
         cwd,
         store,
+        availability,
         mut controls,
         event_tx,
     } = session;
@@ -968,6 +1017,9 @@ async fn run_session(session: Session) {
         .await;
         match outcome {
             Ok(answer) => {
+                if let Err(error) = availability.allow(&model) {
+                    tracing::warn!(%error, "Could not persist NVIDIA NIM model recovery");
+                }
                 history.push(HistoryMessage::assistant(answer));
                 if let Err(error) = store.save(&session_id, &history) {
                     let message = format!("NVIDIA NIM could not save the conversation: {error}");
@@ -995,10 +1047,21 @@ async fn run_session(session: Session) {
                     break;
                 }
             }
-            Err(TurnError::Failed(message)) => {
-                let _ = send(&event_tx, AgentEvent::Error {
-                    message: message.clone(),
-                })
+            Err(error @ (TurnError::Failed(_) | TurnError::ModelUnavailable)) => {
+                let message = if let TurnError::Failed(message) = error {
+                    message
+                } else {
+                    if let Err(error) = availability.reject(&model) {
+                        tracing::warn!(%error, "Could not persist NVIDIA NIM model rejection");
+                    }
+                    model_unavailable_message(&model)
+                };
+                let _ = send(
+                    &event_tx,
+                    AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                )
                 .await;
                 let _ = send(&event_tx, AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -1046,6 +1109,7 @@ async fn send(
 #[derive(Debug)]
 enum TurnError {
     Failed(String),
+    ModelUnavailable,
     Interrupted,
     Stopped,
     Closed,
@@ -1110,6 +1174,11 @@ async fn execute_turn(
     let status = response.status();
     if !status.is_success() {
         let snippet = read_error_snippet(&mut response, interrupt, turn).await?;
+        if serde_json::from_str::<Value>(&snippet)
+            .is_ok_and(|value| is_model_unavailable(status.as_u16(), &value))
+        {
+            return Err(TurnError::ModelUnavailable);
+        }
         return Err(TurnError::Failed(http_error(status, &snippet)));
     }
 
@@ -1212,8 +1281,8 @@ fn http_error(status: reqwest::StatusCode, snippet: &str) -> String {
             error_detail(snippet)
         ),
         404 => format!(
-            "NVIDIA NIM could not run that model ({status}). Refresh the model list or choose \
-             another model.{}",
+            "NVIDIA NIM could not find the requested route or model ({status}). Check \
+             NVIDIA_NIM_BASE_URL and the model ID.{}",
             error_detail(snippet)
         ),
         429 => format!(
@@ -1224,11 +1293,48 @@ fn http_error(status: reqwest::StatusCode, snippet: &str) -> String {
     }
 }
 
+// Match a model-specific rejection, not a generic route 404 or auth/rate-limit
+// failure. Inventory membership is not evidence that NVIDIA's function is live.
+fn is_model_unavailable(status: u16, value: &Value) -> bool {
+    if status != 404 {
+        return false;
+    }
+    if matches!(
+        value.pointer("/error/code").and_then(Value::as_str),
+        Some("model_not_found" | "model_not_available" | "model_not_deployed")
+    ) {
+        return true;
+    }
+    let message = problem_message(value)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    message.starts_with("function ") && message.contains("not found for account")
+}
+
+fn model_unavailable_message(model: &str) -> String {
+    format!(
+        "NVIDIA NIM's deployment for '{}' is unavailable to this API key (404). \
+         Hidden from this account's model list for 15 minutes. Choose another model, \
+         or explicitly retry this one later; a successful retry restores it. \
+         This error does not indicate your account balance.",
+        crate::redact::redact_output(model),
+    )
+}
+
+fn problem_message(value: &Value) -> Option<String> {
+    provider_error(value).or_else(|| {
+        ["detail", "message", "title"]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
+    })
+}
+
 fn error_detail(snippet: &str) -> String {
     let parsed = serde_json::from_str::<Value>(snippet).ok();
     let message = parsed
         .as_ref()
-        .and_then(provider_error)
+        .and_then(problem_message)
         .unwrap_or_else(|| snippet.trim().to_owned());
     let message = crate::redact::redact_output(message.trim());
     if message.is_empty() {
@@ -1249,6 +1355,16 @@ async fn handle_stream_data(
     }
     let value: Value = serde_json::from_str(data)
         .map_err(|_| TurnError::Failed("NVIDIA NIM sent an invalid SSE JSON frame.".into()))?;
+    let status = value
+        .get("status")
+        .or_else(|| value.pointer("/error/status"))
+        .or_else(|| value.pointer("/error/code"))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or_default();
+    if is_model_unavailable(status, &value) {
+        return Err(TurnError::ModelUnavailable);
+    }
     if let Some(message) = provider_error(&value) {
         return Err(TurnError::Failed(format!(
             "NVIDIA NIM failed the request: {}",
@@ -1782,6 +1898,306 @@ mod tests {
             .with_api_key_source(move || Ok(Some(source.lock().unwrap().clone())));
         let error = harness.model_catalog(false).await.unwrap_err();
         assert!(error.to_string().contains("credentials changed"));
+        server.await.unwrap();
+    }
+
+    const FUNCTION_NOT_FOUND: &str = r#"{"status":404,"title":"Not Found","detail":"Function 'fixture-function': Not found for account 'fixture-account'"}"#;
+
+    #[test]
+    fn only_confirmed_model_rejections_are_availability_evidence() {
+        let problem: Value = serde_json::from_str(FUNCTION_NOT_FOUND).unwrap();
+        assert!(is_model_unavailable(404, &problem));
+        assert!(is_model_unavailable(
+            404,
+            &json!({
+                "error":{"code":"model_not_found", "message":"Unknown model"}
+            })
+        ));
+        for status in [400, 401, 402, 403, 429, 500, 503] {
+            assert!(!is_model_unavailable(status, &problem));
+        }
+        for value in [
+            json!({"detail":"Not Found"}),
+            json!({"error":{"code":"not_found", "message":"Route not found"}}),
+            json!({"error":{"message":"Account not found"}}),
+            json!({"title":"Not Found"}),
+        ] {
+            assert!(!is_model_unavailable(404, &value));
+        }
+    }
+
+    #[test]
+    fn unavailable_errors_do_not_expose_nvidia_function_or_account_identifiers() {
+        let message = model_unavailable_message("fixture/chat");
+        assert!(message.contains("fixture/chat"));
+        assert!(message.contains("15 minutes"));
+        assert!(message.contains("does not indicate your account balance"));
+        assert!(!message.contains("fixture-function"));
+        assert!(!message.contains("fixture-account"));
+        assert!(!message.contains("Refresh the model list"));
+        assert!(
+            !model_unavailable_message("nvapi-private-fixture-1234567890")
+                .contains("nvapi-private-fixture")
+        );
+    }
+
+    #[test]
+    fn problem_json_details_are_readable_and_redacted() {
+        assert_eq!(
+            error_detail(r#"{"status":404,"detail":"Route not found"}"#),
+            " Route not found"
+        );
+        assert!(
+            !error_detail(r#"{"detail":"Failed for nvapi-private-fixture-1234567890"}"#)
+                .contains("nvapi-private-fixture")
+        );
+        assert_eq!(error_detail(""), "");
+    }
+
+    #[tokio::test]
+    async fn confirmed_rejection_is_scoped_durable_and_recoverable_without_probe_prompts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut prompts = 0;
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, headers, body) = read_request(&mut socket).await;
+                match path.as_str() {
+                    "/v1/models" => {
+                        assert!(
+                            headers
+                                .to_ascii_lowercase()
+                                .contains("bearer nvapi-first-fixture")
+                        );
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            "application/json",
+                            r#"{"data":[{"id":"fixture/chat"},{"id":"fixture/working"}]}"#,
+                        )
+                        .await;
+                    }
+                    "/featured-models.json" => {
+                        assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            "application/json",
+                            r#"{"featured-models":[]}"#,
+                        )
+                        .await;
+                    }
+                    "/v1/chat/completions" => {
+                        prompts += 1;
+                        assert_eq!(
+                            body["model"], "fixture/chat",
+                            "never silently substitute a model"
+                        );
+                        assert!(
+                            headers
+                                .to_ascii_lowercase()
+                                .contains("bearer nvapi-first-fixture")
+                        );
+                        if prompts == 1 {
+                            respond(
+                                &mut socket,
+                                "404 Not Found",
+                                "application/problem+json",
+                                FUNCTION_NOT_FOUND,
+                            )
+                            .await;
+                        } else {
+                            respond(&mut socket, "200 OK", "text/event-stream",
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").await;
+                        }
+                    }
+                    other => panic!("unexpected request {other}"),
+                }
+            }
+            assert_eq!(prompts, 2, "only the two explicit user prompts");
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let selected = Arc::new(std::sync::Mutex::new("nvapi-first-fixture".to_owned()));
+        let source = selected.clone();
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(&base)
+            .with_store_root(tmp.path())
+            .with_api_key_source(move || Ok(Some(source.lock().unwrap().clone())));
+        let raw = harness.models().await.unwrap();
+        assert_eq!(raw.len(), 2);
+        let (controls, _steering, _, _) = run_controls();
+        let mut stream = harness.run(run_request(), controls).await.unwrap();
+        loop {
+            match stream.next().await.unwrap().unwrap() {
+                AgentEvent::Error { message } => {
+                    assert!(message.contains("Hidden from this account's model list"));
+                    assert!(!message.contains("fixture-function"));
+                    assert!(!message.contains("fixture-account"));
+                }
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, DoneStatus::Errored);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(stream);
+        assert_eq!(harness.models().await.unwrap()[0].id, "fixture/working");
+        let refreshed = harness.model_catalog(true).await.unwrap();
+        assert_eq!(
+            refreshed.models.len(),
+            2,
+            "retain raw inventory for recovery"
+        );
+        assert_eq!(
+            harness
+                .filter_model_catalog(refreshed.models)
+                .unwrap()
+                .len(),
+            1
+        );
+        *selected.lock().unwrap() = "nvapi-second-fixture".into();
+        assert_eq!(harness.filter_model_catalog(raw.clone()).unwrap().len(), 2);
+        *selected.lock().unwrap() = "nvapi-first-fixture".into();
+        let restarted = || {
+            NvidiaNimHarness::new()
+                .with_base_url(&base)
+                .with_store_root(tmp.path())
+                .with_api_key_source(|| Ok(Some("nvapi-first-fixture".into())))
+        };
+        assert_eq!(
+            restarted().filter_model_catalog(raw.clone()).unwrap().len(),
+            1
+        );
+        let other_endpoint = NvidiaNimHarness::new()
+            .with_base_url(format!("{base}/other"))
+            .with_store_root(tmp.path())
+            .with_api_key_source(|| Ok(Some("nvapi-first-fixture".into())));
+        assert_eq!(
+            other_endpoint
+                .filter_model_catalog(raw.clone())
+                .unwrap()
+                .len(),
+            2
+        );
+        // A remembered rejection does not prohibit the user from retrying explicitly.
+        let (controls, _steering, _, _) = run_controls();
+        let mut stream = harness.run(run_request(), controls).await.unwrap();
+        loop {
+            if let AgentEvent::Done { status, .. } = stream.next().await.unwrap().unwrap() {
+                assert_eq!(status, DoneStatus::Completed);
+                break;
+            }
+        }
+        drop(stream);
+        assert_eq!(harness.models().await.unwrap().len(), 2);
+        assert_eq!(restarted().filter_model_catalog(raw).unwrap().len(), 2);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_key_override_cannot_poison_the_selected_accounts_catalog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (path, headers, _) = read_request(&mut socket).await;
+            assert_eq!(path, "/v1/chat/completions");
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("bearer nvapi-override-fixture")
+            );
+            respond(
+                &mut socket,
+                "404 Not Found",
+                "application/json",
+                FUNCTION_NOT_FOUND,
+            )
+            .await;
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(&base)
+            .with_store_root(tmp.path())
+            .with_api_key_source(|| Ok(Some("nvapi-selected-fixture".into())));
+        let mut request = run_request();
+        request
+            .env
+            .insert("NVIDIA_API_KEY".into(), "nvapi-override-fixture".into());
+        let (controls, _steering, _, _) = run_controls();
+        let mut stream = harness.run(request, controls).await.unwrap();
+        loop {
+            if let AgentEvent::Done { status, .. } = stream.next().await.unwrap().unwrap() {
+                assert_eq!(status, DoneStatus::Errored);
+                break;
+            }
+        }
+        let raw = inventory_models(vec![json!({"id":"fixture/chat"})], Vec::new());
+        assert_eq!(harness.filter_model_catalog(raw.clone()).unwrap().len(), 1);
+        let overridden = NvidiaNimHarness::new()
+            .with_base_url(&base)
+            .with_store_root(tmp.path())
+            .with_api_key_source(|| Ok(Some("nvapi-override-fixture".into())));
+        assert!(overridden.filter_model_catalog(raw).unwrap().is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_404_auth_throttling_and_outages_do_not_hide_models() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let statuses = [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "404 Not Found",
+            "429 Too Many Requests",
+            "500 Internal Server Error",
+        ];
+        let server = tokio::spawn(async move {
+            for status in statuses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, _, _) = read_request(&mut socket).await;
+                assert_eq!(path, "/v1/chat/completions");
+                respond(
+                    &mut socket,
+                    status,
+                    "application/json",
+                    r#"{"detail":"Not Found"}"#,
+                )
+                .await;
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(&base)
+            .with_store_root(tmp.path())
+            .with_api_key_source(|| Ok(Some("nvapi-fixture".into())));
+        for _ in statuses {
+            let (controls, _steering, _, _) = run_controls();
+            let mut stream = harness.run(run_request(), controls).await.unwrap();
+            loop {
+                if let AgentEvent::Done { status, .. } = stream.next().await.unwrap().unwrap() {
+                    assert_eq!(status, DoneStatus::Errored);
+                    break;
+                }
+            }
+            assert_eq!(
+                harness
+                    .filter_model_catalog(inventory_models(
+                        vec![json!({"id":"fixture/chat"})],
+                        Vec::new()
+                    ))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(!tmp.path().join("model-availability").exists());
         server.await.unwrap();
     }
 

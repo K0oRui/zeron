@@ -92,7 +92,10 @@ pub(crate) async fn list_with_lease(
     let root = root.to_path_buf();
     tokio::spawn(async move {
         let _lease = lease.clone();
-        list_inner(&root, harness, force, lease).await
+        let models = list_inner(&root, harness.clone(), force, lease).await?;
+        // Runtime evidence must also apply to disk/static fallbacks. Do not
+        // persist this filtered view or resurrect rows when it becomes empty.
+        harness.filter_model_catalog(models)
     })
     .await
     .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))?
@@ -245,6 +248,7 @@ mod tests {
         delay: std::sync::atomic::AtomicBool,
         forced: std::sync::atomic::AtomicBool,
         cached: std::sync::atomic::AtomicBool,
+        hidden: std::sync::atomic::AtomicBool,
         failure: std::sync::Mutex<String>,
         harness: zeron_proto::HarnessId,
     }
@@ -256,6 +260,7 @@ mod tests {
                 delay: false.into(),
                 forced: false.into(),
                 cached: false.into(),
+                hidden: false.into(),
                 failure: std::sync::Mutex::new("offline".into()),
                 harness: zeron_proto::HarnessId::Codex,
             })
@@ -286,6 +291,13 @@ mod tests {
             let mut rows = models();
             rows[0].id = "static".into();
             rows
+        }
+        fn filter_model_catalog(&self, models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
+            Ok(if self.hidden.load(SeqCst) {
+                Vec::new()
+            } else {
+                models
+            })
         }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(models())
@@ -318,6 +330,66 @@ mod tests {
             unreachable!()
         }
     }
+    #[tokio::test]
+    async fn availability_filter_preserves_raw_inventory_and_authoritative_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        probe.hidden.store(true, SeqCst);
+        assert!(
+            list(dir.path(), probe.clone(), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let context = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &context);
+        assert_eq!(
+            read(&path, &context),
+            Some(models()),
+            "persist raw inventory"
+        );
+        // A transient discovery failure must not bring the rejected disk row back.
+        probe.fail.store(true, SeqCst);
+        assert!(
+            list(dir.path(), probe.clone(), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        probe.hidden.store(false, SeqCst);
+        assert_eq!(list(dir.path(), probe, false).await.unwrap(), models());
+    }
+
+    #[tokio::test]
+    async fn availability_filter_also_covers_static_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        probe.fail.store(true, SeqCst);
+        probe.hidden.store(true, SeqCst);
+        assert!(
+            list(dir.path(), probe.clone(), false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        probe.hidden.store(false, SeqCst);
+        assert_eq!(
+            list(dir.path(), probe, false).await.unwrap()[0].id,
+            "static"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_filter_covers_early_disk_replies_during_slow_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        list(dir.path(), probe.clone(), false).await.unwrap();
+        probe.hidden.store(true, SeqCst);
+        probe.delay.store(true, SeqCst);
+        assert!(list(dir.path(), probe, true).await.unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
     #[tokio::test]
     async fn background_refresh_holds_lease_after_cached_reply() {
         let dir = tempfile::tempdir().unwrap();

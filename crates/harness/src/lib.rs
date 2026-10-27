@@ -246,6 +246,14 @@ pub trait Harness: Send + Sync {
     fn fallback_models(&self) -> Vec<Model> {
         Vec::new()
     }
+    /// Apply current account availability AFTER choosing a live, disk or static
+    /// catalog. Keep the underlying inventory intact for later recovery. An
+    /// empty filtered result is authoritative, not a discovery failure.
+    fn filter_model_catalog(&self, models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
+        Ok(models)
+    }
+    /// Inventory and provenance for the engine cache; the engine applies
+    /// [`Self::filter_model_catalog`] after all cache/fallback decisions.
     async fn model_catalog(&self, _force: bool) -> Result<ModelCatalog, HarnessError> {
         self.models().await.map(|models| ModelCatalog {
             models,

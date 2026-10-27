@@ -11,8 +11,24 @@ The picker reads the complete `/v1/models` inventory, not just the featured
 models. Featured metadata supplies labels and context limits when available;
 a missing featured feed does not hide other inventory models. Explicit non-chat
 tasks and known embedding, reranking, reward, speech and image-generation
-families are excluded from the chat picker. The provider can still reject a
-model that is not available to that account.
+families are excluded from the chat picker. Inventory membership does **not**
+prove that NVIDIA's backing deployment is live or accessible to the selected key;
+Zeron does not send inference prompts just to test the catalog.
+
+If an actual chat request returns NVIDIA's `404` / `Function …: Not found for
+account …` response (or a structured `model_not_found` rejection), that model is
+hidden for **15 minutes**, scoped to the exact endpoint and API key. This filter
+runs after live, memory, disk and static catalog selection, including when every
+row is rejected. Refreshing the inventory cannot immediately resurrect the same
+broken model. Other models, accounts and endpoints are unaffected.
+
+The short-lived evidence survives an app restart in private files containing
+only model IDs and timestamps under a hashed endpoint/key namespace. It expires
+automatically; an explicit retry is still allowed, and a successful response
+restores the model immediately. Zeron never silently substitutes a different
+model. Generic route `404`s, authentication failures, throttling and server or
+network failures do not hide catalog rows. NVIDIA controls deployment/access;
+this error is **not** evidence of a zero balance or an invalid key.
 
 `NVIDIA_NIM_BASE_URL` accepts either the API origin or an OpenAI-style base URL
 ending in `/v1`; Zeron does not append `/v1` twice. Catalog caches are scoped to
@@ -63,9 +79,18 @@ conversation resumption, balance changes in both directions, team headers,
 unknown balances, independent upstream providers, and authoritative empty
 catalogs.
 
-In the restricted development sandbox, 19 isolated catalog/parser/redaction
-checks passed. Changed Rust files passed parser checks, workspace manifests and
-the lockfile passed offline metadata validation, and `git diff --check` was
-clean. The full workspace test command could not run because required
-Git/registry dependencies were not locally cached. HTTP fixture tests and live
-authenticated provider calls still need to run in the normal build environment.
+The 404 follow-up adds regressions for exact error classification, account and
+endpoint isolation, request-key overrides, durable expiry/recovery, private
+storage, and authoritative empty results across live, disk and static sources.
+The HTTP fixtures assert that discovery does not send inference prompts and
+that a failed model is never silently replaced.
+
+In the restricted development sandbox, 23 focused checks passed using the
+production availability store, extracted production error helpers/tests, the
+existing redaction/free-model policy modules, and real Serde/JSON dependencies.
+These are not a full production-crate build. Changed Rust files passed parser
+checks, workspace manifests and the lockfile passed offline metadata validation,
+and `git diff --check` was clean. The full workspace test command could not run
+because required Git/registry dependencies were not locally cached. Async HTTP
+and engine-cache fixture tests and live authenticated provider calls still need
+to run in the normal build environment.
