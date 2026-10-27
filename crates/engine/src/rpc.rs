@@ -2036,7 +2036,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::INSTALL_HEADROOM => Duration::from_secs(20 * 60),
         // Enabling may probe the runtime and wait for the proxy's first
         // health check, which together can outlast the default deadline.
-        methods::SET_HEADROOM_ENABLED => Duration::from_secs(60),
+        methods::SET_HEADROOM_ENABLED => Duration::from_secs(120),
         // A full fleet of enabled providers is checked two at a time; each
         // provider may need both a CLI probe and a network request.
         methods::CHECK_HARNESS_UPDATES => Duration::from_secs(4 * 60),

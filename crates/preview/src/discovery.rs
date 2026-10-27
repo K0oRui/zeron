@@ -2,15 +2,18 @@
 //! run or terminal that started it (see [`zeron_proto::ORIGIN_ENV`]). HTTP probes
 //! run only after that origin is established and commands performing
 //! authentication have been excluded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
     collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
+use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use zeron_proto::ORIGIN_ENV;
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,7 @@ pub async fn is_http(address: SocketAddr) -> bool {
 
 /// One process in the scan: enough to walk ancestry and to key the origin
 /// cache by process identity (a recycled pid is a different process).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy)]
 struct Process {
     parent: u32,
@@ -165,9 +169,11 @@ struct Process {
 #[derive(Default)]
 pub struct Origins {
     /// `Some(origin)` when the marker is present.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     markers: HashMap<(u32, u64), Option<String>>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Origins {
     /// What started `pid`: its own marker, else the nearest
     /// ancestor's, so a server whose launcher scrubbed its environment still
@@ -232,6 +238,7 @@ impl Origins {
 }
 
 /// The origin marker's value in a NUL-separated environment block.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn origin_marker(environment: &[u8]) -> Option<String> {
     let prefix = format!("{ORIGIN_ENV}=");
     environment
@@ -698,6 +705,7 @@ mod tests {
             assert!(!listener(&args).is_authentication_command(), "{args:?}");
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn listener_of(pid: u32) -> Listener {
         Listener {
             pid,
@@ -711,6 +719,7 @@ mod tests {
             chat_id: None,
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn environment(entries: &[&str]) -> Vec<u8> {
         entries
             .iter()
@@ -719,6 +728,7 @@ mod tests {
             .copied()
             .collect()
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn origin_is_the_nearest_marked_process_and_never_the_engine() {
         let engine = std::process::id();
@@ -800,6 +810,7 @@ mod tests {
         origins.attribute(&mut listeners, &recycled, &mut read);
         assert!(!listeners[0].zeron_owned);
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn an_unreadable_environment_is_retried_not_remembered() {
         let processes: HashMap<u32, Process> = [(
@@ -819,6 +830,7 @@ mod tests {
         });
         assert_eq!(listeners[0].origin.as_deref(), Some("chat:c"));
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn origin_marker_matches_the_whole_name() {
         assert_eq!(
@@ -831,6 +843,7 @@ mod tests {
             Some(String::new())
         );
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn procargs_environment_skips_the_exec_path_and_arguments() {
         let mut buffer = 2i32.to_ne_bytes().to_vec();

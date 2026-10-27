@@ -5648,16 +5648,6 @@ async fn opencode_version(exe: &std::path::Path) -> Option<semver::Version> {
     Some(version)
 }
 
-/// Inline config is the final user config layer. Preserve inherited overrides
-/// and other MCP servers; never write chat identity into a shared config file.
-fn mcp_config(
-    inherited: Option<&str>,
-    mcp: &zeron_proto::McpServer,
-    protocol: Protocol,
-) -> Result<String, HarnessError> {
-    inline_config(inherited, Some((mcp, protocol)), None)
-}
-
 /// The inline config layer for one run: the user's inherited config, then the
 /// Zeron MCP server, then Headroom's provider routing. Each layer merges into
 /// the one before it, so a run can carry any part on its own.
@@ -6020,13 +6010,15 @@ if (process.argv.includes('--version')) {{
                     r#"{"model":"keep", "mcp":{"servers":{"user":{"type":"remote","url":"https://example.test"}}}}"#
                 }
             };
-            let first: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
-                    .unwrap();
+            let first: Value = serde_json::from_str(
+                &inline_config(Some(inherited), Some((&mcp, protocol)), None).unwrap(),
+            )
+            .unwrap();
             mcp.env.insert("ZERON_CHAT_ID".into(), "second".into());
-            let second: Value =
-                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
-                    .unwrap();
+            let second: Value = serde_json::from_str(
+                &inline_config(Some(inherited), Some((&mcp, protocol)), None).unwrap(),
+            )
+            .unwrap();
             assert_eq!(first["model"], "keep");
             let pointer = if protocol == Protocol::V1 {
                 "/mcp"
@@ -6051,7 +6043,7 @@ if (process.argv.includes('--version')) {{
                 assert!(servers["zeron"].get("enabled").is_none());
             }
             for invalid in ["[]", "{", r#"{"mcp":false}"#] {
-                assert!(mcp_config(Some(invalid), &mcp, protocol).is_err());
+                assert!(inline_config(Some(invalid), Some((&mcp, protocol)), None).is_err());
             }
             mcp.env.insert("ZERON_CHAT_ID".into(), "first".into());
         }

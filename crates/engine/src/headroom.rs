@@ -62,7 +62,10 @@ pub const UNROUTED: [HarnessId; 6] = [
 const INSTALL_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const VERSION_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PLUGIN_PROBE_DEADLINE: Duration = Duration::from_secs(15);
-const PROXY_START_DEADLINE: Duration = Duration::from_secs(25);
+/// A freshly installed Headroom imports a large ML stack on its first start
+/// (158 packages here took over half a minute under Windows Defender), so the
+/// first proxy start after an install gets a budget sized for a cold venv.
+const PROXY_START_DEADLINE: Duration = Duration::from_secs(90);
 const RUNTIME_TTL: Duration = Duration::from_secs(30);
 /// How long a release check is trusted before Settings asks PyPI again.
 const LATEST_TTL: Duration = Duration::from_secs(60 * 60);
@@ -280,6 +283,10 @@ impl Headroom {
             inner.installing = true;
             inner.error = None;
         }
+        // uv replaces the whole tool directory, and Windows refuses to delete a
+        // shim that is still running: the proxy stops for the install and
+        // starts again from whichever build lands.
+        self.stop_proxy().await;
         let result = self.install_inner().await;
         self.lock().installing = false;
         match result {
@@ -298,7 +305,15 @@ impl Headroom {
                     self.ensure_proxy().await;
                 }
             }
-            Err(error) => self.lock().error = Some(error),
+            Err(error) => {
+                // The attempt failed but the build that was running still
+                // works: put the proxy back, then report the failure, which
+                // starting it would otherwise clear.
+                if self.enabled() {
+                    self.ensure_proxy().await;
+                }
+                self.lock().error = Some(error);
+            }
         }
         self.status().await
     }
@@ -403,7 +418,10 @@ impl Headroom {
             }
             match run(command, left).await {
                 Ok(_) => return Ok(()),
-                Err(error) => last = Some(error),
+                Err(error) => {
+                    tracing::warn!(%error, "headroom install failed");
+                    last = Some(install_failure(&error));
+                }
             }
         }
         Err(last.unwrap_or_else(|| "Headroom install ran out of time.".into()))
@@ -488,7 +506,9 @@ impl Headroom {
     /// listening there (including one the user started), otherwise spawns one.
     async fn ensure_proxy(&self) -> Option<u16> {
         let _guard = self.start.lock().await;
-        if !self.enabled() {
+        // An install replaces the runtime's files; a proxy started now would
+        // hold them open and make that replacement fail on Windows.
+        if self.lock().installing || !self.enabled() {
             return None;
         }
         if health().await {
@@ -551,10 +571,40 @@ impl Headroom {
     async fn stop_proxy(&self) {
         let child = { self.lock().proxy.take() };
         if let Some(mut child) = child {
+            // uv's console shim spawns the interpreter as its own child, so
+            // killing the shim alone leaves the interpreter running and
+            // holding the tool directory the next install must replace.
+            #[cfg(windows)]
+            {
+                if let Some(pid) = child.id() {
+                    kill_tree(pid).await;
+                }
+            }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         }
+        #[cfg(windows)]
+        self.stop_untracked_proxy().await;
         self.lock().running = false;
+    }
+
+    /// A proxy started by an earlier engine is not this process's child, yet it
+    /// still holds the port. The port is the only handle on it, so stop
+    /// whatever answers there.
+    #[cfg(windows)]
+    async fn stop_untracked_proxy(&self) {
+        if !health().await {
+            return;
+        }
+        let Some(pid) = port_owner(PORT).await else {
+            return;
+        };
+        tracing::warn!(pid, "stopping a Headroom proxy left by an earlier run");
+        kill_tree(pid).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while health().await && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     fn reap_dead_child(&self) {
@@ -852,6 +902,42 @@ async fn health() -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// Stop `pid` and everything it started. uv's console shim keeps the
+/// interpreter as a child, and the interpreter keeps the tool's modules open,
+/// so replacing the tool directory needs both gone.
+#[cfg(windows)]
+async fn kill_tree(pid: u32) {
+    let mut command = tokio::process::Command::new("taskkill");
+    command
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    let _ = command.status().await;
+}
+
+/// The pid listening on `port`, from netstat's table. Only the local address
+/// column is read, so an agent's connection to the same port never matches.
+#[cfg(windows)]
+async fn port_owner(port: u16) -> Option<u32> {
+    let mut command = tokio::process::Command::new("netstat");
+    command
+        .args(["-ano", "-p", "TCP"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    let output = command.output().await.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let suffix = format!(":{port}");
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(1).filter(|local| local.ends_with(&suffix))?;
+        fields.last()?.parse().ok()
+    })
+}
+
 /// Time left before `deadline`, never negative.
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
@@ -904,6 +990,26 @@ fn tail(text: &str, limit: usize) -> String {
         chars = chars.split_off(chars.len() - limit);
     }
     chars.into_iter().collect()
+}
+
+/// uv replaces the tool directory wholesale, so a shim another process still
+/// runs makes that removal fail with an access-denied from inside uv. Name the
+/// cause: uv's own line reports a refused directory, not what to do about it.
+fn install_failure(error: &str) -> String {
+    let locked = [
+        "Access is denied",
+        "Permission denied",
+        "os error 5",
+        "being used by another process",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker));
+    if !locked {
+        return error.to_owned();
+    }
+    "Headroom's files are locked by a running copy. \
+     Stop any Headroom proxy, then press Reinstall."
+        .into()
 }
 
 #[cfg(test)]
@@ -1042,6 +1148,20 @@ mod tests {
         // Unknown on either side is not an update.
         assert!(!newer_than_installed(None, Some("0.42.0")));
         assert!(!newer_than_installed(Some("0.41.0"), None));
+    }
+
+    #[test]
+    fn a_locked_install_names_the_copy_holding_the_files() {
+        let uv = "Resolved 158 packages in 2.28s\n\
+                  error: failed to remove directory `C:\\Users\\me\\AppData\\Roaming\\uv\\tools\\headroom-ai\\Scripts`: Access is denied. (os error 5)";
+        assert_eq!(
+            install_failure(uv),
+            "Headroom's files are locked by a running copy. Stop any Headroom proxy, then press Reinstall."
+        );
+        assert_eq!(
+            install_failure("Couldn't run Headroom: not found"),
+            "Couldn't run Headroom: not found"
+        );
     }
 
     #[test]

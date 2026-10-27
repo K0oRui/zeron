@@ -158,16 +158,13 @@ fn headroom_provider_labels(providers: &[HarnessId]) -> String {
 /// which says more than "on" ever could.
 fn headroom_detail(status: &HeadroomStatus, installing: bool) -> String {
     if installing {
-        return "Installing the proxy…".into();
+        return "Installing…".into();
     }
     if let Some(error) = &status.error {
         return format!("Error — {error}");
     }
     if !status.installed {
-        return format!(
-            "Not installed · the proxy listens on 127.0.0.1:{}",
-            status.port
-        );
+        return "Not installed".into();
     }
     let version = status
         .version
@@ -175,15 +172,9 @@ fn headroom_detail(status: &HeadroomStatus, installing: bool) -> String {
         .map(|version| format!(" · v{version}"))
         .unwrap_or_default();
     match (status.enabled, status.running) {
-        (false, _) => format!(
-            "Off · rides 127.0.0.1:{} when enabled{version}",
-            status.port
-        ),
+        (false, _) => format!("Off{version}"),
         (true, true) => format!("Running on 127.0.0.1:{}{version}", status.port),
-        (true, false) => format!(
-            "Not answering on 127.0.0.1:{}{version} — retried at the next run",
-            status.port
-        ),
+        (true, false) => format!("Not answering on 127.0.0.1:{}{version}", status.port),
     }
 }
 
@@ -1123,7 +1114,7 @@ impl HarnessesPage {
         if !self.supports_headroom(cx) {
             return None;
         }
-        match &self.headroom {
+        let content = match &self.headroom {
             Loadable::Idle | Loadable::Loading => Some(
                 div()
                     .flex()
@@ -1138,7 +1129,7 @@ impl HarnessesPage {
                             .child(widgets::meta_line(
                                 theme,
                                 vec![div()
-                                    .child(SharedString::from("Reading the proxy's state…"))
+                                    .child(SharedString::from("Loading…"))
                                     .into_any_element()],
                             )),
                     )
@@ -1171,7 +1162,16 @@ impl HarnessesPage {
                 )
             }
             Loadable::Ready(status) => Some(self.render_headroom_ready(status, theme, cx)),
-        }
+        };
+        content.map(|content| {
+            widgets::section_card(theme)
+                .child(
+                    widgets::card_row(theme, true)
+                        .id("headroom-row")
+                        .child(div().flex_1().min_w_0().child(content)),
+                )
+                .into_any_element()
+        })
     }
 
     fn render_headroom_ready(
@@ -1184,11 +1184,14 @@ impl HarnessesPage {
         let enabled = self.pending_headroom_toggle.unwrap_or(status.enabled);
         let enabled_copy = enabled;
         let pending = self.pending_headroom_toggle.is_some();
+        // A missing runtime has nothing to switch on: the card dims and the
+        // switch stops taking clicks until Install lands.
+        let switchable = !installing && status.installed;
         let toggle = widgets::toggle_switch(theme, enabled, "headroom-switch")
             .id("headroom-toggle")
-            .when(pending || installing, |el| el.opacity(0.55))
-            .when(installing, |el| el.cursor_not_allowed())
-            .when(!installing, |el| {
+            .when(pending || !switchable, |el| el.opacity(0.55))
+            .when(!switchable, |el| el.cursor_not_allowed())
+            .when(switchable, |el| {
                 let enabled_copy = enabled_copy;
                 el.cursor_pointer()
                     .tab_index(0)
@@ -1250,15 +1253,14 @@ impl HarnessesPage {
         let mut detail = div()
             .flex_1()
             .min_w_0()
+            .when(!status.installed, |el| el.opacity(0.55))
             .child(widgets::row_title(theme, "Headroom"))
             .child(widgets::meta_line(theme, fragments));
         if !unrouted.is_empty() {
             detail = detail.child(widgets::meta_line(
                 theme,
                 vec![div()
-                    .child(SharedString::from(format!(
-                        "Not routed: {unrouted} (these agents read no proxy setting)"
-                    )))
+                    .child(SharedString::from(format!("Not routed: {unrouted}")))
                     .into_any_element()],
             ));
         }
@@ -2219,10 +2221,7 @@ fn headroom_detail_names_what_the_proxy_is_doing() {
     assert!(headroom_detail(&status, false).starts_with("Not installed"));
     status.installed = true;
     status.version = Some("0.41.0".into());
-    assert_eq!(
-        headroom_detail(&status, false),
-        "Off · rides 127.0.0.1:8787 when enabled · v0.41.0"
-    );
+    assert_eq!(headroom_detail(&status, false), "Off · v0.41.0");
     status.enabled = true;
     status.running = true;
     assert_eq!(
@@ -2232,7 +2231,7 @@ fn headroom_detail_names_what_the_proxy_is_doing() {
     // An error outranks every state: it is what the user has to act on.
     status.error = Some("boom".into());
     assert_eq!(headroom_detail(&status, false), "Error — boom");
-    assert_eq!(headroom_detail(&status, true), "Installing the proxy…");
+    assert_eq!(headroom_detail(&status, true), "Installing…");
 }
 
 #[cfg(test)]
