@@ -25,6 +25,7 @@ zeron-term-link.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+deser-hjson.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

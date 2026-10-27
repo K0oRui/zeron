@@ -513,27 +513,13 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
         .map(|m| m.label.clone())
 }
 
-/// Kilo advertises its whole gateway catalog, including rows that need
-/// credits. The rule is shared ([`zeron_proto::kilo`]) with the harness's
-/// discovery-side filter and the desktop picker, applied here so a catalog
-/// from an older engine still opens on the free rows only.
-fn kilo_model_is_free(model: &ModelInfo) -> bool {
-    zeron_proto::kilo::gateway_model_is_free(&model.id, &model.label)
-}
-
 /// Clean a live `ListModels` reply: drop a `default` placeholder when real
 /// rows exist, fold `[1m]`/`-1m` variants into a Context Window option, and
 /// prefer curated labels (legacy `HarnessCatalog.normalize`).
 pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     let catalog = curated_catalog(harness);
-    // An older engine never filtered Kilo's gateway rows. Keep the free ones;
-    // if the rule matches nothing (a renamed free tier), show the list as-is
-    // rather than an empty picker.
-    let models = if harness == "kilo" {
-        zeron_proto::kilo::keep_free_or_all(models, kilo_model_is_free)
-    } else {
-        models
-    };
+    // Account balance filtering belongs to the host. Re-filtering here would
+    // hide paid models even after a funded account's host offered them.
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
     models
@@ -559,6 +545,9 @@ pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo>
             }
             if let Some(label) = curated_label(&row.id, &catalog) {
                 row.label = label;
+            }
+            if harness == "kilo" {
+                row.label = zeron_proto::kilo::strip_gateway_label(&row.label).to_owned();
             }
             Some(row)
         })
@@ -782,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_keeps_only_free_kilo_rows() {
+    fn normalize_preserves_funded_kilo_rows() {
         let live = vec![
             model(
                 "kilo/kilo-auto/free",
@@ -807,9 +796,25 @@ mod tests {
             ),
         ];
         let out = normalize_models("kilo", live);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
         assert_eq!(out[0].id, "kilo/kilo-auto/free");
         assert_eq!(out[1].id, "kilo/nvidia/nemotron-3-super-120b-a12b:free");
+        assert_eq!(out[2].id, "kilo/anthropic/claude-sonnet-5");
+        assert_eq!(out[2].label, "Anthropic: Claude Sonnet 5");
+    }
+
+    #[test]
+    fn an_empty_authorized_catalog_replaces_previously_funded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCatalog::new(dir.path());
+        cache.put_models(
+            "device",
+            "kilo",
+            &[model("kilo/paid", "Paid", "", &[], vec![])],
+        );
+        cache.put_models("device", "kilo", &[]);
+        assert_eq!(cache.models("device", "kilo"), Some(vec![]));
+        assert!(normalize_models("kilo", vec![]).is_empty());
     }
 
     #[test]

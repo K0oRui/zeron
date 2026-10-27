@@ -1,16 +1,18 @@
 //! NVIDIA NIM over its OpenAI-compatible HTTP API.
 //!
-//! The hosted catalog does not mark models as free, and `/v1/models` also
-//! contains embeddings, reward models and other non-chat endpoints. Discovery
-//! therefore intersects NVIDIA's featured chat catalog with live inventory;
-//! it never invents a `plan` field or treats inventory membership as proof of
-//! chat availability. Runs use `POST /v1/chat/completions` with the selected
+//! Discovery uses the selected account's `/v1/models` inventory, enriched by
+//! featured metadata (not restricted to featured models). Explicit non-chat
+//! tasks and known embedding/reward endpoints stay out of the chat picker.
+//! NVIDIA exposes neither a balance nor prices here, so inventory membership
+//! is never treated as evidence of free access. Runs use
+//! `POST /v1/chat/completions` with the selected
 //! account's `NVIDIA_API_KEY`, stream text/reasoning/usage over SSE, and keep
 //! a private local transcript so a resumed runtime retains the conversation.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -68,10 +70,13 @@ fn data_root() -> PathBuf {
     crate::executable::home_or_current_dir().join(".zeron")
 }
 
+type ApiKeySource = dyn Fn() -> Result<Option<String>, HarnessError> + Send + Sync;
+
 pub struct NvidiaNimHarness {
     client: reqwest::Client,
     base_url: String,
     featured_url: String,
+    api_key_source: Option<Arc<ApiKeySource>>,
     models_cache: crate::catalog::Catalog,
     store_root: Option<PathBuf>,
 }
@@ -86,7 +91,7 @@ impl Default for NvidiaNimHarness {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let base_url = base_url.trim().trim_end_matches('/').to_owned();
+        let base_url = normalize_base_url(&base_url);
         let featured_url = if base_url == NIM_BASE_URL {
             NIM_FEATURED_URL.into()
         } else {
@@ -96,6 +101,7 @@ impl Default for NvidiaNimHarness {
             client,
             base_url,
             featured_url,
+            api_key_source: None,
             models_cache: Default::default(),
             store_root: None,
         }
@@ -111,8 +117,12 @@ impl NvidiaNimHarness {
     /// Primarily a self-hosting and local-fixture seam; production uses the
     /// hosted endpoints above.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into().trim().trim_end_matches('/').to_owned();
-        self.featured_url = format!("{}/featured-models.json", self.base_url);
+        self.base_url = normalize_base_url(&base_url.into());
+        self.featured_url = if self.base_url == NIM_BASE_URL {
+            NIM_FEATURED_URL.into()
+        } else {
+            format!("{}/featured-models.json", self.base_url)
+        };
         self
     }
 
@@ -123,15 +133,46 @@ impl NvidiaNimHarness {
         self
     }
 
-    fn context(&self) -> ModelContext {
-        ModelContext {
+    /// Read the selected account at discovery time, without changing the
+    /// process environment. Re-reading it for the cache context also catches
+    /// account switches while a request is in flight.
+    pub fn with_api_key_source<F>(mut self, source: F) -> Self
+    where
+        F: Fn() -> Result<Option<String>, HarnessError> + Send + Sync + 'static,
+    {
+        self.api_key_source = Some(Arc::new(source));
+        self
+    }
+
+    fn api_key(&self) -> Result<Option<String>, HarnessError> {
+        let selected = match &self.api_key_source {
+            Some(source) => source()?,
+            None => None,
+        };
+        Ok(selected
+            .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty()))
+    }
+
+    fn context(&self) -> Result<ModelContext, HarnessError> {
+        let key = self.api_key()?;
+        Ok(ModelContext {
             hash: format!(
                 "{:x}",
-                Sha256::digest(format!("{}\0{}", self.base_url, self.featured_url).as_bytes())
+                Sha256::digest(
+                    format!(
+                        "inventory-v2\0{}\0{}\0{}",
+                        self.base_url,
+                        self.featured_url,
+                        key.as_deref().unwrap_or_default()
+                    )
+                    .as_bytes()
+                )
             ),
             binary_path: PathBuf::from(self.base_url.as_str()),
-            binary_version: Some("openai-chat-completions-v1".into()),
-        }
+            binary_version: Some("openai-chat-completions-v2".into()),
+        })
     }
 
     fn sessions(&self) -> HistoryStore {
@@ -143,9 +184,7 @@ impl NvidiaNimHarness {
     }
 
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        // A process-level key is optional for the public hosted inventory.
-        // Account-slot keys are deliberately run-scoped and never global.
-        let key = std::env::var("NVIDIA_API_KEY").ok();
+        let key = self.api_key()?;
         let inventory_url = format!("{}/v1/models", self.base_url);
         let (inventory, featured) = tokio::join!(
             get_json(
@@ -154,81 +193,165 @@ impl NvidiaNimHarness {
                 key.as_deref(),
                 "model inventory"
             ),
+            // Never send the inference key to the public metadata host.
             get_json(&self.client, &self.featured_url, None, "featured catalog")
         );
-
-        let inventory_ids = inventory.as_ref().ok().and_then(|body| {
-            serde_json::from_value::<NimModelsResponse>(body.clone())
-                .ok()
-                .map(|response| {
-                    response
-                        .data
-                        .into_iter()
-                        .map(|model| model.id)
-                        .filter(|id| !id.is_empty())
-                        .collect::<HashSet<_>>()
-                })
+        // A rejected selected key must not silently turn into a public or
+        // another account's catalog, even when the featured feed is healthy.
+        if let Err(error) = &inventory
+            && !crate::CatalogFailure::classify(error).allows_stale()
+        {
+            return Err(inventory.unwrap_err());
+        }
+        let featured_rows = featured
+            .as_ref()
+            .ok()
+            .and_then(|body| serde_json::from_value::<NimFeaturedResponse>(body.clone()).ok());
+        let metadata = featured_rows
+            .map(|response| response.featured)
+            .unwrap_or_default();
+        let inventory = inventory.and_then(|body| {
+            serde_json::from_value::<NimModelsResponse>(body).map_err(|_| {
+                HarnessError::Protocol("NVIDIA NIM returned an invalid model inventory.".into())
+            })
         });
-        let featured_rows = featured.as_ref().ok().and_then(|body| {
-            serde_json::from_value::<NimFeaturedResponse>(body.clone())
-                .ok()
-                .map(|response| response.featured)
-        });
-
-        if let Some(rows) = featured_rows {
-            let mut seen = HashSet::new();
-            let models: Vec<Model> = rows
-                .into_iter()
-                .filter(|row| !row.model.is_empty())
-                // With inventory available, a featured row must still exist
-                // there. Without it, NVIDIA's current featured feed is the
-                // best available source and is still safer than guessing
-                // capabilities from arbitrary inventory ids.
-                .filter(|row| {
-                    inventory_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&row.model))
-                })
-                .filter(|row| seen.insert(row.model.clone()))
-                .map(featured_model)
-                .collect();
-            if !models.is_empty() {
-                return Ok(models);
+        match inventory {
+            Ok(response) => {
+                let models = inventory_models(response.data, metadata);
+                if !models.is_empty() {
+                    return Ok(models);
+                }
+                Err(HarnessError::Protocol(
+                    "NVIDIA NIM returned no chat models in its inventory.".into(),
+                ))
+            }
+            Err(error) => {
+                // A metadata-only fallback is for outages, never a successful
+                // inventory that says these models are no longer available.
+                let mut seen = HashSet::new();
+                let models: Vec<Model> = metadata
+                    .into_iter()
+                    .filter(|row| !row.model.trim().is_empty() && seen.insert(row.model.clone()))
+                    .map(featured_model)
+                    .collect();
+                if !models.is_empty() {
+                    return Ok(models);
+                }
+                Err(error)
             }
         }
-
-        // The featured feed is an enhancement, not a second single point of
-        // failure: known chat metadata can still be matched against inventory.
-        if let Some(ids) = inventory_ids {
-            let models = fallback_models()
-                .into_iter()
-                .filter(|model| ids.contains(&model.id))
-                .collect::<Vec<_>>();
-            if !models.is_empty() {
-                return Ok(models);
-            }
-        }
-
-        let detail = match (inventory, featured) {
-            (Err(inventory), Err(featured)) => format!("{inventory}; {featured}"),
-            (Err(inventory), _) => inventory.to_string(),
-            (_, Err(featured)) => featured.to_string(),
-            _ => "the responses contained no confirmed chat models".into(),
-        };
-        Err(HarnessError::Protocol(format!(
-            "NVIDIA NIM returned no usable chat catalog: {detail}"
-        )))
     }
+}
+
+/// Accept either an API origin or the commonly copied OpenAI base ending in
+/// `/v1`; appending `/v1` twice otherwise breaks discovery AND inference.
+fn normalize_base_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url).to_owned()
 }
 
 #[derive(Debug, Deserialize)]
 struct NimModelsResponse {
-    data: Vec<NimModel>,
+    // Parse rows independently: one incomplete entry must not hide the rest
+    // of a large provider catalog.
+    data: Vec<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NimModel {
-    id: String,
+fn inventory_models(rows: Vec<Value>, metadata: Vec<NimFeaturedModel>) -> Vec<Model> {
+    let featured_order: HashMap<_, _> = metadata
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (row.model.clone(), i))
+        .collect();
+    let metadata: HashMap<_, _> = metadata
+        .into_iter()
+        .map(|row| (row.model.clone(), featured_model(row)))
+        .chain(
+            fallback_models()
+                .into_iter()
+                .map(|model| (model.id.clone(), model)),
+        )
+        // Prefer live featured metadata over the static enrichment.
+        .fold(HashMap::new(), |mut map, (id, model)| {
+            map.entry(id).or_insert(model);
+            map
+        });
+    let mut seen = HashSet::new();
+    let mut models: Vec<Model> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.trim();
+            if id.is_empty() || !is_chat_model(id, &row) || !seen.insert(id.to_owned()) {
+                return None;
+            }
+            if let Some(model) = metadata.get(id) {
+                return Some(model.clone());
+            }
+            let label = ["name", "display_name", "displayName"]
+                .iter()
+                .find_map(|field| row.get(*field).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id);
+            Some(Model {
+                id: id.into(),
+                label: label.into(),
+                description: row
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            })
+        })
+        .collect();
+    // Retain NVIDIA's featured defaults, then EVERY other inventory row in
+    // provider order. Featured is enrichment, not an allow-list.
+    models.sort_by_key(|model| featured_order.get(&model.id).copied().unwrap_or(usize::MAX));
+    models
+}
+
+fn is_chat_model(id: &str, row: &Value) -> bool {
+    if row.pointer("/capabilities/chat").and_then(Value::as_bool) == Some(false) {
+        return false;
+    }
+    let task = ["task", "pipeline_tag", "model_type"]
+        .iter()
+        .find_map(|field| row.get(*field).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        task.as_str(),
+        "embedding"
+            | "embeddings"
+            | "text-embedding"
+            | "feature-extraction"
+            | "rerank"
+            | "reranking"
+            | "reward"
+            | "image-generation"
+            | "text-to-image"
+            | "text-to-speech"
+            | "automatic-speech-recognition"
+    ) {
+        return false;
+    }
+    // Hosted inventory often supplies only ids. Exclude known non-chat
+    // endpoint families, but do not require new chat models to be featured.
+    let id = id.to_ascii_lowercase();
+    ![
+        "embed",
+        "rerank",
+        "reward",
+        "nvclip",
+        "parakeet",
+        "riva-",
+        "stable-diffusion",
+        "black-forest-labs/flux",
+        "stabilityai/",
+    ]
+    .iter()
+    .any(|family| id.contains(family))
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,7 +486,7 @@ impl Harness for NvidiaNimHarness {
                 // model_catalog path still reports the live/cache failure so
                 // its persistent fallback logic can make the same choice.
                 let models = fallback_models();
-                if models.is_empty() {
+                if !crate::CatalogFailure::classify(&error).allows_stale() || models.is_empty() {
                     Err(error)
                 } else {
                     tracing::warn!(%error, "NVIDIA NIM live catalog unavailable; using static models");
@@ -374,7 +497,7 @@ impl Harness for NvidiaNimHarness {
     }
 
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
-        Ok(Some(self.context()))
+        self.context().map(Some)
     }
 
     async fn model_catalog(&self, force: bool) -> Result<ModelCatalog, HarnessError> {
@@ -382,7 +505,7 @@ impl Harness for NvidiaNimHarness {
             .get_with_timeout(
                 force,
                 Duration::from_secs(25),
-                || Ok(self.context().key()),
+                || self.context().map(|context| context.key()),
                 || self.discover_models(),
             )
             .await
@@ -407,25 +530,32 @@ impl Harness for NvidiaNimHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let api_key = request
-            .env
-            .get("NVIDIA_API_KEY")
-            .cloned()
-            .or_else(|| std::env::var("NVIDIA_API_KEY").ok())
-            .map(|key| key.trim().to_owned())
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                HarnessError::NotSignedIn(
-                    "NVIDIA NIM needs an API key. Open Settings → Providers → NVIDIA NIM and \
-                     connect an `nvapi-…` key, or set NVIDIA_API_KEY on this device."
-                        .into(),
-                )
-            })?;
+        let api_key = match request.env.get("NVIDIA_API_KEY") {
+            Some(key) => Some(key.clone()),
+            None => self.api_key()?,
+        }
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            HarnessError::NotSignedIn(
+                "NVIDIA NIM needs an API key. Open Settings → Providers → NVIDIA NIM and \
+                 connect an `nvapi-…` key, or set NVIDIA_API_KEY on this device."
+                    .into(),
+            )
+        })?;
         let model = request
             .model
             .clone()
+            .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| NVIDIA_NIM_FEATURED_FALLBACK[0].0.into());
+            .unwrap_or_else(|| {
+                self.context()
+                    .ok()
+                    .and_then(|context| self.models_cache.cached_for(context.key()))
+                    .and_then(|models| models.into_iter().next())
+                    .map(|model| model.id)
+                    .unwrap_or_else(|| NVIDIA_NIM_FEATURED_FALLBACK[0].0.into())
+            });
         let session_id = request
             .resume
             .clone()
@@ -1076,6 +1206,11 @@ fn http_error(status: reqwest::StatusCode, snippet: &str) -> String {
             "NVIDIA NIM rejected the API key ({status}). Connect a valid `nvapi-…` key in \
              Settings → Providers → NVIDIA NIM."
         ),
+        402 => format!(
+            "NVIDIA NIM has no inference credits available ({status}). Check your NVIDIA \
+             account balance or choose a model your account can access without credits.{}",
+            error_detail(snippet)
+        ),
         404 => format!(
             "NVIDIA NIM could not run that model ({status}). Refresh the model list or choose \
              another model.{}",
@@ -1470,6 +1605,196 @@ mod tests {
         assert!(models[0].description.as_deref().unwrap().contains("4096"));
     }
 
+    #[test]
+    fn accepts_origins_and_openai_style_v1_base_urls() {
+        for url in [
+            "https://example.test",
+            " https://example.test/ ",
+            "https://example.test/v1",
+            "https://example.test/v1/",
+        ] {
+            assert_eq!(normalize_base_url(url), "https://example.test");
+        }
+        assert_eq!(
+            normalize_base_url("http://localhost:8000/nim/v1/"),
+            "http://localhost:8000/nim"
+        );
+    }
+
+    #[test]
+    fn inventory_is_complete_not_a_featured_allow_list() {
+        let mut rows = vec![
+            json!({"id":"fixture/featured"}),
+            json!({"id":"fixture/new-chat", "name":"New Chat"}),
+            json!({"id":"fixture/featured"}),
+            json!({"id":"fixture/embed"}),
+            json!({"id":"fixture/rerank"}),
+            json!({"id":"fixture/reward"}),
+            json!({"id":"fixture/audio", "task":"automatic-speech-recognition"}),
+            json!({"id":"fixture/no-chat", "capabilities":{"chat":false}}),
+            json!({"id":"   "}),
+            json!({"id":42}),
+            Value::Null,
+        ];
+        for i in 0..512 {
+            rows.push(json!({"id":format!("fixture/chat-{i}")}));
+        }
+        let featured = serde_json::from_value::<NimFeaturedResponse>(json!({"featured-models":[
+            {"model":"fixture/featured", "model-name":"Featured Chat", "context":4096},
+            {"model":"fixture/gone", "model-name":"No Longer Available"}
+        ]}))
+        .unwrap()
+        .featured;
+        let models = inventory_models(rows, featured);
+        assert_eq!(models.len(), 514);
+        assert_eq!(models[0].label, "Featured Chat");
+        assert_eq!(models[1].label, "New Chat");
+        assert!(models.iter().any(|model| model.id == "fixture/chat-511"));
+        assert!(!models.iter().any(|model| model.id == "fixture/gone"));
+    }
+
+    #[tokio::test]
+    async fn inventory_survives_a_missing_featured_feed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, headers, _) = read_request(&mut socket).await;
+                if path == "/v1/models" {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer nvapi-selected-fixture")
+                    );
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "application/json",
+                        r#"{"data":[{"id":"fixture/not-featured"}]}"#,
+                    )
+                    .await;
+                } else {
+                    assert_eq!(path, "/featured-models.json");
+                    assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                    respond(&mut socket, "404 Not Found", "application/json", "{}").await;
+                }
+            }
+        });
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(format!("{base}/v1/"))
+            .with_api_key_source(|| Ok(Some("nvapi-selected-fixture".into())));
+        let catalog = harness.model_catalog(false).await.unwrap();
+        assert_eq!(catalog.source, "live");
+        assert_eq!(catalog.models[0].id, "fixture/not-featured");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_switch_invalidates_the_catalog_and_auth_failure_cannot_use_featured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let selected = Arc::new(std::sync::Mutex::new("nvapi-first-fixture".to_owned()));
+        let source = selected.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, headers, _) = read_request(&mut socket).await;
+                if path == "/featured-models.json" {
+                    assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                    respond(&mut socket, "200 OK", "application/json", r#"{"featured-models":[{"model":"fixture/first"},{"model":"fixture/second"}]}"#).await;
+                } else {
+                    assert_eq!(path, "/v1/models");
+                    let headers = headers.to_ascii_lowercase();
+                    if headers.contains("bearer nvapi-first-fixture") {
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            "application/json",
+                            r#"{"data":[{"id":"fixture/first"}]}"#,
+                        )
+                        .await;
+                    } else if headers.contains("bearer nvapi-second-fixture") {
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            "application/json",
+                            r#"{"data":[{"id":"fixture/second"}]}"#,
+                        )
+                        .await;
+                    } else {
+                        assert!(headers.contains("bearer nvapi-rejected-fixture"));
+                        respond(&mut socket, "401 Unauthorized", "application/json", "{}").await;
+                    }
+                }
+            }
+        });
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(base)
+            .with_api_key_source(move || Ok(Some(source.lock().unwrap().clone())));
+        assert_eq!(harness.models().await.unwrap()[0].id, "fixture/first");
+        let first = harness.context().unwrap();
+        *selected.lock().unwrap() = "nvapi-second-fixture".into();
+        assert_ne!(first.hash, harness.context().unwrap().hash);
+        assert_eq!(harness.models().await.unwrap()[0].id, "fixture/second");
+        *selected.lock().unwrap() = "nvapi-rejected-fixture".into();
+        let error = harness.models().await.unwrap_err();
+        assert_eq!(
+            crate::CatalogFailure::classify(&error),
+            crate::CatalogFailureCode::AuthRequired
+        );
+        assert!(!error.to_string().contains("nvapi-"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_change_during_discovery_does_not_publish_the_old_catalog() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let selected = Arc::new(std::sync::Mutex::new("nvapi-first-fixture".to_owned()));
+        let source = selected.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, _, _) = read_request(&mut socket).await;
+                if path == "/v1/models" {
+                    *selected.lock().unwrap() = "nvapi-second-fixture".into();
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "application/json",
+                        r#"{"data":[{"id":"fixture/first"}]}"#,
+                    )
+                    .await;
+                } else {
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "application/json",
+                        r#"{"featured-models":[]}"#,
+                    )
+                    .await;
+                }
+            }
+        });
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(base)
+            .with_api_key_source(move || Ok(Some(source.lock().unwrap().clone())));
+        let error = harness.model_catalog(false).await.unwrap_err();
+        assert!(error.to_string().contains("credentials changed"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn credit_errors_are_actionable_and_do_not_expose_keys() {
+        let error = http_error(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"message":"No credit for nvapi-private-fixture-1234567890"}}"#,
+        );
+        assert!(error.contains("no inference credits"));
+        assert!(!error.contains("nvapi-private-fixture"));
+    }
+
     #[tokio::test]
     async fn streams_reasoning_text_usage_and_resumes_history() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1519,10 +1844,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let harness = NvidiaNimHarness::new()
-            .with_base_url(base.clone())
+            .with_base_url(format!("{base}/v1"))
+            .with_api_key_source(|| Ok(Some("nvapi-fixture-key-123456".into())))
             .with_store_root(tmp.path());
-        let mut request = run_request();
-        request.env.insert("NVIDIA_API_KEY".into(), "nvapi-fixture-key-123456".into());
+        let request = run_request();
         let (controls, steering, _interrupt, _turn) = run_controls();
         let mut stream = harness.run(request, controls).await.unwrap();
         let mut first = Vec::new();

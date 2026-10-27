@@ -105,6 +105,7 @@ pub struct RelayedCallback {
     pub location: Option<String>,
 }
 
+mod kilo;
 mod muse;
 mod nvidia_nim;
 mod oauth;
@@ -719,6 +720,8 @@ struct ProbeEndpoints {
     codex_usage: String,
     /// Grok's billing view (`/v1/billing?format=credits`).
     grok_usage: String,
+    /// Kilo Gateway's current personal/team credit balance.
+    kilo_balance: String,
     /// GitHub's REST root (`/user`, `/copilot_internal/user`).
     github_api: String,
     /// GitHub's OAuth root (`/login/device/code`, `/login/oauth/access_token`).
@@ -746,6 +749,7 @@ impl Default for ProbeEndpoints {
             claude_profile: CLAUDE_PROFILE_URL.into(),
             codex_usage: CODEX_USAGE_URL.into(),
             grok_usage: usage::GROK_USAGE_URL.into(),
+            kilo_balance: kilo::KILO_BALANCE_URL.into(),
             github_api: "https://api.github.com".into(),
             github_login: "https://github.com".into(),
             openai_auth: oauth::OPENAI_AUTH.into(),
@@ -3568,6 +3572,10 @@ impl crate::registry::RunEnvironment for AccountRunEnvironment {
     ) -> Result<(), String> {
         crate::registry::RunEnvironment::prepare(&self.muse, harness, request).await?;
         crate::registry::RunEnvironment::prepare(&self.nvidia_nim, harness, request).await
+    }
+
+    fn model_api_key(&self, harness: HarnessId) -> Result<Option<String>, String> {
+        crate::registry::RunEnvironment::model_api_key(&self.nvidia_nim, harness)
     }
 
     async fn credential(&self, harness: HarnessId) -> Option<String> {

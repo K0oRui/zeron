@@ -1,14 +1,10 @@
 //! Kilo Code — provider knowledge shared by the engine, the viewer client,
 //! and the desktop UI.
 //!
-//! The Kilo CLI (an opencode fork driven over its own ACP server, `kilo acp`)
-//! advertises its WHOLE gateway catalog on session setup: hundreds of model
-//! rows, most of which need paid credits, each labelled with the gateway's
-//! provider prefix. Zeron's picker keeps only the rows an account can run
-//! without buying credits and drops the redundant prefix. The rule lives here
-//! exactly once: the harness's discovery-side filter, the relay client's
-//! `normalize_models`, and the desktop picker's `normalize_model_rows` all
-//! apply it identically (each previously carried its own copy, free to drift).
+//! Kilo advertises a gateway catalog alongside independently authenticated
+//! providers. The engine filters gateway rows using the current account's
+//! balance; clients must not apply an unconditional free-only filter, which
+//! would hide funded models after the engine has already authorized them.
 
 /// Label prefix on every Kilo gateway row (`Kilo Gateway/Auto Free`). The
 /// picker already sits under the Kilo harness, so the prefix is noise.
@@ -38,34 +34,24 @@ pub fn strip_gateway_label(label: &str) -> &str {
     label.strip_prefix(GATEWAY_LABEL_PREFIX).unwrap_or(label)
 }
 
-/// Keep only the free gateway rows — or, when the rule matches nothing (the
-/// gateway renamed its free tier), keep the list as-is rather than showing an
-/// empty picker. `is_free` is normally [`gateway_model_is_free`] adapted to
-/// the caller's model type:
+/// Apply a confirmed balance to a catalog. Positive or unknown balances keep
+/// the full catalog. Zero/negative balances keep ONLY models available without
+/// gateway credits (including independently authenticated upstream providers).
+/// An empty result is intentional: never substitute paid rows when there is
+/// no money just because no free rows matched.
 ///
-/// ```
-/// struct Row { id: String, label: String }
-/// let rows = vec![
-///     Row { id: "kilo/kilo-auto/free".into(), label: "Kilo Gateway/Auto Free".into() },
-///     Row { id: "kilo/anthropic/claude-sonnet-5".into(), label: "Kilo Gateway/Claude Sonnet 5".into() },
-/// ];
-/// let kept = zeron_proto::kilo::keep_free_or_all(rows, |row| {
-///     zeron_proto::kilo::gateway_model_is_free(&row.id, &row.label)
-/// });
-/// assert_eq!(kept.len(), 1);
-/// assert_eq!(kept[0].id, "kilo/kilo-auto/free");
-/// ```
-pub fn keep_free_or_all<T>(rows: Vec<T>, is_free: impl Fn(&T) -> bool) -> Vec<T> {
-    let mut free = Vec::new();
-    let mut paid = Vec::new();
-    for row in rows {
-        if is_free(&row) {
-            free.push(row);
-        } else {
-            paid.push(row);
-        }
+/// `None` means the provider could not report a balance, NOT a zero balance.
+/// An anonymous gateway account can be passed as `Some(0.0)`.
+pub fn models_for_balance<T>(
+    rows: Vec<T>,
+    balance: Option<f64>,
+    available_without_credits: impl Fn(&T) -> bool,
+) -> Vec<T> {
+    if balance.is_some_and(|balance| balance.is_finite() && balance <= 0.0) {
+        rows.into_iter().filter(available_without_credits).collect()
+    } else {
+        rows
     }
-    if free.is_empty() { paid } else { free }
 }
 
 #[cfg(test)]
@@ -107,28 +93,33 @@ mod tests {
     }
 
     #[test]
-    fn keep_free_or_all_never_empties_a_non_empty_list() {
-        struct Row {
-            id: &'static str,
-            label: &'static str,
+    fn funded_and_unknown_balances_keep_all_models() {
+        for balance in [Some(0.01), Some(10.0), None, Some(f64::NAN)] {
+            assert_eq!(
+                models_for_balance(vec!["free", "paid"], balance, |row| *row == "free"),
+                vec!["free", "paid"]
+            );
         }
-        let rows = || {
-            vec![
-                Row { id: "kilo/kilo-auto/free", label: "Kilo Gateway/Auto Free" },
-                Row { id: "kilo/anthropic/claude-sonnet-5", label: "Kilo Gateway/Claude Sonnet 5" },
-            ]
-        };
-        let kept =
-            keep_free_or_all(rows(), |row| gateway_model_is_free(row.id, row.label));
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].id, "kilo/kilo-auto/free");
+    }
 
-        // No free row matches (a renamed free tier): the paid list is shown
-        // whole rather than an empty picker.
-        let paid_only = keep_free_or_all(
-            vec![Row { id: "kilo/anthropic/claude-sonnet-5", label: "Kilo Gateway/Claude Sonnet 5" }],
-            |row| gateway_model_is_free(row.id, row.label),
+    #[test]
+    fn empty_balances_never_fall_back_to_paid_models() {
+        for balance in [0.0, -1.0] {
+            assert_eq!(
+                models_for_balance(vec!["free", "paid"], Some(balance), |row| *row == "free"),
+                vec!["free"]
+            );
+            assert!(models_for_balance(vec!["paid"], Some(balance), |_| false).is_empty());
+        }
+    }
+
+    #[test]
+    fn gateway_balance_does_not_hide_independent_providers() {
+        let kept = models_for_balance(
+            vec!["kilo/router/free", "kilo/paid", "openai/gpt"],
+            Some(0.0),
+            |id| !id.starts_with("kilo/") || gateway_model_is_free(id, ""),
         );
-        assert_eq!(paid_only.len(), 1);
+        assert_eq!(kept, vec!["kilo/router/free", "openai/gpt"]);
     }
 }

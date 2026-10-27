@@ -142,6 +142,13 @@ impl crate::registry::RunEnvironment for NvidiaNimRunEnvironment {
         Ok(())
     }
 
+    fn model_api_key(&self, harness: HarnessId) -> Result<Option<String>, String> {
+        if harness != HarnessId::NvidiaNim {
+            return Ok(None);
+        }
+        self.0.nvidia_nim_run_env().map(|(key, _)| key)
+    }
+
     async fn credential(&self, harness: HarnessId) -> Option<String> {
         if harness != HarnessId::NvidiaNim {
             return None;
@@ -254,6 +261,11 @@ mod tests {
         let mut run = request();
         env.prepare(HarnessId::NvidiaNim, &mut run).await.unwrap();
         assert_eq!(run.env["NVIDIA_API_KEY"], first);
+        assert_eq!(
+            env.model_api_key(HarnessId::NvidiaNim).unwrap().as_deref(),
+            Some(first)
+        );
+        assert_eq!(env.model_api_key(HarnessId::Codex).unwrap(), None);
         let before = env.credential(HarnessId::NvidiaNim).await.unwrap();
         assert!(!before.contains(first));
 
@@ -271,6 +283,10 @@ mod tests {
         let mut run = request();
         env.prepare(HarnessId::NvidiaNim, &mut run).await.unwrap();
         assert_eq!(run.env["NVIDIA_API_KEY"], second);
+        assert_eq!(
+            env.model_api_key(HarnessId::NvidiaNim).unwrap().as_deref(),
+            Some(second)
+        );
 
         let snapshot = accounts
             .forget(HarnessId::NvidiaNim, &rows[1].id)

@@ -93,8 +93,9 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
         ),
         HarnessId::NvidiaNim => Some(
-            "Connect an API key from NVIDIA API Catalog. Model availability and charges depend \
-             on your NVIDIA account; Zeron does not label inventory entries as free.",
+            "Connect an API key from NVIDIA API Catalog. The model list uses your selected key. \
+             NVIDIA's inventory does not report prices or account balances, so unpriced models \
+             are not labeled as free.",
         ),
         _ => None,
     }

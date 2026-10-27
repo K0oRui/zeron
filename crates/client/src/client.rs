@@ -1367,14 +1367,17 @@ impl Client {
                             .map_err(|e| ClientError::HostError(e.to_string()))
                     });
                 match reply {
-                    Ok(list) if !list.is_empty() => {
+                    // A successful empty reply can mean no free models are
+                    // available at the current balance. Never revive paid
+                    // rows from a previously funded account's cache.
+                    Ok(list) => {
                         let list = catalog::normalize_models(harness, list);
                         cache.put_models(device_id, harness, &list);
                         // Rows and chips pick up newly learned model labels.
                         self.inner.recompute_workspace();
                         list
                     }
-                    _ => match cache.models(device_id, harness) {
+                    Err(_) => match cache.models(device_id, harness) {
                         Some(list) => {
                             catalog::learn_labels(harness, &list);
                             list

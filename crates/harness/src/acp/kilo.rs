@@ -6,13 +6,13 @@
 //!
 //! Everything Kilo-specific about the provider lives here: the ACP spec, the
 //! install/skill paths, the discovery budget, the gateway-catalog curation
-//! (free rows only, prefix stripped — the rule itself is shared via
-//! [`zeron_proto::kilo`]) and the Windows stdin-nudge workaround.
+//! (prefix stripped; balance filtering happens at the engine's RPC boundary)
+//! and the Windows stdin-nudge workaround.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use zeron_proto::kilo::{gateway_model_is_free, keep_free_or_all, strip_gateway_label};
+use zeron_proto::kilo::strip_gateway_label;
 use zeron_proto::{HarnessId, Model, ReasoningLevel, SteeringMode};
 
 use super::{AcpAgentSpec, default_effort_values, identity_transform};
@@ -111,11 +111,10 @@ fn fallback_rows() -> Vec<Model> {
     }]
 }
 
-/// The live gateway catalog the way the picker shows it: only the rows an
-/// account runs without buying credits (never an empty list — see
-/// [`keep_free_or_all`]), each label freed of its redundant gateway prefix.
-pub(super) fn curate_gateway_rows(rows: Vec<Model>) -> Vec<Model> {
-    let mut rows = keep_free_or_all(rows, |row| gateway_model_is_free(&row.id, &row.label));
+/// Keep the entire advertised catalog in the credential-scoped cache. A
+/// balance can change without changing credentials; the engine applies it
+/// after loading live, cached OR fallback rows, never before persistence.
+pub(super) fn curate_gateway_rows(mut rows: Vec<Model>) -> Vec<Model> {
     for row in &mut rows {
         row.label = strip_gateway_label(&row.label).to_owned();
     }
@@ -187,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_rows_keep_the_free_ones_and_drop_the_prefix() {
+    fn gateway_rows_keep_all_models_and_drop_the_prefix() {
         let row = |id: &str, label: &str| Model {
             id: id.into(),
             label: label.into(),
@@ -209,16 +208,26 @@ mod tests {
         ]);
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["kilo/kilo-auto/free", "kilo/nvidia/nemotron-3-super-120b-a12b:free"]
+            vec![
+                "kilo/kilo-auto/free",
+                "kilo/nvidia/nemotron-3-super-120b-a12b:free",
+                "kilo/anthropic/claude-sonnet-5",
+                "kilo/freeform/model"
+            ]
         );
         assert_eq!(
             models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            vec!["Auto Free", "NVIDIA: Nemotron 3 Super (free)"]
+            vec![
+                "Auto Free",
+                "NVIDIA: Nemotron 3 Super (free)",
+                "Anthropic: Claude Sonnet 5",
+                "Freeform"
+            ]
         );
     }
 
     #[test]
-    fn a_renamed_free_tier_never_empties_the_picker() {
+    fn discovery_does_not_make_a_balance_decision() {
         let row = |id: &str, label: &str| Model {
             id: id.into(),
             label: label.into(),
