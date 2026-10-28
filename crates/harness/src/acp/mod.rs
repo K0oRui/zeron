@@ -64,7 +64,7 @@ use crate::{
     CancellationToken, Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child,
 };
 use child::Child;
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{map_update, notice_events, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
 
@@ -96,11 +96,6 @@ struct AcpAgentSpec {
     env_override: &'static str,
     /// Arguments that put the binary in ACP-serving mode.
     args: &'static [&'static str],
-    /// Pinned npm package (`name@version`) installed ONCE into the managed
-    /// adapters dir when the binary isn't already present — the launch then
-    /// spawns `node <entry>` directly, keeping npm (and every way a user's
-    /// npm state can break) out of chat turns. See [`crate::adapter_install`].
-    npm_package: Option<&'static str>,
     /// pinned release archive for this platform, installed once into the
     /// managed adapters dir when the binary isn't already present. See
     /// [`crate::archive_install`].
@@ -109,9 +104,9 @@ struct AcpAgentSpec {
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
     /// means to the user. Distinct from `executable` where the spawned adapter
-    /// wraps the CLI (third-party ACP adapters), and the npx
-    /// fallback deliberately doesn't count: npx can fetch an adapter on
-    /// demand, but an absent CLI still means no logins/config to drive.
+    /// wraps the CLI (third-party ACP adapters); an adapter that can be
+    /// fetched on demand still doesn't count, because an absent CLI means no
+    /// logins/config to drive.
     cli_executable: &'static str,
     /// Extra install locations probed for [`Self::cli_executable`].
     cli_extra_paths: fn() -> Vec<PathBuf>,
@@ -209,9 +204,18 @@ fn devin_effort_values(
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    // `$GROK_HOME/bin` first: grok's own installer, its npm postinstall and
+    // its runtime bootstrap all put the binary there, and zeron already reads
+    // the login from `$GROK_HOME/auth.json` (see `agent_accounts::stores`).
+    if let Some(home) = std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        dirs.push(home.join("bin").join("grok"));
+    }
     if let Some(home) = crate::executable::home_dir() {
-        dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".grok").join("bin").join("grok"));
+        dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".npm-global").join("bin").join("grok"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/grok"));
@@ -234,46 +238,77 @@ fn grok_spec() -> AcpAgentSpec {
         display_name: "Grok",
         executable: "grok",
         env_override: "GROK_EXECUTABLE",
-        // Flag placement verified against grok 1.0.4: `--no-auto-update` is
-        // TOP-LEVEL (before the subcommand) and kills the launch-time update
-        // check (a silent multi-second network stall); `--no-leader` lives on
-        // the `agent` subcommand and starts a fresh agent even when
-        // `[cli] use_leader` is set — leader mode ATTACHES `agent stdio` to a
-        // shared process via ~/.grok/leader.sock, so a wedged/stale leader
-        // (the user's TUI) reads as total silent non-response in zeron.
+        // Flag placement verified against grok 1.0.4 and 1.0.70:
+        // `--no-auto-update` is TOP-LEVEL (before the subcommand) and kills
+        // the launch-time update check (a silent multi-second network stall);
+        // `--no-leader` lives on the `agent` subcommand and starts a fresh
+        // agent even when `[cli] use_leader` is set — leader mode ATTACHES
+        // `agent stdio` to a shared process via ~/.grok/leader.sock, so a
+        // wedged/stale leader (the user's TUI) reads as total silent
+        // non-response in zeron.
         args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
-        npm_package: Some("@xai-official/grok@1.0.4"),
+        // No managed install: `@xai-official/grok` is not an adapter, it IS
+        // the CLI, so a copy here would be a second full agent install (same
+        // reasoning as Kilo). Worse, the package is not self-contained — its
+        // postinstall writes `$GROK_HOME/bin/grok-<version>` and atomically
+        // swaps the canonical `$GROK_HOME/bin/grok` symlink, and its
+        // `bin/grok` launcher repeats that on first run — so zeron's private
+        // copy would silently rewrite the user's own install (and, being
+        // installed once behind an ok-marker, freeze it at whatever version
+        // shipped that day). Installation and upgrades belong to the CLI:
+        // [`crate::install`]'s Grok methods, `grok update`, or GROK_EXECUTABLE.
         archive: None,
         extra_paths: grok_install_paths,
         cli_executable: "grok",
         cli_extra_paths: grok_install_paths,
-        install_hint: "grok (searched PATH, the login shell's PATH, ~/.local/bin, \
-             ~/.grok/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
-             fnm/nvm/volta/pnpm/bun install dirs; install with \
+        install_hint: "grok (searched PATH, the login shell's PATH, $GROK_HOME/bin, \
+             ~/.local/bin, ~/.grok/bin, ~/.npm-global/bin, /opt/homebrew/bin, \
+             /usr/local/bin, and fnm/nvm/volta/pnpm/bun install dirs; install with \
              `curl -fsSL https://x.ai/cli/install.sh | bash` or \
              `npm install -g @xai-official/grok`; set GROK_EXECUTABLE to override)",
+        // The CLI's own catalog (1.0.70): grok-4.6 is the default and takes
+        // `xhigh`; grok-4.5's ladder stops at High. Discovery replaces these
+        // with whatever the agent advertises.
         models: || {
-            vec![Model {
-                id: "grok-4.5".into(),
-                label: "Grok 4.5".into(),
-                description: Some("xAI's coding model — 500k context".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                ],
-                options: Vec::new(),
-            }]
+            vec![
+                Model {
+                    id: "grok-4.6".into(),
+                    label: "Grok 4.6".into(),
+                    description: Some("xAI's frontier coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "grok-4.5".into(),
+                    label: "Grok 4.5".into(),
+                    description: Some("xAI's coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                    options: Vec::new(),
+                },
+            ]
         },
         // No `_session/steering` extension: a steer preempts the generation
         // (waiting out running tools) and continues the turn — immediate.
+        // `x.ai/session/interjection` is not this: it is a notification the
+        // agent PUSHES to its own UI, with no client-callable form.
         steering_mode: SteeringMode::StepBoundary,
         // Grok Build's advertised efforts (default high); applied through the
-        // session's `thought_level` config option.
+        // session's `reasoning_effort` config option (category
+        // `thought_level`). The default model offers xhigh.
         reasoning_levels: &[
             ReasoningLevel::Low,
             ReasoningLevel::Medium,
             ReasoningLevel::High,
+            ReasoningLevel::XHigh,
         ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
@@ -313,7 +348,6 @@ fn devin_spec() -> AcpAgentSpec {
         env_override: "DEVIN_EXECUTABLE",
         args: &["acp"],
         // Native ACP server — no adapter package in between.
-        npm_package: None,
         archive: None,
         extra_paths: devin_install_paths,
         cli_executable: "devin",
@@ -389,7 +423,6 @@ fn hermes_spec() -> AcpAgentSpec {
         env_override: "HERMES_EXECUTABLE",
         args: &["acp"],
         // Python/uv install — no npm fallback exists.
-        npm_package: None,
         archive: None,
         extra_paths: hermes_install_paths,
         cli_executable: "hermes",
@@ -1165,7 +1198,6 @@ fn antigravity_spec() -> AcpAgentSpec {
         } else {
             &[]
         },
-        npm_package: None,
         archive: antigravity_archive(),
         extra_paths: Vec::new,
         cli_executable: "agy_acp_server",
@@ -1257,53 +1289,10 @@ fn sign_in_url(line: &str) -> Option<String> {
     reqwest::Url::parse(url).ok().map(|url| url.to_string())
 }
 
-/// Background-install managed npm adapters for agents whose CLI is present
-/// on this device, so a first chat never pays (or trips over) an npm run.
-/// Skips agents whose adapter is already resolvable; failures are logged and
-/// retried on the next daemon start or blocking launch. A no-op outside a
-/// tokio runtime. Archive-distributed servers require explicit installation.
-pub fn prewarm_managed_adapters() {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    for spec in [grok_spec()] {
-        let Some(pkg) = spec.npm_package else {
-            continue;
-        };
-        let pin = crate::adapter_install::NpmPin::parse(pkg);
-        if find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
-            || crate::adapter_install::installed_entry(&pin, spec.executable).is_some()
-            || find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
-            || crate::adapter_install::find_npm().is_none()
-        {
-            continue;
-        }
-        let (bin_name, display_name) = (spec.executable, spec.display_name);
-        handle.spawn(async move {
-            match crate::adapter_install::ensure_installed(pin, bin_name, display_name).await {
-                Ok(entry) => tracing::info!(
-                    target: "zeron_harness::adapter_install",
-                    adapter = %entry.display(),
-                    "prewarmed {display_name} ACP adapter"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "zeron_harness::adapter_install",
-                    "prewarm of the {display_name} ACP adapter failed: {e}"
-                ),
-            }
-        });
-    }
-}
-
-/// A resolved launch: a concrete program, or a managed npm adapter that may
-/// still need installing (see [`AcpHarness::resolve_program`]).
+/// A resolved launch: a concrete program, or an installed archive (see
+/// [`AcpHarness::resolve_program`]).
 enum Launch {
     Program(PathBuf, Vec<String>),
-    Managed {
-        pin: crate::adapter_install::NpmPin,
-        bin_name: &'static str,
-        args: Vec<String>,
-    },
     Archive {
         entry: PathBuf,
         args: Vec<String>,
@@ -1316,7 +1305,7 @@ pub struct AcpHarness {
     spec: AcpAgentSpec,
     executable: Option<PathBuf>,
     /// Override of the agent's on-disk sessions root (grok's
-    /// `~/.grok/sessions`), where subagent transcripts are tailed from.
+    /// `$GROK_HOME/sessions`), where subagent transcripts are tailed from.
     sessions_root: Option<PathBuf>,
     /// Grace between `session/cancel` and SIGTERM.
     interrupt_grace: Duration,
@@ -1621,27 +1610,19 @@ impl AcpHarness {
         self
     }
 
-    /// Test seam: the program `run` would spawn (the adapter binary, or —
-    /// for a managed npm adapter — its installed entry, else npm as the
-    /// installer that would run first).
+    /// Test seam: the program `run` would spawn (the adapter binary, or an
+    /// installed archive's entry).
     #[doc(hidden)]
     pub fn launch_program(&self) -> Result<PathBuf, HarnessError> {
         match self.resolve_launch()? {
             Launch::Program(program, _) => Ok(program),
-            Launch::Managed { pin, bin_name, .. } => {
-                match crate::adapter_install::installed_entry(&pin, bin_name) {
-                    Some(entry) => Ok(entry),
-                    None => crate::adapter_install::find_npm()
-                        .ok_or_else(|| HarnessError::NotInstalled(self.spec.install_hint.into())),
-                }
-            }
             Launch::Archive { entry, .. } => Ok(entry),
         }
     }
 
-    /// Resolve what to spawn: an explicit/installed adapter binary, or the
-    /// managed install of the spec's pinned npm package. `NotInstalled` only
-    /// when neither the binary nor the machinery to install it (npm) exists.
+    /// Resolve what to spawn: an explicit override, a binary on the install
+    /// paths, or an already-installed release archive. `NotInstalled` (with
+    /// the spec's install hint) when there is nothing to spawn.
     fn find_server(&self) -> Option<PathBuf> {
         find_on_paths(self.spec.executable, (self.spec.extra_paths)()).or_else(|| {
             if self.spec.id == HarnessId::Antigravity {
@@ -1676,18 +1657,6 @@ impl AcpHarness {
         if let Some(found) = self.find_server() {
             return Ok(Launch::Program(found, spec_args));
         }
-        if let Some(pkg) = self.spec.npm_package {
-            let pin = crate::adapter_install::NpmPin::parse(pkg);
-            if crate::adapter_install::installed_entry(&pin, self.spec.executable).is_some()
-                || crate::adapter_install::find_npm().is_some()
-            {
-                return Ok(Launch::Managed {
-                    pin,
-                    bin_name: self.spec.executable,
-                    args: spec_args,
-                });
-            }
-        }
         if self.spec.archive.is_some() {
             let entry = self
                 .installed_archive_entry()
@@ -1700,69 +1669,25 @@ impl AcpHarness {
         Err(HarnessError::NotInstalled(self.spec.install_hint.into()))
     }
 
-    /// Resolve to a concrete (program, args), running the managed install if
-    /// it hasn't completed yet. `block_on_install: false` (discovery paths)
-    /// never waits on npm: it kicks the install in the background and errors
-    /// out, so a picker open falls back to the static catalog instead of
-    /// stalling for however long a 500MB dependency tree takes to land.
-    /// Resolve the server, optionally waiting for its managed installation.
+    /// Resolve to a concrete (program, args). `block_on_install` is kept for
+    /// the callers that distinguish discovery from a launch; nothing waits on
+    /// an installer here any more.
     #[doc(hidden)]
     pub async fn resolve_program(
         &self,
-        block_on_install: bool,
+        _block_on_install: bool,
     ) -> Result<(PathBuf, Vec<String>), HarnessError> {
         match self.resolve_launch()? {
             Launch::Program(program, args) => Ok((program, args)),
-            Launch::Managed {
-                pin,
-                bin_name,
-                args,
-            } => {
-                let entry = match crate::adapter_install::installed_entry(&pin, bin_name) {
-                    Some(entry) => entry,
-                    None if block_on_install => {
-                        crate::adapter_install::ensure_installed(
-                            pin,
-                            bin_name,
-                            self.spec.display_name,
-                        )
-                        .await?
-                    }
-                    None => {
-                        let display_name = self.spec.display_name;
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::adapter_install::ensure_installed(
-                                pin,
-                                bin_name,
-                                display_name,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    target: "zeron_harness::adapter_install",
-                                    "background adapter install failed: {e}"
-                                );
-                            }
-                        });
-                        return Err(HarnessError::Protocol(format!(
-                            "{} adapter is installing in the background",
-                            self.spec.display_name
-                        )));
-                    }
-                };
-                let (program, mut node_args) = crate::adapter_install::launch_for_entry(&entry)?;
-                node_args.extend(args);
-                Ok((program, node_args))
-            }
             Launch::Archive { entry, args } => Ok((entry, args)),
         }
     }
 
     /// The agent's own CLI running `args` (`grok login`, `hermes auth add`),
     /// resolved exactly as a launch resolves it — the env override, PATH, the
-    /// login shell, install dirs, the managed npm install — minus the ACP
-    /// server arguments. Only meaningful for agents whose server IS their CLI
-    /// (Grok, Devin, Hermes); Pi's server is a separate adapter.
+    /// login shell and install dirs — minus the ACP server arguments. Only
+    /// meaningful for agents whose server IS their CLI (Grok, Devin, Hermes);
+    /// Pi's server is a separate adapter.
     pub async fn cli_command(&self, args: &[&str]) -> Result<Command, HarnessError> {
         let (exe, mut launch_args) = self.resolve_program(false).await?;
         let prefix = launch_args.len().saturating_sub(self.spec.args.len());
@@ -1973,14 +1898,42 @@ impl AcpHarness {
         // server request left unanswered can stall the agent. Drain it.
         let drain = tokio::spawn(drain_discovery_incoming(client.clone(), incoming));
         let discovery = async {
-            client
+            let initialized = client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
+            // Agents that publish their catalog in the HANDSHAKE (grok 1.0.70:
+            // `_meta.modelState`, same {currentModelId, availableModels} shape
+            // as the legacy session field) still describe it when the session
+            // cannot be opened — a signed-out CLI, a cwd it rejects. Keep it
+            // as the fallback so the picker shows the real release catalog
+            // instead of the static rows.
+            let handshake_models = initialized
+                .get("_meta")
+                .and_then(|meta| meta.get("modelState"))
+                .cloned();
             let cwd = crate::executable::home_or_current_dir();
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
-                .await?;
-            let mut models = models_from_session(&session, &(self.spec.models)());
+                .await;
+            let mut models = match &session {
+                Ok(session) => models_from_session(session, &(self.spec.models)()),
+                Err(_) => Vec::new(),
+            };
+            if models.is_empty()
+                && let Some(state) = &handshake_models
+            {
+                models = models_from_session(
+                    &json!({ "models": state }),
+                    &(self.spec.models)(),
+                );
+            }
+            if models.is_empty() {
+                // Nothing advertised anywhere: surface the session's own
+                // failure (auth, cwd) rather than an empty catalog, so the
+                // caller can classify it and fall back deliberately.
+                session?;
+                return Ok(models);
+            }
             if self.spec.id == HarnessId::Kilo {
                 models = kilo::curate_gateway_rows(models);
             }
@@ -2075,6 +2028,39 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .iter()
         .filter_map(trait_from_config_option)
         .collect();
+    // Per-model ladders, when the agent states them (grok 1.0.70 hangs
+    // `_meta.reasoningEfforts[].value` off each `availableModels` entry).
+    // These beat both the session-wide `thought_level` option — which only
+    // describes the CURRENT model, so every other row would inherit its
+    // ladder — and the static catalog, which is a snapshot of one CLI
+    // release and must never shadow a narrower wire ladder.
+    let mut per_model_ladders: std::collections::HashMap<String, Vec<ReasoningLevel>> =
+        std::collections::HashMap::new();
+    for entry in session_response
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = entry.get("modelId").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut levels: Vec<ReasoningLevel> = entry
+            .get("_meta")
+            .and_then(|m| m.get("reasoningEfforts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|effort| effort.get("value").and_then(Value::as_str))
+            .filter_map(reasoning_from_value)
+            .collect();
+        levels.sort_unstable();
+        levels.dedup();
+        if !levels.is_empty() {
+            per_model_ladders.insert(norm_id(id), levels);
+        }
+    }
 
     let exact = |id: &str| catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
     // Family-alias catalog row: the claude adapter advertises bare aliases
@@ -2110,10 +2096,15 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .and_then(|m| m.description.clone())
                 .or_else(|| description.map(str::to_owned))
                 .or_else(|| known.and_then(|m| m.description.clone())),
-            reasoning_levels: match known.filter(|m| !m.reasoning_levels.is_empty()) {
-                Some(m) => m.reasoning_levels.clone(),
-                None => ladder.clone(),
-            },
+            reasoning_levels: per_model_ladders
+                .get(&norm_id(id))
+                .cloned()
+                .or_else(|| {
+                    known
+                        .filter(|m| !m.reasoning_levels.is_empty())
+                        .map(|m| m.reasoning_levels.clone())
+                })
+                .unwrap_or_else(|| ladder.clone()),
             options,
         }
     };
@@ -2313,9 +2304,10 @@ impl Harness for AcpHarness {
     }
 
     /// The agent's own CLI, not the adapter: `claude` counts as installed even
-    /// when `claude-agent-acp` would arrive via npx, and an npx-reachable
-    /// adapter does NOT count when the CLI itself is missing. Explicit
-    /// executables (tests, `*_EXECUTABLE` overrides) always count.
+    /// when `claude-agent-acp` is what actually launches, and an adapter that
+    /// could be fetched on demand does NOT count when the CLI itself is
+    /// missing. Explicit executables (tests, `*_EXECUTABLE` overrides) always
+    /// count.
     fn installed(&self) -> bool {
         // Overrides go through the same validation as `resolve_launch`, so an
         // override that points at nothing reports not-installed instead of an
@@ -2343,7 +2335,6 @@ impl Harness for AcpHarness {
             return match self.resolve_launch().ok()? {
                 Launch::Program(program, _) => Some(program),
                 Launch::Archive { entry, .. } => Some(entry),
-                Launch::Managed { .. } => None,
             };
         }
         // Version checks and updates target the agent CLI when its transport differs.
@@ -2364,10 +2355,6 @@ impl Harness for AcpHarness {
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
         let binary = match self.resolve_launch()? {
             Launch::Program(path, _) => path,
-            Launch::Managed { pin, bin_name, .. } => {
-                crate::adapter_install::installed_entry(&pin, bin_name)
-                    .unwrap_or_else(|| PathBuf::from(format!("{}@{}", pin.name, pin.version)))
-            }
             Launch::Archive { entry, .. } => entry,
         };
         let extra = if self.id() == HarnessId::Antigravity {
@@ -3086,10 +3073,14 @@ impl SubagentObserver {
 
 /// The events of one notification, session-filtered. `session/update` maps
 /// per [`map_update`]; `_x.ai/session_notification` is grok's extension
-/// channel — same `{sessionId, update}` envelope, but its updates (the
-/// `subagent_*` lifecycle) render nothing directly. The subagent tracker sees
-/// both first (spawn/finished correlation + transcript tails); its tagged
-/// events flow from its own tasks, not this return value.
+/// channel — same `{sessionId, update}` envelope. Most of what it carries is
+/// lifecycle (`subagent_*`, `turn_completed`, `last_turn_summary`) and renders
+/// nothing, but `retry_state` and the compaction notices are exactly what the
+/// user needs to see (a silent 15-attempt retry streak reads as a frozen
+/// run), so it goes through [`notice_events`] like the unknown
+/// `session/update` kinds. The subagent tracker sees both first
+/// (spawn/finished correlation + transcript tails); its tagged events flow
+/// from its own tasks, not this return value.
 fn session_update_events(
     method: &str,
     params: &Value,
@@ -3110,7 +3101,7 @@ fn session_update_events(
         },
         "_x.ai/session_notification" => {
             subagents.observe(update);
-            Vec::new()
+            notice_events(update)
         }
         _ => Vec::new(),
     }
@@ -3641,10 +3632,12 @@ async fn open_session(
 }
 
 /// The sign-in a run may perform on its own after auth_required: the method
-/// the agent itself names as its default (`_meta.defaultAuthMethodId` — Grok's
-/// `cached_token`, which re-reads its stored login). Not just any advertised
-/// method: the others open a browser sign-in nobody is watching. `Err` names
-/// the kind of a method that cannot run here at all (terminal, env var).
+/// the agent itself names as its default (`_meta.defaultAuthMethodId` — for
+/// Grok that is `xai.api_key` when `XAI_API_KEY` is set, and null otherwise,
+/// since 1.0.70 dropped the old `cached_token` default in favour of the single
+/// `grok.com` browser method). Not just any advertised method: the others open
+/// a browser sign-in nobody is watching. `Err` names the kind of a method that
+/// cannot run here at all (terminal, env var).
 fn run_auth_method(init: &Value) -> Result<Option<String>, String> {
     let Some(default) = init["_meta"]["defaultAuthMethodId"].as_str() else {
         return Ok(None);
@@ -6280,15 +6273,22 @@ mod tests {
 
     #[test]
     fn a_run_signs_in_only_with_the_agents_own_default_method() {
-        // Grok 1.0.46's initialize.
+        // Grok 1.0.70 with XAI_API_KEY set (it advertises `xai.api_key` and
+        // names it the default). Signed out it advertises only `grok.com` and
+        // sends a null default — no self sign-in (asserted below).
         let grok = json!({
             "authMethods": [
-                { "id": "cached_token", "name": "cached_token" },
+                { "id": "xai.api_key", "name": "API key" },
                 { "id": "grok.com", "name": "Grok" },
             ],
-            "_meta": { "defaultAuthMethodId": "cached_token" },
+            "_meta": { "defaultAuthMethodId": "xai.api_key" },
         });
-        assert_eq!(run_auth_method(&grok), Ok(Some("cached_token".into())));
+        assert_eq!(run_auth_method(&grok), Ok(Some("xai.api_key".into())));
+        let signed_out = json!({
+            "authMethods": [{ "id": "grok.com", "name": "Grok" }],
+            "_meta": { "defaultAuthMethodId": null },
+        });
+        assert_eq!(run_auth_method(&signed_out), Ok(None));
         // Devin advertises only a browser login and names no default.
         let devin = json!({
             "authMethods": [{ "id": "devin-browser", "name": "Log in with browser" }],
@@ -6566,6 +6566,10 @@ mod tests {
 
     #[test]
     fn grok_thought_levels_order_from_lowest_to_highest() {
+        // Synthetic ids (a catalog newer than the static rows): the point is
+        // that the session's `thought_level` order is normalized ascending and
+        // that each row's ladder comes from the static catalog when it knows
+        // the id, else from the session option.
         let response = json!({
             "sessionId": "s-1",
             "configOptions": [
@@ -6745,6 +6749,86 @@ mod tests {
         });
         let models = models_from_session(&foreign, &crate::claude::catalog::static_models());
         assert_eq!(models[0].label, "Opus 9 Mini");
+    }
+
+    /// grok 1.0.70 publishes its catalog twice with the same shape: in
+    /// `initialize._meta.modelState` (available before/without a session) and
+    /// in `session/new`. Discovery feeds the handshake copy through the same
+    /// parser (`{"models": <modelState>}`), and the per-model
+    /// `_meta.reasoningEfforts` ladders must survive the trip — the session's
+    /// own `thought_level` option only describes the CURRENT model.
+    #[test]
+    fn grok_handshake_model_state_carries_the_real_catalog_and_ladders() {
+        let state = json!({
+            "currentModelId": "grok-4.6",
+            "availableModels": [
+                {
+                    "modelId": "grok-4.6",
+                    "name": "Grok 4.6",
+                    "description": "SpaceXAI's latest frontier model",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "supportsReasoningEffort": true,
+                        "reasoningEffort": "high",
+                        "reasoningEfforts": [
+                            { "id": "xhigh", "value": "xhigh", "default": false },
+                            { "id": "high", "value": "high", "default": true },
+                            { "id": "medium", "value": "medium", "default": false },
+                            { "id": "low", "value": "low", "default": false },
+                        ],
+                    },
+                },
+                {
+                    "modelId": "grok-4.5",
+                    "name": "Grok 4.5",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "reasoningEfforts": [
+                            { "id": "high", "value": "high", "default": true },
+                            { "id": "medium", "value": "medium", "default": false },
+                            { "id": "low", "value": "low", "default": false },
+                        ],
+                    },
+                },
+            ],
+        });
+        let models = models_from_session(&json!({ "models": state }), &(grok_spec().models)());
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+            ]
+        );
+        assert_eq!(
+            models[1].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ]
+        );
+        // A wire ladder that is NARROWER than the static row must win: the
+        // static catalog is a snapshot, the wire is this CLI.
+        let narrowed = json!({
+            "currentModelId": "grok-4.6",
+            "availableModels": [{
+                "modelId": "grok-4.6",
+                "name": "Grok 4.6",
+                "_meta": { "reasoningEfforts": [{ "value": "high" }, { "value": "low" }] },
+            }],
+        });
+        let models = models_from_session(&json!({ "models": narrowed }), &(grok_spec().models)());
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::High]
+        );
     }
 
     #[test]

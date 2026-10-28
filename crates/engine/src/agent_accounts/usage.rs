@@ -3,7 +3,7 @@
 //! [`ProbeError`] classification and backoff as the original providers.
 //!
 //! - **Grok**: `GET cli-chat-proxy.grok.com/v1/billing?format=credits`
-//!   (`/usage` in the CLI) — the Grok Build share of the current period.
+//!   (`creditUsagePercent` for the current period, named by the window).
 //!   Only a 401/403 refreshes, and only a SAVED slot (OIDC `refresh_token`
 //!   grant against the entry's own issuer, single-flight); the live token is
 //!   the CLI's to rotate.
@@ -348,45 +348,53 @@ impl AgentAccounts {
     }
 }
 
-/// Grok's `/billing?format=credits`: the current period, with the Grok Build
-/// product's share of it (the blended `creditUsagePercent` as fallback).
-/// Proto3 omits zero scalars, so a fresh period can arrive without either
-/// field: a valid `currentPeriod` there means zero used, not schema drift.
+/// Grok's `/billing?format=credits`: one window for the current billing
+/// period, from the account's `creditUsagePercent`, with on-demand spend as
+/// the fallback when there is no credit allowance. Proto3 omits zero scalars,
+/// so a fresh period can arrive without either field: a valid `currentPeriod`
+/// there means zero used, not schema drift.
+///
+/// 1.0.70's `BillingConfig` has no `productUsage[]` and no
+/// `currentPeriod.type` — the old Grok-Build-share branch and the
+/// `USAGE_PERIOD_TYPE_*` labels could never fire, which left every meter
+/// labelled "Period". The window is now named from its own start/end.
 pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapshot> {
     let config = body.get("config")?;
     let period = config.get("currentPeriod");
-    let product_percent = config
-        .get("productUsage")
-        .and_then(|u| u.as_array())
-        .and_then(|products| {
-            products
-                .iter()
-                .find(|p| p.get("product").and_then(|v| v.as_str()) == Some("GrokBuild"))
-                // An omitted percentage on a present product is zero (proto3).
-                .map(|p| p.get("usagePercent").and_then(json_f64).unwrap_or(0.0))
-        });
-    let used_percent = product_percent
-        .or_else(|| config.get("creditUsagePercent").and_then(json_f64))
+    let used_percent = config
+        .get("creditUsagePercent")
+        .and_then(json_f64)
         .or_else(|| on_demand_percent(config))
         .or_else(|| period.is_some().then_some(0.0))?;
-    let label = match period.and_then(|p| p.get("type")).and_then(|v| v.as_str()) {
-        Some("USAGE_PERIOD_TYPE_DAILY") => "Day",
-        Some("USAGE_PERIOD_TYPE_WEEKLY") => "Week",
-        Some("USAGE_PERIOD_TYPE_MONTHLY") => "Month",
-        _ => "Period",
-    };
+    let start = parse_when(period.and_then(|p| p.get("start")))
+        .or_else(|| parse_when(config.get("billingPeriodStart")));
+    let resets_at = parse_when(period.and_then(|p| p.get("end")));
     Some(UsageSnapshot {
         windows: vec![AgentUsageWindow {
-            label: label.to_string(),
+            label: grok_period_label(start, resets_at).to_string(),
+            // A percentage on the 0–100 scale the name promises (the caps
+            // beside it are money objects, not fractions).
             used_fraction: (used_percent.clamp(0.0, 100.0) / 100.0) as f32,
-            resets_at: parse_when(
-                period
-                    .and_then(|p| p.get("end"))
-                    .or_else(|| config.get("billingPeriodEnd")),
-            ),
+            resets_at,
         }],
         plan_label: None,
     })
+}
+
+/// Name the meter after the period it describes. The billing window is the
+/// only signal 1.0.70 gives (a `{start, end}` pair), so its length decides:
+/// day, week, month, and "Period" when the window is unknown.
+fn grok_period_label(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> &'static str {
+    const HOUR: i64 = 60 * 60;
+    match (start, end) {
+        (Some(start), Some(end)) => match (end - start).num_seconds() {
+            secs if secs <= 36 * HOUR => "Day",
+            secs if secs <= 8 * 24 * HOUR => "Week",
+            secs if secs <= 32 * 24 * HOUR => "Month",
+            _ => "Period",
+        },
+        _ => "Period",
+    }
 }
 
 /// `onDemandUsed / onDemandCap` when the account has an on-demand allowance.

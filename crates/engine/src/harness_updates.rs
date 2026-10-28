@@ -73,7 +73,11 @@ enum LatestSource {
         repository: &'static str,
         tag_prefix: &'static str,
     },
-    Command(&'static [&'static str]),
+    /// `grok update --check --json`: a `{currentVersion, latestVersion,
+    /// updateAvailable, error}` record. The plain `--check` form prints a
+    /// version banner and exits 0 even when the check FAILED, so its stdout
+    /// cannot be trusted (the JSON form says so in `error`).
+    GrokUpdateCheck,
     Hermes,
     /// Muse's release channel manifest (see [`MUSE_CHANNELS`]).
     Muse,
@@ -353,7 +357,7 @@ fn provider(id: HarnessId) -> ProviderSpec {
         },
         HarnessId::Grok => ProviderSpec {
             version_args: &["version"],
-            latest: LatestSource::Command(&["update", "--check"]),
+            latest: LatestSource::GrokUpdateCheck,
             update_args: Some(&["update"]),
             manual_command: "grok update",
         },
@@ -1112,16 +1116,17 @@ impl HarnessUpdateCoordinator {
                 .github_latest(repository, tag_prefix)
                 .await
                 .map(UpdateCheck::Version),
-            LatestSource::Command(args) => {
+            LatestSource::GrokUpdateCheck => {
                 let lease = self.inner.registry.execution_lease(harness).await;
-                let result = run_command_output(&executable, args, COMMAND_TIMEOUT)
-                    .await
-                    .and_then(|output| {
-                        extract_latest_version(&output)
-                            .ok_or_else(|| "command returned no recognizable version".into())
-                    });
+                let result = run_command_output(
+                    &executable,
+                    &["update", "--check", "--json"],
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .and_then(|output| parse_grok_update_check(&output));
                 drop(lease);
-                result.map(UpdateCheck::Version)
+                result
             }
             LatestSource::Hermes => {
                 let lease = self.inner.registry.execution_lease(harness).await;
@@ -1341,7 +1346,7 @@ impl HarnessUpdateCoordinator {
             LatestSource::AntigravityAcp => self.antigravity_acp_latest().await,
             LatestSource::Muse => self.muse_latest().await,
             LatestSource::Claude
-            | LatestSource::Command(_)
+            | LatestSource::GrokUpdateCheck
             | LatestSource::Hermes
             | LatestSource::Manual => Err("no separate upstream feed".into()),
         }
@@ -2965,10 +2970,30 @@ fn installed_version(harness: HarnessId, output: &str) -> Option<String> {
     extract_version(output)
 }
 
-/// Update checks name the installed release before the candidate
-/// (`available: 1.0.4 -> 1.0.41`), so the release is the final version.
-fn extract_latest_version(text: &str) -> Option<String> {
-    version_tokens(text).last()
+/// `grok update --check --json` → the release now published.
+///
+/// The record is authoritative in a way the plain text is not: grok prints its
+/// current-version banner and exits 0 even when the check failed, with the
+/// reason only in `error` (`updateAvailable: false, latestVersion: null`).
+/// Reading that as a version token would report a broken check as "up to
+/// date" — so an `error` here fails the check instead.
+fn parse_grok_update_check(text: &str) -> Result<UpdateCheck, String> {
+    let record: serde_json::Value =
+        serde_json::from_str(text.trim()).map_err(|_| "update check returned no JSON record")?;
+    if let Some(error) = record.get("error").and_then(|e| e.as_str())
+        && !error.is_empty()
+    {
+        return Err(format!("update check failed: {error}"));
+    }
+    match record
+        .get("latestVersion")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        Some(latest) => Ok(UpdateCheck::Version(latest.to_string())),
+        // No error and nothing published: the check ran and found no release.
+        None => Ok(UpdateCheck::Current),
+    }
 }
 
 fn version_numbers(version: &str) -> Option<Vec<u64>> {
@@ -3090,8 +3115,8 @@ fn prerelease_is_newer(latest: Option<&str>, installed: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LatestSource, activate_codex_release, codex_standalone_install, extract_latest_version,
-        extract_version, installed_version, opencode_release_package, provider,
+        LatestSource, activate_codex_release, codex_standalone_install, extract_version,
+        installed_version, opencode_release_package, provider,
         validate_codex_package, version_is_newer,
     };
     use std::path::PathBuf;
@@ -3293,18 +3318,36 @@ mod tests {
     }
 
     #[test]
-    fn update_checks_report_the_candidate_after_the_installed_version() {
-        assert_eq!(
-            extract_latest_version(
-                "A new version of Grok Build is available: 1.0.4 -> 1.0.41 [stable]"
+    fn grok_update_check_reads_the_json_record_not_the_banner() {
+        use super::{UpdateCheck, parse_grok_update_check};
+        assert!(matches!(
+            parse_grok_update_check(
+                r#"{"currentVersion":"1.0.4","latestVersion":"1.0.41","updateAvailable":true,"installer":"internal","channel":"stable","autoUpdate":null,"error":null}"#
             ),
-            Some("1.0.41".into())
+            Ok(UpdateCheck::Version(version)) if version == "1.0.41"
+        ));
+        // The trap: grok exits 0 with its banner and `latestVersion: null`
+        // when the check itself failed. That is a failure, not "up to date".
+        let failed = r#"{"currentVersion":"1.0.70","latestVersion":null,"updateAvailable":false,"installer":"internal","channel":"stable","autoUpdate":null,"error":"GCS channel pointer fetch failed for https://storage.googleapis.com/x"}"#;
+        assert!(
+            parse_grok_update_check(failed)
+                .unwrap_err()
+                .contains("update check failed")
         );
-        assert_eq!(
-            extract_latest_version("grok 1.0.41 (d846eb93d9) [stable]"),
-            Some("1.0.41".into())
-        );
-        assert_eq!(extract_latest_version("no release here"), None);
+        // A clean record with nothing published is "current".
+        assert!(matches!(
+            parse_grok_update_check(
+                r#"{"currentVersion":"1.0.70","latestVersion":"1.0.70","updateAvailable":false,"error":null}"#
+            ),
+            Ok(UpdateCheck::Version(version)) if version == "1.0.70"
+        ));
+        assert!(matches!(
+            parse_grok_update_check(
+                r#"{"currentVersion":"1.0.70","latestVersion":null,"updateAvailable":false,"error":null}"#
+            ),
+            Ok(UpdateCheck::Current)
+        ));
+        assert!(parse_grok_update_check("A new version is available: 1.0.4 -> 1.0.41").is_err());
     }
 
     #[cfg(unix)]
@@ -3315,7 +3358,10 @@ mod tests {
         let executable = temp.path().join("grok");
         std::fs::write(
             &executable,
-            "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check) echo 'A new version of Grok Build is available: 1.0.4 -> 1.0.41 [stable]' ;;\n  *) exit 2 ;;\nesac\n",
+            // `--check --json` is what the coordinator asks for: a record,
+            // not the banner (grok prints the banner even when the check
+            // failed).
+            "#!/bin/sh\ncase \"$1:$2:$3\" in\n  version::) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check:--json) echo '{\"currentVersion\":\"1.0.4\",\"latestVersion\":\"1.0.41\",\"updateAvailable\":true,\"error\":null}' ;;\n  *) exit 2 ;;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3367,12 +3413,12 @@ mod tests {
             &executable,
             r#"#!/bin/sh
 root="$(dirname "$0")"
-case "$1:$2" in
-  version:) cat "$root/version" ;;
-  update:--check)
+case "$1:$2:$3" in
+  version::) cat "$root/version" ;;
+  update:--check:--json)
     test ! -f "$root/fail-check" || exit 1
-    printf '2.0.0\n' ;;
-  update:) printf '2.0.0\n' > "$root/version" ;;
+    printf '{"currentVersion":"%s","latestVersion":"2.0.0","updateAvailable":true,"error":null}\n' "$(cat "$root/version")" ;;
+  update::) printf '2.0.0\n' > "$root/version" ;;
   *) exit 2 ;;
 esac
 "#,
@@ -4567,7 +4613,7 @@ esac
         let executable = temp.join("grok");
         std::fs::write(
             &executable,
-            "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check) echo 'A new version of Grok Build is available: 1.0.4 -> 1.0.41 [stable]' ;;\n  update:) echo should-not-run > \"$(dirname \"$0\")/updated\" ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1:$2:$3\" in\n  version::) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check:--json) echo '{\"currentVersion\":\"1.0.4\",\"latestVersion\":\"1.0.41\",\"updateAvailable\":true,\"error\":null}' ;;\n  update::) echo should-not-run > \"$(dirname \"$0\")/updated\" ;;\n  *) exit 2 ;;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();

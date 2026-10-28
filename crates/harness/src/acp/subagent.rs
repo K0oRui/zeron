@@ -6,7 +6,8 @@
 //! lifecycle extension updates `subagent_spawned` / `subagent_progress` /
 //! `subagent_finished` (verified live, 1.0.4). The transcript itself is
 //! written incrementally to the child session's `chat_history.jsonl` under
-//! `~/.grok/sessions/<urlencoded-cwd>/<child_session_id>/`.
+//! `$GROK_HOME/sessions/<urlencoded-cwd>/<child_session_id>/` (`~/.grok` by
+//! default).
 //!
 //! So the tracker correlates the `spawn_subagent` tool call with its
 //! `subagent_spawned` update, tails the child's `chat_history.jsonl` into
@@ -36,11 +37,17 @@ const TAIL_POLL: Duration = Duration::from_millis(250);
 const DRAIN_POLLS: u32 = 6;
 const DRAIN_POLL: Duration = Duration::from_millis(200);
 
-/// The default grok sessions root (`~/.grok/sessions`).
+/// The default grok sessions root: `$GROK_HOME/sessions`, else
+/// `~/.grok/sessions`. `GROK_HOME` wins because that is where the CLI writes
+/// (`docs/user-guide/17-sessions.md`), and zeron already reads the login from
+/// `$GROK_HOME/auth.json` — a relocated home must take its child transcripts
+/// along or subagent tabs stay empty.
 fn default_sessions_root() -> PathBuf {
-    crate::executable::home_or_current_dir()
-        .join(".grok")
-        .join("sessions")
+    let home = std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::executable::home_or_current_dir().join(".grok"));
+    home.join("sessions")
 }
 
 /// Wrap an event as subagent-attributed traffic.

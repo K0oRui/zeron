@@ -1053,15 +1053,6 @@ impl Engine {
         }
         core.set_updater(updater);
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        // Managed ACP adapters install in the background at boot (agents
-        // whose CLI is present but whose adapter isn't yet), so a first chat
-        // never waits on — or dies inside — an npm run.
-        // Not on a Cloud device: it registers only Codex + Claude Code, and
-        // a sandbox's lazy CLI shims install themselves when merely probed.
-        if !runner::is_cloud_platform() {
-            zeron_harness::acp::prewarm_managed_adapters();
-        }
-
         let host_relay = edge.as_ref().map(|edge| {
             let mut link_config =
                 zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
