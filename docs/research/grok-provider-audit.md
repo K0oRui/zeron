@@ -160,10 +160,14 @@ billingPeriodStart, history[{ billingCycle { month }, includedUsed, totalUsed }]
 `crates/harness/src/acp/mod.rs:3093` routes the method to the subagent tracker only and
 returns no events. In 1.0.70 that channel carries:
 
-- `retry_state` — `{type: "retrying", attempt, max_retries: 15, reason, error_type}` and
-  `{type: "failed", …}`. Probed live: a failing upstream produced 15 silent retries over
-  minutes while zeron showed a bare "Working" — and the 30 s stall chip is cleared by these
-  very notifications, so nothing ever surfaces.
+- `retry_state` — an internally tagged enum (`RetryState`) whose three variants do **not**
+  share a shape; captured live against failing gateways (see the follow-up below):
+  `retrying {error_type, is_rate_limited, attempt, max_retries, reason}`,
+  `failed {error_type, message}` (no `attempt`; `message` is multi-line),
+  `exhausted {attempts, is_rate_limited, reason}` (`attempts`, plural, no `error_type`).
+  Probed live: a failing upstream produced 15 silent retries over minutes while zeron
+  showed a bare "Working" — and the 30 s stall chip is cleared by these very
+  notifications, so nothing ever surfaces.
 - `session_notice`-style payloads such as `Auto-compaction failed` / `Auto-compact
   cancelled` (strings in the binary; `x.ai/session/notice` is the documented channel).
 - `turn_completed`, `response_completed` (usage), `model_changed`, `last_turn_summary`,
@@ -268,7 +272,7 @@ were re-run after the change are named per issue.
 | 3 | `grok_install_paths` probes `$GROK_HOME/bin/grok` first; `default_sessions_root()` is `$GROK_HOME/sessions` (else `~/.grok`). | `acp/mod.rs`, `acp/subagent.rs` |
 | 4 | Static catalogs rebuilt from the 1.0.70 wire: harness rows `grok-4.6` (default, low…xhigh) + `grok-4.5` (low…high); client fallback dropped `grok-4.7` and matches. Registry ladder gained `XHigh` and its descriptor now says `StepBoundary`. Per-model ladders are read from `availableModels[]._meta.reasoningEfforts` and **beat** both the session-wide `thought_level` and the static row, which removes the "static shadowing a narrower wire ladder" hazard. | `acp/mod.rs`, `client/src/catalog.rs`, `engine/src/registry.rs` |
 | 5 | `grok_usage_snapshot` reads `creditUsagePercent` (0–100 → 0–1, on-demand spend as fallback) and names the window from `currentPeriod.start`/`end` (Day/Week/Month/Period). `productUsage` and the `USAGE_PERIOD_TYPE_*` labels — dead on 1.0.70 — are gone. | `engine/src/agent_accounts/usage.rs` |
-| 6 | `_x.ai/session_notification` now maps `retry_state` and `auto_compact_failed`/`_cancelled` into notice chips (`notice_events`, also used by `map_update`'s unknown-kind catch-all): one chip when a retry streak starts, none for attempts 2..n, one when it gives up. | `acp/normalize.rs`, `acp/mod.rs` |
+| 6 | `_x.ai/session_notification` now maps `retry_state` and `auto_compact_failed`/`_cancelled` into notices (`notice_events`, also used by `map_update`'s unknown-kind catch-all): one chip when a retry streak starts, none for attempts 2..n; the give-up states are folded into the turn's `Done` error instead of a duplicate chip (see the follow-up). | `acp/normalize.rs`, `acp/mod.rs` |
 | 7 | `typed_call` falls back to `_meta["x.ai/tool"].kind`, so grok's opening `tool_call` frame types correctly (Exec/Read/Edit) instead of `Unknown { name: "run_terminal_command" }`. | `acp/normalize.rs` |
 | 8 | Corrected (see the issue): interjection is agent→client and prompt-while-busy only queues, so preempt stays; the real bug — the `TurnBoundary` descriptor that hid the steer affordance — is fixed. | `acp/mod.rs`, `engine/src/registry.rs` |
 | 9 | Discovery keeps `initialize._meta.modelState` and uses it when `session/new` advertises nothing (signed out, rejected cwd) or fails, instead of falling back to the stale static rows. | `acp/mod.rs` |
@@ -290,3 +294,51 @@ client-catalog / descriptor-surface tests.
   probed shapes but not executed here.
 - The compatibility feed (`releases/harness-compatibility.json`) still publishes no Grok
   listing, so a known-broken Grok build is only caught by version comparison.
+
+## Follow-up: the retry frames, corrected (2026-10-28, second pass)
+
+The first pass described `retry_state` as "`{type, attempt, max_retries, reason, error_type}`"
+and rendered `reason` with `error_type` as the fallback. Running it against a real failure
+produced a nonsense chip — **"Grok could not reach the model: api"** — which is what the
+variant shapes above explain: `error_type` is a machine category (`api`, `http`, `auth`,
+`rate_limited`), and the `failed` variant has no `reason` at all.
+
+Three things were wrong, all now fixed:
+
+1. **Field names are per-variant.** `failed` carries its sentence on `message` (and no
+   `attempt`); `exhausted` counts `attempts` (plural) and carries no `error_type`. The old
+   code read `reason` only, so `failed` always fell through to the category, and
+   `exhausted` always read `attempt` = 0 and reported "could not reach the model" instead
+   of "gave up after N attempts".
+2. **`error_type` is not prose.** It is now only consulted when the frame carries no text,
+   and then through a phrase table (`the model API failed`, `the sign-in was rejected`, …).
+   An unrecognized category contributes nothing rather than being echoed. The `failed`
+   message is also reduced to its first line: it appends an indented
+   `Model:`/`Auth:`/`Version:`/`Available:` diagnostic block.
+3. **The reason now reaches the terminal error.** `session_update_events` records the
+   give-up text on the turn, and `stop_outcome` appends it, so a failed turn reads
+   "The agent failed to complete the turn: Unauthorized (401) from …" instead of the bare
+   sentence. Following the convention codex states in `normalize::settle_turn_error` ("the
+   doc writes an error part for both an `AgentEvent::Error` and a `Done` error, so a message
+   goes to exactly one"), the give-up states emit **no** chip — the Done is their only
+   placement — while the in-progress streak keeps its single chip.
+
+Also fixed while in this path: `response_error` rendered a structured `data` object by
+serializing it, so grok's `session/prompt` 401 read
+`Internal error (code -32603): {"message":"Unauthorized (401) …","http_status":401}`. It now
+prefers `data.message`.
+
+Captured live from 1.0.70 (mock gateway, dummy key):
+
+| Trigger | Frame |
+| --- | --- |
+| HTTP 500 | `retrying` ×15, `reason: "API error (status 500 Internal Server Error): …"`, `error_type: "api"` |
+| HTTP 429 | `retrying` (attempt 1, `error_type: "rate_limited"`), then `exhausted {attempts: 0, is_rate_limited: true}`; prompt rejects `-32003 "Rate limited"` |
+| Connection refused | `retrying` ×N, `error_type: "http"`, `reason: "request error: … tcp connect error: Connection refused"` |
+| HTTP 401 | `failed {error_type: "auth", message: "Unauthorized (401) …\n\n  Model: …"}`; prompt rejects `-32603` with `data.{message, http_status}` |
+| Turn failure | `session/prompt` answers `stopReason: "error"` → the Done that used to read "The agent failed to complete the turn." |
+
+Tests: `grok_retry_states_surface_one_chip_per_streak`,
+`grok_failed_retry_text_never_leaks_the_error_type`,
+`grok_retry_failure_describes_only_the_give_up_states`,
+`rpc_error_prefers_a_structured_details_message`.

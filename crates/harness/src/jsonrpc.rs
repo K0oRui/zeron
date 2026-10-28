@@ -323,9 +323,17 @@ fn response_error(error: &Value) -> String {
         rendered.push_str(&format!(" (code {code})"));
     }
     if let Some(data) = error.get("data").filter(|v| !v.is_null()) {
+        // A structured detail usually puts the sentence on `message` and its
+        // diagnostics beside it (grok's 401: `{message, http_status}`). Render
+        // that sentence, not the serialized object.
         let detail = data
             .as_str()
             .map(str::to_owned)
+            .or_else(|| {
+                data.get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| data.to_string());
         if !detail.is_empty() {
             rendered.push_str(": ");
@@ -658,6 +666,30 @@ mod tests {
             assert!(rendered.starts_with("Invalid request (code -32600): "));
             assert!(rendered.ends_with(data.as_str().unwrap_or(&data.to_string())));
         }
+    }
+
+    /// A structured `data` object names its sentence on `message` (grok's
+    /// `session/prompt` 401 does): render that, not the serialized object.
+    #[test]
+    fn rpc_error_prefers_a_structured_details_message() {
+        let rendered = response_error(&json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "message": "Unauthorized (401) from https://api.x.ai", "http_status": 401 },
+        }));
+        assert_eq!(
+            rendered,
+            "Internal error (code -32603): Unauthorized (401) from https://api.x.ai"
+        );
+        // An object without one keeps the old rendering.
+        assert_eq!(
+            response_error(&json!({
+                "code": -1,
+                "message": "nope",
+                "data": { "reason": "busy" },
+            })),
+            "nope (code -1): {\"reason\":\"busy\"}"
+        );
     }
 
     #[test]

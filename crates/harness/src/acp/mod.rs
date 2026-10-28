@@ -64,7 +64,7 @@ use crate::{
     CancellationToken, Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child,
 };
 use child::Child;
-use normalize::{map_update, notice_events, parse_commands, preferred_allow_option};
+use normalize::{map_update, notice_events, parse_commands, preferred_allow_option, retry_failure};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
 
@@ -3086,11 +3086,18 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    turn_failure: &mut Option<String>,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
     let update = params.get("update").unwrap_or(&Value::Null);
+    // The one thing the transcript alone cannot carry forward: WHY a retry
+    // ended. The chips below are per-frame; the terminal error needs the
+    // agent's own words, or the turn just reads "failed to complete".
+    if let Some(why) = retry_failure(update) {
+        *turn_failure = Some(why);
+    }
     match method {
         "session/update" => match subagents {
             SubagentObserver::Devin(tracker) => tracker.map(update),
@@ -3131,6 +3138,7 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
 fn stop_outcome(
     res: &Result<Value, HarnessError>,
     interrupted: bool,
+    turn_failure: Option<&str>,
 ) -> (DoneStatus, Option<String>) {
     if interrupted {
         return (DoneStatus::Interrupted, None);
@@ -3138,9 +3146,15 @@ fn stop_outcome(
     match res {
         Ok(resp) => match resp.get("stopReason").and_then(Value::as_str) {
             Some("cancelled") => (DoneStatus::Interrupted, None),
+            // The agent gave up on the model call. Its retry stream names the
+            // reason (a 401, a dead stream); without it the user is told only
+            // that the turn failed, which is the report behind this branch.
             Some("error") => (
                 DoneStatus::Errored,
-                Some("The agent failed to complete the turn.".to_owned()),
+                Some(match turn_failure {
+                    Some(why) => format!("The agent failed to complete the turn: {why}"),
+                    None => "The agent failed to complete the turn.".to_owned(),
+                }),
             ),
             Some("refusal") => (
                 DoneStatus::Errored,
@@ -4536,6 +4550,11 @@ async fn run_session(session: Session) {
     // ZERON_ACP_QUIET_SETTLE_MS is intentionally no longer honored (#296).
     let mut last_update_at = tokio::time::Instant::now();
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Why the agent's last retry gave up (grok's `retry_state`), so a turn
+    // that ends in `stopReason: "error"` can name the cause instead of just
+    // "The agent failed to complete the turn." Taken (and thus cleared) by
+    // whichever Done closes the turn.
+    let mut turn_failure: Option<String> = None;
     // PREVENTION, ahead of all the recovery above: never send a
     // `session/prompt` into a session that is visibly mid SELF-CONTINUED
     // turn — that prompt's reply is what the adapter drops (the verified
@@ -4678,7 +4697,13 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                                session_update_events(
+                                    &method,
+                                    &params,
+                                    &session_id,
+                                    &mut subagents,
+                                    &mut turn_failure,
+                                );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -4736,7 +4761,11 @@ async fn run_session(session: Session) {
                     && !queued_steers.is_empty();
                 preempt_pending = false;
                 if !preempted {
-                    let (status, mut error) = stop_outcome(&res, interrupted || stopped);
+                    let (status, mut error) = stop_outcome(
+                        &res,
+                        interrupted || stopped,
+                        turn_failure.take().as_deref(),
+                    );
                     if !interrupted
                         && auth_method.is_some()
                         && res.as_ref().is_err_and(is_auth_required)
@@ -4893,8 +4922,9 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    let events = session_update_events(
+                        &method, &params, &session_id, &mut subagents, &mut turn_failure,
+                    );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -4949,7 +4979,11 @@ async fn run_session(session: Session) {
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
                         }
-                        let (status, error) = stop_outcome(&res, interrupted);
+                        let (status, error) = stop_outcome(
+                            &res,
+                            interrupted,
+                            turn_failure.take().as_deref(),
+                        );
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
@@ -5014,8 +5048,10 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                    let events = session_update_events(
+                                        &method, &params, &session_id, &mut subagents,
+                                        &mut turn_failure,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
