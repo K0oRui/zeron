@@ -107,12 +107,10 @@ pub struct RelayedCallback {
 
 mod kilo;
 mod muse;
-mod nvidia_nim;
 mod oauth;
 #[cfg(test)]
 mod provider_tests;
 pub use muse::MuseRunEnvironment;
-pub use nvidia_nim::NvidiaNimRunEnvironment;
 mod stores;
 mod usage;
 
@@ -1014,7 +1012,6 @@ impl AgentAccounts {
             HarnessId::Kilo,
             HarnessId::Pi,
             HarnessId::Muse,
-            HarnessId::NvidiaNim,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
@@ -1023,14 +1020,6 @@ impl AgentAccounts {
         if let Some(slot) = self.muse_active() {
             active_keys
                 .entry(HarnessId::Muse)
-                .or_default()
-                .insert(slot.account_key);
-        }
-        // NVIDIA keys are Zeron-owned too: selection is explicit and never
-        // requires rewriting a third-party CLI's global credential store.
-        if let Some(slot) = self.nvidia_nim_active() {
-            active_keys
-                .entry(HarnessId::NvidiaNim)
                 .or_default()
                 .insert(slot.account_key);
         }
@@ -1191,7 +1180,6 @@ impl AgentAccounts {
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
             HarnessId::Muse => self.set_muse_active(Some(&slot.id))?,
-            HarnessId::NvidiaNim => self.set_nvidia_nim_active(Some(&slot.id))?,
             HarnessId::Opencode | HarnessId::Kilo | HarnessId::Pi => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
@@ -1507,10 +1495,6 @@ impl AgentAccounts {
             self.forget_muse(account_id).await?;
             return self.list_locked(false).await;
         }
-        if harness == HarnessId::NvidiaNim {
-            self.forget_nvidia_nim(account_id)?;
-            return self.list_locked(false).await;
-        }
         let snapshot = self.list_locked(false).await?;
         let row = snapshot
             .accounts
@@ -1612,10 +1596,6 @@ impl AgentAccounts {
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
             HarnessId::Muse => self.start_muse_login().await?,
-            HarnessId::NvidiaNim => match provider.unwrap_or("api-key") {
-                "api-key" => self.start_api_key_login(HarnessId::NvidiaNim),
-                other => return Err(stores::unsupported_login(harness, other)),
-            },
             HarnessId::Opencode | HarnessId::Kilo => match provider.unwrap_or("openai") {
                 "openai" => self.start_openai_login(harness, "openai").await?,
                 "github-copilot" => self.start_copilot_login(harness).await?,
@@ -2342,7 +2322,6 @@ impl AgentAccounts {
     ) -> Result<AgentAccountsSnapshot, EngineError> {
         match harness {
             HarnessId::Codex => self.save_codex_api_key(raw_key).await,
-            HarnessId::NvidiaNim => self.save_nvidia_nim_api_key(raw_key).await,
             other => Err(EngineError::Other(format!(
                 "API-key logins are not supported for {other:?}"
             ))),
@@ -3182,9 +3161,8 @@ impl AgentAccounts {
             let mut inflight = lock(&self.inner.inflight_probes);
             for &(harness, slot, active) in targets {
                 // Muse reports its usage from runs (`record_muse_usage`); a
-                // probe's fresh host has observed none. NIM exposes token
-                // usage per response, not a subscription quota to probe.
-                if matches!(harness, HarnessId::Muse | HarnessId::NvidiaNim) {
+                // probe's fresh host has observed none.
+                if harness == HarnessId::Muse {
                     continue;
                 }
                 let key = usage_key(harness, &slot.account_key);
@@ -3547,72 +3525,6 @@ impl AgentAccounts {
     }
 }
 
-/// Compose every Zeron-owned account environment behind the registry's single
-/// hook. Adding NIM must not displace Muse's per-account config roots.
-pub struct AccountRunEnvironment {
-    muse: MuseRunEnvironment,
-    nvidia_nim: NvidiaNimRunEnvironment,
-}
-
-impl AccountRunEnvironment {
-    pub fn new(accounts: AgentAccounts) -> Self {
-        Self {
-            muse: MuseRunEnvironment(accounts.clone()),
-            nvidia_nim: NvidiaNimRunEnvironment(accounts),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::registry::RunEnvironment for AccountRunEnvironment {
-    async fn prepare(
-        &self,
-        harness: HarnessId,
-        request: &mut zeron_proto::RunRequest,
-    ) -> Result<(), String> {
-        crate::registry::RunEnvironment::prepare(&self.muse, harness, request).await?;
-        crate::registry::RunEnvironment::prepare(&self.nvidia_nim, harness, request).await
-    }
-
-    fn model_api_key(&self, harness: HarnessId) -> Result<Option<String>, String> {
-        crate::registry::RunEnvironment::model_api_key(&self.nvidia_nim, harness)
-    }
-
-    async fn credential(&self, harness: HarnessId) -> Option<String> {
-        if let Some(credential) =
-            crate::registry::RunEnvironment::credential(&self.muse, harness).await
-        {
-            return Some(credential);
-        }
-        crate::registry::RunEnvironment::credential(&self.nvidia_nim, harness).await
-    }
-
-    async fn record_usage(
-        &self,
-        harness: HarnessId,
-        credential: &str,
-        windows: Vec<AgentUsageWindow>,
-        plan_label: Option<String>,
-    ) {
-        crate::registry::RunEnvironment::record_usage(
-            &self.muse,
-            harness,
-            credential,
-            windows.clone(),
-            plan_label.clone(),
-        )
-        .await;
-        crate::registry::RunEnvironment::record_usage(
-            &self.nvidia_nim,
-            harness,
-            credential,
-            windows,
-            plan_label,
-        )
-        .await;
-    }
-}
-
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
 //
 // Claude Code stores its credentials in the login Keychain under the service
@@ -3894,7 +3806,6 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
-        HarnessId::NvidiaNim => "nvidia-nim",
     }
 }
 

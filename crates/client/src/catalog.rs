@@ -51,9 +51,14 @@ impl HarnessInfo {
         Some(self.supports_steering? && self.steering_mode.as_deref()? == "step-boundary")
     }
 
-    /// Listed by the device and usable (installed, not disabled).
+    /// A real provider supported by this build, not a test harness.
+    pub(crate) fn supported(&self) -> bool {
+        self.id != "mock" && zeron_proto::HarnessId::from_slug(&self.id).is_some()
+    }
+
+    /// Listed by the device and usable (supported, installed, not disabled).
     pub fn offered(&self) -> bool {
-        self.installed && self.enabled != Some(false)
+        self.supported() && self.installed && self.enabled != Some(false)
     }
 }
 
@@ -168,7 +173,6 @@ pub fn harness_label(id: &str) -> String {
         "kilo" => "Kilo Code",
         "antigravity" => "Antigravity",
         "muse" => "Muse Code",
-        "nvidia-nim" => "NVIDIA NIM",
         "mock" => "Mock",
         other => return other.to_owned(),
     }
@@ -367,10 +371,8 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        // NIM has no authoritative static catalog or offline entitlement list.
-        "nvidia-nim" => Vec::new(),
-        // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
-        _ => vec![
+        // Claude Code 2.1.307 reports these (mock shares the catalog).
+        "claude-code" | "mock" => vec![
             model(
                 "claude-opus-5-5",
                 "Opus 5.5",
@@ -435,6 +437,7 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![toggle("thinking", "Thinking")],
             ),
         ],
+        _ => Vec::new(),
     }
 }
 
@@ -510,10 +513,8 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
 /// rows exist, fold `[1m]`/`-1m` variants into a Context Window option, and
 /// prefer curated labels (legacy `HarnessCatalog.normalize`).
 pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    // These are provider wire IDs, not Claude CLI aliases. Folding a real
-    // `-1m`/`[1m]` NIM ID would create a different, possibly nonexistent model.
-    if harness == "nvidia-nim" {
-        return models;
+    if zeron_proto::HarnessId::from_slug(harness).is_none() {
+        return Vec::new();
     }
     let catalog = curated_catalog(harness);
     // Account balance filtering belongs to the host. Re-filtering here would
@@ -597,7 +598,7 @@ pub fn model_label(harness: &str, model_id: &str) -> String {
 /// Last-known live catalogs on disk (`{data_dir}/catalogs/{device}.json`):
 /// pickers open instantly with the device's real list, and an unreachable
 /// device still shows what it offered last time before the static fallback.
-/// NIM is excluded: its account inventory must not be resurrected offline.
+/// Unsupported provider IDs in older caches are discarded.
 #[derive(Debug, Clone)]
 pub(crate) struct DiskCatalog {
     dir: std::path::PathBuf,
@@ -609,6 +610,16 @@ struct DeviceCatalog {
     harnesses: Option<Vec<HarnessInfo>>,
     #[serde(default)]
     models: std::collections::BTreeMap<String, Vec<ModelInfo>>,
+}
+
+impl DeviceCatalog {
+    fn retain_supported(&mut self) {
+        if let Some(harnesses) = &mut self.harnesses {
+            harnesses.retain(HarnessInfo::supported);
+        }
+        self.models
+            .retain(|harness, _| zeron_proto::HarnessId::from_slug(harness).is_some());
+    }
 }
 
 fn file_safe(id: &str) -> String {
@@ -639,9 +650,7 @@ impl DiskCatalog {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        // Retire legacy NIM rows rather than treating another login's old
-        // inventory or a built-in suggestion as currently runnable.
-        catalog.models.remove("nvidia-nim");
+        catalog.retain_supported();
         catalog
     }
 
@@ -664,7 +673,7 @@ impl DiskCatalog {
 
     pub(crate) fn put_harnesses(&self, device_id: &str, list: &[HarnessInfo]) {
         let mut catalog = self.load(device_id);
-        catalog.harnesses = Some(list.to_vec());
+        catalog.harnesses = Some(list.iter().filter(|row| row.supported()).cloned().collect());
         self.store(device_id, &catalog);
     }
 
@@ -681,24 +690,23 @@ impl DiskCatalog {
             let Ok(bytes) = std::fs::read(entry.path()) else {
                 continue;
             };
-            let Ok(catalog) = serde_json::from_slice::<DeviceCatalog>(&bytes) else {
+            let Ok(mut catalog) = serde_json::from_slice::<DeviceCatalog>(&bytes) else {
                 continue;
             };
+            catalog.retain_supported();
             for (harness, models) in &catalog.models {
-                if harness == "nvidia-nim" {
-                    continue;
-                }
                 learn_labels(harness, models);
             }
         }
     }
 
     pub(crate) fn put_models(&self, device_id: &str, harness: &str, list: &[ModelInfo]) {
+        if zeron_proto::HarnessId::from_slug(harness).is_none() {
+            return;
+        }
         learn_labels(harness, list);
         let mut catalog = self.load(device_id);
-        if harness != "nvidia-nim" {
-            catalog.models.insert(harness.to_owned(), list.to_vec());
-        }
+        catalog.models.insert(harness.to_owned(), list.to_vec());
         self.store(device_id, &catalog);
     }
 }
@@ -729,42 +737,64 @@ mod tests {
     }
 
     #[test]
-    fn nim_never_invents_static_models_or_rewrites_provider_ids() {
-        assert!(fallback_models("nvidia-nim").is_empty());
-        let rows = vec![
-            model("vendor/model-1m", "Model 1M", "", &[], vec![]),
-            model("vendor/other[1m]", "Other", "", &[], vec![]),
-            model("default", "Default", "", &[], vec![]),
-        ];
-        assert_eq!(normalize_models("nvidia-nim", rows.clone()), rows);
+    fn unsupported_providers_have_no_models_or_picker_rows() {
+        for harness in ["removed-provider", "nvidia-nim"] {
+            assert!(zeron_proto::HarnessId::from_slug(harness).is_none());
+            assert!(fallback_models(harness).is_empty());
+            assert!(normalize_models(harness, fallback_models("codex")).is_empty());
+            assert!(!HarnessInfo::fallback(harness, "Retired").offered());
+        }
+        assert!(!fallback_models("claude-code").is_empty());
+        assert!(!fallback_models("mock").is_empty());
     }
 
     #[test]
-    fn nim_legacy_disk_rows_are_retired_and_live_rows_are_not_offline_fallbacks() {
+    fn unsupported_disk_rows_are_ignored_without_losing_other_catalogs() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCatalog::new(dir.path());
-        let mut legacy = DeviceCatalog::default();
+        let mut legacy = DeviceCatalog {
+            harnesses: Some(vec![
+                HarnessInfo::fallback("removed-provider", "Retired"),
+                HarnessInfo::fallback("codex", "Codex"),
+            ]),
+            ..Default::default()
+        };
         legacy.models.insert(
-            "nvidia-nim".into(),
-            vec![model("old/guessed", "Old", "", &[], vec![])],
+            "removed-provider".into(),
+            vec![model(
+                "old/guessed",
+                "Retired Cached Label",
+                "",
+                &[],
+                vec![],
+            )],
         );
         legacy
             .models
             .insert("codex".into(), fallback_models("codex"));
         cache.store("device", &legacy);
-        assert!(cache.models("device", "nvidia-nim").is_none());
+        assert!(cache.models("device", "removed-provider").is_none());
         assert!(!cache.models("device", "codex").unwrap().is_empty());
+        assert_eq!(cache.harnesses("device").unwrap()[0].id, "codex");
+        assert_eq!(cache.harnesses("device").unwrap().len(), 1);
+        cache.warm_labels();
+        assert_eq!(
+            model_label("removed-provider", "old/guessed"),
+            "old/guessed"
+        );
         cache.put_models(
             "device",
-            "nvidia-nim",
-            &[model("live/chat", "Live Chat", "", &[], vec![])],
+            "removed-provider",
+            &[model("live/chat", "Retired Live Label", "", &[], vec![])],
         );
-        assert!(cache.models("device", "nvidia-nim").is_none());
-        assert_eq!(model_label("nvidia-nim", "live/chat"), "Live Chat");
+        assert!(cache.models("device", "removed-provider").is_none());
+        assert_eq!(model_label("removed-provider", "live/chat"), "live/chat");
+        cache.put_harnesses("device", legacy.harnesses.as_ref().unwrap());
         let stored: DeviceCatalog =
             serde_json::from_slice(&std::fs::read(cache.path("device")).unwrap()).unwrap();
-        assert!(!stored.models.contains_key("nvidia-nim"));
+        assert!(!stored.models.contains_key("removed-provider"));
         assert!(!stored.models["codex"].is_empty());
+        assert_eq!(stored.harnesses.unwrap().len(), 1);
     }
 
     #[test]

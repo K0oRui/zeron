@@ -20,9 +20,9 @@ struct Saved {
 
 fn location(root: &Path, harness: &dyn Harness, context: &ModelContext) -> PathBuf {
     let id = serde_json::to_value(harness.id()).unwrap();
-    // Kilo now persists its full inventory, with balance filtering AFTER
-    // loading it. Do not reuse the old free-only cache on a funded account.
-    // Devin still persists only the rows its signed-in plan can run.
+    // Kilo persists its full inventory, with balance filtering AFTER loading
+    // it. Do not reuse the old free-only cache on a funded account. Devin
+    // still persists only the rows its signed-in plan can run.
     let name = match harness.id() {
         zeron_proto::HarnessId::Kilo => format!("inventory-{}.json", context.hash),
         zeron_proto::HarnessId::Devin => format!("plan-{}.json", context.hash),
@@ -92,10 +92,7 @@ pub(crate) async fn list_with_lease(
     let root = root.to_path_buf();
     tokio::spawn(async move {
         let _lease = lease.clone();
-        let models = list_inner(&root, harness.clone(), force, lease).await?;
-        // Runtime evidence must also apply to disk/static fallbacks. Do not
-        // persist this filtered view or resurrect rows when it becomes empty.
-        harness.filter_model_catalog(models)
+        list_inner(&root, harness, force, lease).await
     })
     .await
     .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))?
@@ -126,18 +123,6 @@ async fn list_inner(
             .await
             .map(|catalog| catalog.models);
     };
-    if harness.id() == zeron_proto::HarnessId::NvidiaNim {
-        // NIM's public/featured/static lists are not account entitlement data.
-        // Its harness owns a short-lived, inventory-only memory cache. Never
-        // revive an older disk catalog (including pre-v3 unfiltered rows).
-        let catalog = harness.model_catalog(force).await?;
-        if !unchanged(harness.as_ref(), &context) {
-            return Err(HarnessError::Protocol(
-                "model discovery context changed; retry".into(),
-            ));
-        }
-        return Ok(catalog.models); // Empty is a successful inventory, not a fallback signal.
-    }
     let path = location(root, harness.as_ref(), &context);
     let disk = read(&path, &context);
     // The refresh owns its lifetime; returning disk early must not cancel it.
@@ -260,8 +245,6 @@ mod tests {
         delay: std::sync::atomic::AtomicBool,
         forced: std::sync::atomic::AtomicBool,
         cached: std::sync::atomic::AtomicBool,
-        hidden: std::sync::atomic::AtomicBool,
-        empty: std::sync::atomic::AtomicBool,
         failure: std::sync::Mutex<String>,
         harness: zeron_proto::HarnessId,
     }
@@ -273,8 +256,6 @@ mod tests {
                 delay: false.into(),
                 forced: false.into(),
                 cached: false.into(),
-                hidden: false.into(),
-                empty: false.into(),
                 failure: std::sync::Mutex::new("offline".into()),
                 harness: zeron_proto::HarnessId::Codex,
             })
@@ -306,13 +287,6 @@ mod tests {
             rows[0].id = "static".into();
             rows
         }
-        fn filter_model_catalog(&self, models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
-            Ok(if self.hidden.load(SeqCst) {
-                Vec::new()
-            } else {
-                models
-            })
-        }
         async fn models(&self) -> Result<Vec<Model>, HarnessError> {
             Ok(models())
         }
@@ -325,11 +299,7 @@ mod tests {
                 return Err(HarnessError::Protocol(self.failure.lock().unwrap().clone()));
             }
             Ok(ModelCatalog {
-                models: if self.empty.load(SeqCst) {
-                    vec![]
-                } else {
-                    models()
-                },
+                models: models(),
                 source: if self.cached.load(SeqCst) {
                     "cache"
                 } else {
@@ -348,88 +318,6 @@ mod tests {
             unreachable!()
         }
     }
-    #[tokio::test]
-    async fn nim_never_revives_disk_or_static_rows_on_empty_or_failed_inventory() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut probe = Probe::new();
-        Arc::get_mut(&mut probe).unwrap().harness = zeron_proto::HarnessId::NvidiaNim;
-        let context = probe.model_context().unwrap().unwrap();
-        let path = location(dir.path(), probe.as_ref(), &context);
-        save(&path, &context, &models()).unwrap(); // Simulate a pre-upgrade catalog.
-        probe.empty.store(true, SeqCst);
-        assert!(
-            list(dir.path(), probe.clone(), true)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        probe.fail.store(true, SeqCst);
-        assert!(list(dir.path(), probe.clone(), true).await.is_err());
-        probe.fail.store(false, SeqCst);
-        probe.empty.store(false, SeqCst);
-        assert_eq!(list(dir.path(), probe, true).await.unwrap(), models());
-    }
-
-    #[tokio::test]
-    async fn availability_filter_preserves_raw_inventory_and_authoritative_empty_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = Probe::new();
-        probe.hidden.store(true, SeqCst);
-        assert!(
-            list(dir.path(), probe.clone(), true)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let context = probe.model_context().unwrap().unwrap();
-        let path = location(dir.path(), probe.as_ref(), &context);
-        assert_eq!(
-            read(&path, &context),
-            Some(models()),
-            "persist raw inventory"
-        );
-        // A transient discovery failure must not bring the rejected disk row back.
-        probe.fail.store(true, SeqCst);
-        assert!(
-            list(dir.path(), probe.clone(), true)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        probe.hidden.store(false, SeqCst);
-        assert_eq!(list(dir.path(), probe, false).await.unwrap(), models());
-    }
-
-    #[tokio::test]
-    async fn availability_filter_also_covers_static_fallbacks() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = Probe::new();
-        probe.fail.store(true, SeqCst);
-        probe.hidden.store(true, SeqCst);
-        assert!(
-            list(dir.path(), probe.clone(), false)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        probe.hidden.store(false, SeqCst);
-        assert_eq!(
-            list(dir.path(), probe, false).await.unwrap()[0].id,
-            "static"
-        );
-    }
-
-    #[tokio::test]
-    async fn availability_filter_covers_early_disk_replies_during_slow_refresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = Probe::new();
-        list(dir.path(), probe.clone(), false).await.unwrap();
-        probe.hidden.store(true, SeqCst);
-        probe.delay.store(true, SeqCst);
-        assert!(list(dir.path(), probe, true).await.unwrap().is_empty());
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-
     #[tokio::test]
     async fn background_refresh_holds_lease_after_cached_reply() {
         let dir = tempfile::tempdir().unwrap();

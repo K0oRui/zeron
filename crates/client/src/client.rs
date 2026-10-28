@@ -1323,7 +1323,7 @@ impl Client {
                 match reply {
                     Ok(list) => {
                         let list: Vec<HarnessInfo> =
-                            list.into_iter().filter(|h| h.id != "mock").collect();
+                            list.into_iter().filter(HarnessInfo::supported).collect();
                         cache.put_harnesses(device_id, &list);
                         list
                     }
@@ -1344,10 +1344,12 @@ impl Client {
         list
     }
 
-    /// Model catalog for `harness` on `device_id` (normalized live reply,
-    /// else the cached one, else the curated static list). NIM requires a live
-    /// inventory: neither disk nor static rows may claim account availability.
+    /// Model catalog for a supported `harness` on `device_id` (normalized
+    /// live reply, else the cached one, else the curated static list).
     pub async fn list_models(&self, device_id: &str, harness: &str) -> Vec<ModelInfo> {
+        if zeron_proto::HarnessId::from_slug(harness).is_none() {
+            return Vec::new();
+        }
         match self.inner.backend() {
             Backend::Demo(demo) => demo.list_models(harness).await,
             Backend::Live(_) if zeron_proto::is_cloud_device(device_id, "") => {

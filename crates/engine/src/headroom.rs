@@ -56,7 +56,6 @@ pub const UNROUTED: [HarnessId; 6] = [
     HarnessId::Pi,
     HarnessId::Kilo,
     HarnessId::Muse,
-    HarnessId::NvidiaNim,
 ];
 
 const INSTALL_DEADLINE: Duration = Duration::from_secs(15 * 60);

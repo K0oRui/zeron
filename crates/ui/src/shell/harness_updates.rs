@@ -106,7 +106,6 @@ fn agent_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "Muse Code",
         HarnessId::Mock => "Mock",
-        HarnessId::NvidiaNim => "NVIDIA NIM",
     }
 }
 
@@ -853,7 +852,9 @@ impl Shell {
                         .await;
                     if let Ok(mut stream) = result {
                         while let Some(value) = stream.recv().await {
-                            let Ok(rows) = serde_json::from_value(value) else {
+                            let Ok(rows) =
+                                zeron_proto::providers::decode_provider_rows(value, "harness")
+                            else {
                                 break;
                             };
                             if this

@@ -2117,3 +2117,21 @@ async fn kilo_does_not_apply_a_balance_from_an_account_switched_mid_request() {
     assert!(error.to_string().contains("account changed"));
     assert!(!error.to_string().contains("fixture-token"));
 }
+
+#[tokio::test]
+async fn codex_api_keys_keep_the_legacy_flow_on_generic_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = AgentAccounts::new(AgentAccountsConfig::isolated(tmp.path()));
+    let start = accounts
+        .start_login_with(HarnessId::Codex, Some("api-key"), None)
+        .await
+        .unwrap();
+    assert_eq!(start.mode, AgentLoginMode::ApiKey);
+    let snapshot = accounts
+        .complete_login(&start.login_id, "sk-test-12345678abcd")
+        .await
+        .unwrap();
+    assert!(snapshot.accounts.iter().any(|account| {
+        account.harness == HarnessId::Codex && account.auth_kind == Some(AgentAuthKind::ApiKey)
+    }));
+}

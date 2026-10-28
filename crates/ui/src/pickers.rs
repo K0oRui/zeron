@@ -1932,7 +1932,10 @@ impl Pickers {
                 pickers.harnesses_revalidating = false;
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                    Ok(value) => match zeron_proto::providers::decode_provider_rows::<
+                        HarnessDescriptor,
+                    >(value, "id")
+                    {
                         Ok(list) => Loadable::Ready(list),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
@@ -1991,10 +1994,7 @@ impl Pickers {
         }
         let target = self.space_target(cx);
         let generation = self.target_generation;
-        if harness == HarnessId::NvidiaNim
-            || !matches!(self.models.get(&harness), Some(Loadable::Ready(_)))
-        {
-            // NIM must not offer an old account/catalog while revalidating.
+        if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
             self.models.insert(harness, Loadable::Loading);
             self.catalog_rev += 1;
         }
@@ -2086,7 +2086,6 @@ impl Pickers {
             self.model_refresh_errors.remove(&harness);
         }
         if let Loadable::Error(error) = &loaded
-            && harness != HarnessId::NvidiaNim
             && matches!(self.models.get(&harness), Some(Loadable::Ready(_)))
         {
             tracing::warn!(%error, ?harness, "Model refresh failed; retaining visible rows");
@@ -2715,7 +2714,6 @@ impl Pickers {
         // into the fresh catalog or made available as a new choice elsewhere.
         if self.model_rail == ModelRail::Harness
             && let Some(harness) = effective
-            && harness != HarnessId::NvidiaNim
             && let Some(id) = self.effective_model_id(cx)
             && self
                 .models
@@ -6447,10 +6445,6 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
 /// advertised id from the base + trait (`pick_model_value`), so a folded pick
 /// still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
-    // NIM IDs are exact HTTP routing keys, not CLI context-window aliases.
-    if harness == HarnessId::NvidiaNim {
-        return models;
-    }
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
     }
@@ -6556,7 +6550,6 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Kilo => (crate::icons::KILO_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
         HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
-        HarnessId::NvidiaNim => (crate::icons::NIM_MARK, None),
     }
 }
 
@@ -7506,48 +7499,6 @@ mod tests {
                 missing.installed = false;
                 pickers.harnesses = Loadable::Ready(vec![missing]);
                 assert!(pickers.rail_descriptors(cx).is_empty());
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn nim_refresh_failure_replaces_stale_rows_instead_of_retaining_them(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| {
-            cx.set_global(Theme::dark());
-            let state = cx.new(|_| AppState::new());
-            let pickers = cx.new(|cx| Pickers::new(state, cx));
-            pickers.update(cx, |pickers, cx| {
-                pickers.config.harness = Some(HarnessId::NvidiaNim);
-                pickers.config.model = Some("old/unverified".into());
-                pickers.model_rail = ModelRail::Harness;
-                pickers.harnesses =
-                    Loadable::Ready(vec![descriptor(HarnessId::NvidiaNim, "NVIDIA NIM")]);
-                pickers.apply_model_catalog(
-                    HarnessId::NvidiaNim,
-                    Loadable::Ready(vec![bare_model("old/unverified", "Old")]),
-                    cx,
-                );
-                assert_eq!(pickers.visible_model_rows(cx).len(), 1);
-                pickers.apply_model_catalog(
-                    HarnessId::NvidiaNim,
-                    Loadable::Error("inventory unavailable".into()),
-                    cx,
-                );
-                assert!(matches!(
-                    pickers.models[&HarnessId::NvidiaNim],
-                    Loadable::Error(_)
-                ));
-                pickers.apply_model_catalog(HarnessId::NvidiaNim, Loadable::Ready(vec![]), cx);
-                assert_eq!(
-                    pickers.models[&HarnessId::NvidiaNim],
-                    Loadable::Ready(vec![])
-                );
-                assert!(
-                    pickers.visible_model_rows(cx).is_empty(),
-                    "do not synthesize a saved bad NIM choice"
-                );
             });
         });
     }
@@ -10440,19 +10391,6 @@ mod tests {
         assert!(
             flags.contains(&("glm", false)),
             "other harness: not a clash"
-        );
-    }
-
-    #[test]
-    fn nim_normalization_never_rewrites_inventory_routing_ids() {
-        let rows = vec![
-            bare_model("vendor/chat-1m", "Chat 1M"),
-            bare_model("vendor/other[1m]", "Other"),
-            bare_model("default", "Default"),
-        ];
-        assert_eq!(
-            normalize_model_rows(HarnessId::NvidiaNim, rows.clone()),
-            rows
         );
     }
 
