@@ -361,6 +361,37 @@ fn featured_model(row: NimFeaturedModel) -> Model {
     }
 }
 
+// Apply after any memory-cache load and before choosing an implicit default.
+// Success evidence can restore an exact hosted exclusion for this key, but
+// never invents a row that NVIDIA did not advertise in the inventory.
+fn visible_inventory_models(
+    mut models: Vec<Model>,
+    base_url: &str,
+    availability: &AvailabilityScope,
+) -> Vec<Model> {
+    let unavailable = availability.unavailable();
+    let verified = availability.verified();
+    models.retain(|model| {
+        !unavailable.contains(&model.id)
+            && (!discovery::known_unavailable_on_hosted(base_url, &model.id)
+                || verified.contains(&model.id))
+    });
+    models
+}
+
+fn record_model_success(
+    base_url: &str,
+    model: &str,
+    answer: &str,
+    availability: &AvailabilityScope,
+) -> std::io::Result<()> {
+    if !answer.trim().is_empty() && discovery::known_unavailable_on_hosted(base_url, model) {
+        availability.verify(model)
+    } else {
+        availability.allow(model)
+    }
+}
+
 fn missing_api_key() -> HarnessError {
     HarnessError::NotSignedIn(
         "NVIDIA NIM needs an API key. Open Settings → Providers → NVIDIA NIM and \
@@ -435,13 +466,14 @@ impl Harness for NvidiaNimHarness {
         self.filter_model_catalog(self.model_catalog(false).await?.models)
     }
 
-    fn filter_model_catalog(&self, mut models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
+    fn filter_model_catalog(&self, models: Vec<Model>) -> Result<Vec<Model>, HarnessError> {
         let key = self.api_key()?;
-        let unavailable = self
-            .availability(key.as_deref().unwrap_or_default())
-            .unavailable();
-        models.retain(|model| !unavailable.contains(&model.id));
-        Ok(models)
+        let availability = self.availability(key.as_deref().unwrap_or_default());
+        Ok(visible_inventory_models(
+            models,
+            &self.base_url,
+            &availability,
+        ))
     }
 
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -503,10 +535,9 @@ impl Harness for NvidiaNimHarness {
                     )
                     .await?
                     .models;
-                let unavailable = availability.unavailable();
-                models
+                visible_inventory_models(models, &self.base_url, &availability)
                     .into_iter()
-                    .find(|model| !unavailable.contains(&model.id))
+                    .next()
                     .map(|model| model.id)
                     .ok_or_else(|| {
                         HarnessError::Protocol(
@@ -932,7 +963,8 @@ async fn run_session(session: Session) {
         .await;
         match outcome {
             Ok(answer) => {
-                if let Err(error) = availability.allow(&model) {
+                if let Err(error) = record_model_success(&base_url, &model, &answer, &availability)
+                {
                     tracing::warn!(%error, "Could not persist NVIDIA NIM model recovery");
                 }
                 history.push(HistoryMessage::assistant(answer));
@@ -969,7 +1001,10 @@ async fn run_session(session: Session) {
                     if let Err(error) = availability.reject(&model) {
                         tracing::warn!(%error, "Could not persist NVIDIA NIM model rejection");
                     }
-                    model_unavailable_message(&model)
+                    model_unavailable_message(
+                        &model,
+                        discovery::known_unavailable_on_hosted(&base_url, &model),
+                    )
                 };
                 let _ = send(
                     &event_tx,
@@ -1227,7 +1262,16 @@ fn is_model_unavailable(status: u16, value: &Value) -> bool {
     message.starts_with("function ") && message.contains("not found for account")
 }
 
-fn model_unavailable_message(model: &str) -> String {
+fn model_unavailable_message(model: &str, hosted_exclusion: bool) -> String {
+    if hosted_exclusion {
+        return format!(
+            "NVIDIA's public NIM endpoint rejected '{}' for this key (404). \
+             This known unavailable hosted entry is excluded from the model list and \
+             automatic defaults. Choose another model in this chat. A successful explicit \
+             retry can restore it for this key. This is not a balance error.",
+            crate::redact::redact_output(model),
+        );
+    }
     format!(
         "NVIDIA NIM's deployment for '{}' is unavailable to this API key (404). \
          Hidden from this account's model list for 15 minutes. Choose another model, \
@@ -1705,6 +1749,86 @@ mod tests {
         assert_eq!(ids, HashSet::from(["fixture/updated", "fixture/new-chat"]));
     }
 
+    #[test]
+    fn known_hosted_entry_is_hidden_before_failure_and_success_is_key_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("availability");
+        let store = Arc::new(AvailabilityStore::new(root.clone()));
+        let account = store.scope([1; 32]);
+        let palmyra = "writer/palmyra-fin-70b-32k";
+        let raw = inventory_models(
+            vec![
+                json!({"id":palmyra,"available":true,"capabilities":{"chat":true}}),
+                json!({"id":"fixture/working"}),
+                json!({"id":"writer/new-finance-chat"}),
+            ],
+            vec![],
+        );
+        // This must work BEFORE a failed request, even for a cached raw list
+        // or generic public metadata that optimistically labels it available.
+        let fresh =
+            visible_inventory_models(raw.clone(), "https://integrate.api.nvidia.com", &account);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(
+            fresh[0].id, "fixture/working",
+            "never use Palmyra as an implicit default"
+        );
+        assert!(
+            fresh
+                .iter()
+                .any(|model| model.id == "writer/new-finance-chat")
+        );
+        assert_eq!(
+            visible_inventory_models(raw.clone(), "http://localhost:8000", &account).len(),
+            3
+        );
+        record_model_success(
+            "https://integrate.api.nvidia.com",
+            palmyra,
+            " \n ",
+            &account,
+        )
+        .unwrap();
+        record_model_success(
+            "http://localhost:8000",
+            palmyra,
+            "Self-hosted answer",
+            &account,
+        )
+        .unwrap();
+        assert!(
+            account.verified().is_empty(),
+            "blank or other-endpoint responses are not public-host proof"
+        );
+        record_model_success(
+            "https://integrate.api.nvidia.com",
+            palmyra,
+            "Recovered",
+            &account,
+        )
+        .unwrap();
+        assert_eq!(
+            visible_inventory_models(raw.clone(), "https://integrate.api.nvidia.com", &account)
+                .len(),
+            3
+        );
+        assert_eq!(
+            visible_inventory_models(
+                raw.clone(),
+                "https://integrate.api.nvidia.com",
+                &store.scope([2; 32])
+            )
+            .len(),
+            2
+        );
+        account.reject(palmyra).unwrap();
+        let restarted = Arc::new(AvailabilityStore::new(root)).scope([1; 32]);
+        assert_eq!(
+            visible_inventory_models(raw, "https://integrate.api.nvidia.com", &restarted).len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn empty_inventory_is_authoritative_even_with_healthy_featured_metadata() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2015,7 +2139,7 @@ mod tests {
 
     #[test]
     fn unavailable_errors_do_not_expose_nvidia_function_or_account_identifiers() {
-        let message = model_unavailable_message("fixture/chat");
+        let message = model_unavailable_message("fixture/chat", false);
         assert!(message.contains("fixture/chat"));
         assert!(message.contains("15 minutes"));
         assert!(message.contains("does not indicate your account balance"));
@@ -2023,9 +2147,18 @@ mod tests {
         assert!(!message.contains("fixture-account"));
         assert!(!message.contains("Refresh the model list"));
         assert!(
-            !model_unavailable_message("nvapi-private-fixture-1234567890")
+            !model_unavailable_message("nvapi-private-fixture-1234567890", false)
                 .contains("nvapi-private-fixture")
         );
+    }
+
+    #[test]
+    fn hosted_exclusion_error_does_not_promise_the_model_returns_after_a_timer() {
+        let message = model_unavailable_message("writer/palmyra-fin-70b-32k", true);
+        assert!(message.contains("Choose another model in this chat"));
+        assert!(message.contains("explicit retry"));
+        assert!(message.contains("not a balance error"));
+        assert!(!message.contains("15 minutes"));
     }
 
     #[test]

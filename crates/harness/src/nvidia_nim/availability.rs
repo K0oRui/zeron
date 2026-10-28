@@ -1,4 +1,4 @@
-//! Short-lived evidence from actual inference requests, never catalog probes.
+//! Account-scoped evidence from actual inference requests, never catalog probes.
 //! Files contain only model IDs and timestamps, keyed by a hash of endpoint + key.
 
 use std::{
@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 const REJECTION_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_SAVED_BYTES: u64 = 128 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-type Rejections = HashMap<String, u64>;
+type ModelTimes = HashMap<String, u64>;
 
 pub(super) struct AvailabilityStore {
     root: PathBuf,
-    accounts: Mutex<HashMap<[u8; 32], Rejections>>,
+    accounts: Mutex<HashMap<[u8; 32], Evidence>>,
 }
 
 #[derive(Clone)]
@@ -30,10 +30,21 @@ pub(super) struct AvailabilityScope {
     key: [u8; 32],
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct Evidence {
+    #[serde(default)]
+    models: ModelTimes,
+    // Only an actual successful completion can override a hosted exclusion.
+    // A later definitive rejection removes this evidence, regardless of TTL.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    verified: ModelTimes,
+}
+
 #[derive(Deserialize, Serialize)]
 struct Saved {
     version: u8,
-    models: Rejections,
+    #[serde(flatten)]
+    evidence: Evidence,
 }
 
 impl AvailabilityStore {
@@ -56,7 +67,7 @@ impl AvailabilityStore {
         self.root.join(format!("{hash}.json"))
     }
 
-    fn load(&self, key: &[u8; 32]) -> Rejections {
+    fn load(&self, key: &[u8; 32]) -> Evidence {
         let saved = (|| -> Option<Saved> {
             let file = std::fs::File::open(self.path(key)).ok()?;
             let mut bytes = Vec::new();
@@ -70,11 +81,11 @@ impl AvailabilityStore {
         })();
         saved
             .filter(|saved| saved.version == 1)
-            .map(|saved| saved.models)
+            .map(|saved| saved.evidence)
             .unwrap_or_default()
     }
 
-    fn save(&self, key: &[u8; 32], models: &Rejections) -> std::io::Result<()> {
+    fn save(&self, key: &[u8; 32], evidence: &Evidence) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
         #[cfg(unix)]
         {
@@ -89,7 +100,7 @@ impl AvailabilityStore {
         ));
         let bytes = serde_json::to_vec(&Saved {
             version: 1,
-            models: models.clone(),
+            evidence: evidence.clone(),
         })?;
         let result = (|| {
             let mut options = std::fs::OpenOptions::new();
@@ -129,38 +140,72 @@ impl AvailabilityScope {
         self.update(model, false, now())
     }
 
+    /// Remember a successful explicit use of a catalog-excluded hosted model.
+    /// This is key/endpoint scoped and is revoked by the next model-specific 404.
+    pub(super) fn verify(&self, model: &str) -> std::io::Result<()> {
+        self.record(model, false, true, now())
+    }
+
+    pub(super) fn verified(&self) -> HashSet<String> {
+        let mut accounts = self
+            .store
+            .accounts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let evidence = accounts
+            .entry(self.key)
+            .or_insert_with(|| self.store.load(&self.key));
+        let now = now();
+        evidence
+            .verified
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(model, _)| model.clone())
+            .collect()
+    }
+
     fn unavailable_at(&self, now: u64) -> HashSet<String> {
         let mut accounts = self
             .store
             .accounts
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let models = accounts
+        let evidence = accounts
             .entry(self.key)
             .or_insert_with(|| self.store.load(&self.key));
-        prune(models, now);
-        models.keys().cloned().collect()
+        prune(&mut evidence.models, now);
+        evidence.models.keys().cloned().collect()
     }
 
     fn update(&self, model: &str, reject: bool, now: u64) -> std::io::Result<()> {
+        self.record(model, reject, false, now)
+    }
+
+    fn record(&self, model: &str, reject: bool, verify: bool, now: u64) -> std::io::Result<()> {
         let mut accounts = self
             .store
             .accounts
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let models = accounts
+        let evidence = accounts
             .entry(self.key)
             .or_insert_with(|| self.store.load(&self.key));
-        prune(models, now);
+        prune(&mut evidence.models, now);
         let changed = if reject {
-            models.insert(model.to_owned(), now);
+            evidence.verified.remove(model);
+            evidence.models.insert(model.to_owned(), now);
             true
         } else {
-            models.remove(model).is_some()
+            let removed = evidence.models.remove(model).is_some();
+            let verified = verify && evidence.verified.get(model).is_none_or(|at| *at > now);
+            if verified {
+                evidence.verified.insert(model.to_owned(), now);
+            }
+            removed || verified
         };
         // Keep the in-memory evidence even if private disk storage is unwritable.
         if changed {
-            self.store.save(&self.key, models)
+            self.store.save(&self.key, evidence)
         } else {
             Ok(())
         }
@@ -174,7 +219,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn prune(models: &mut Rejections, now: u64) {
+fn prune(models: &mut ModelTimes, now: u64) {
     // A backward clock adjustment must not hide a model indefinitely either.
     models.retain(|_, rejected_at| {
         *rejected_at <= now && now - *rejected_at < REJECTION_TTL.as_secs()
@@ -300,6 +345,48 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn verified_access_survives_restart_without_leaking_to_another_key() {
+        let dir = TempDir::new();
+        dir.store()
+            .scope([1; 32])
+            .verify("fixture/known-hosted")
+            .unwrap();
+        assert!(
+            dir.store()
+                .scope([1; 32])
+                .verified()
+                .contains("fixture/known-hosted")
+        );
+        assert!(dir.store().scope([2; 32]).verified().is_empty());
+    }
+
+    #[test]
+    fn rejection_revokes_positive_evidence_even_after_its_short_timer_expires() {
+        let dir = TempDir::new();
+        let account = dir.store().scope([1; 32]);
+        account.verify("fixture/known-hosted").unwrap();
+        account.update("fixture/known-hosted", true, 1000).unwrap();
+        assert!(account.unavailable_at(1900).is_empty());
+        assert!(account.verified().is_empty());
+        assert!(dir.store().scope([1; 32]).verified().is_empty());
+    }
+
+    #[test]
+    fn legacy_rejections_load_without_a_verified_field() {
+        let dir = TempDir::new();
+        let store = dir.store();
+        std::fs::create_dir_all(&store.root).unwrap();
+        std::fs::write(
+            store.path(&[1; 32]),
+            r#"{"version":1,"models":{"fixture/chat":1000}}"#,
+        )
+        .unwrap();
+        let account = store.scope([1; 32]);
+        assert!(account.unavailable_at(1001).contains("fixture/chat"));
+        assert!(account.verified().is_empty());
     }
 
     #[test]

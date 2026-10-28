@@ -156,10 +156,51 @@ pub(super) fn is_chat_model(id: &str, row: &Value) -> bool {
     .any(|family| id.contains(family))
 }
 
+/// Exact, dated exclusions for NVIDIA's public hosted route, not a model
+/// allow-list or a claim that the weights/other deployments are retired.
+/// 2026-10-28: the Palmyra hosted page below returns 404, matching the reported
+/// function/account-not-found response. Do not apply this to self-hosted NIM.
+/// https://build.nvidia.com/writer/palmyra-fin-70b-32k
+/// An actual successful completion may override this exclusion for its key.
+pub(super) fn known_unavailable_on_hosted(base_url: &str, model: &str) -> bool {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    let public_host = base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com")
+        || base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com:443");
+    public_host && model == "writer/palmyra-fin-70b-32k"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn palmyra_exclusion_is_exact_and_public_hosted_only() {
+        let model = "writer/palmyra-fin-70b-32k";
+        for base in [
+            "https://integrate.api.nvidia.com",
+            "https://integrate.api.nvidia.com/v1/",
+            "https://integrate.api.nvidia.com:443",
+            "https://INTEGRATE.API.NVIDIA.COM/",
+        ] {
+            assert!(known_unavailable_on_hosted(base, model), "{base}");
+            assert!(!known_unavailable_on_hosted(
+                base,
+                "writer/new-finance-chat"
+            ));
+        }
+        for base in [
+            "http://localhost:8000",
+            "https://private.nim.example/v1",
+            "https://integrate.api.nvidia.com:8443",
+            "https://integrate.api.nvidia.com/private",
+            "https://integrate.api.nvidia.com.evil.example",
+            "https://integrate.api.nvidia.com?tenant=x",
+        ] {
+            assert!(!known_unavailable_on_hosted(base, model), "{base}");
+        }
+    }
 
     #[test]
     fn new_models_do_not_need_to_be_featured_or_statically_known() {

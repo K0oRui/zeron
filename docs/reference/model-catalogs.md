@@ -35,9 +35,35 @@ An omitted model is chosen from the actual request key's inventory, never a
 hardcoded default. Update both the app and the device running chats for these
 rules to apply; no manual cache-file deletion is needed.
 
+### Known unavailable public-hosted entries
+
+`writer/palmyra-fin-70b-32k` is excluded from Zeron's picker and implicit defaults
+for NVIDIA's public hosted endpoint **before** a failed prompt, even if
+`/v1/models` still lists it.
+On 2026-10-28 its [NVIDIA model page](https://build.nvidia.com/writer/palmyra-fin-70b-32k)
+returned a 404 page, matching the reported function/account-not-found inference
+failure. This is a dated public-route exclusion, not a claim that the model's
+weights or every private deployment have been retired. Other Writer IDs and
+self-hosted/custom NIM endpoints are not excluded by this rule.
+
+The exclusion is applied after memory-cache loading and does not expire when a
+15-minute rejection timer runs out. Explicit model requests remain allowed; a
+successful nonempty completion can restore the entry **only for that endpoint
+and key**, provided it is still in the inventory. This positive evidence survives
+restart in the same private store. A later definitive model rejection revokes it,
+including after the short negative-cache timer expires. Inventory metadata alone
+cannot claim this proof; no test prompts are sent automatically.
+
+An existing chat's selected model is not silently replaced. Choose a different
+model in that chat rather than repeatedly sending to the old selection. The
+error now says this instead of implying the hosted entry returns after a timer.
+
+### Other model-specific failures
+
 If an actual chat request returns NVIDIA's `404` / `Function …: Not found for
-account …` response (or a structured `model_not_found` rejection), that model is
-hidden for **15 minutes**, scoped to the exact endpoint and API key. This filter
+account …` response (or a structured `model_not_found` rejection), an entry not in
+the known hosted exclusion set is hidden for **15 minutes**, scoped to the exact
+endpoint and API key. This filter
 runs after inventory loading (including the short-lived memory cache), including
 when every row is rejected. Refreshing the inventory cannot immediately resurrect
 the same broken model. Other models, accounts and endpoints are unaffected.
@@ -106,7 +132,7 @@ The HTTP fixtures assert that discovery does not send inference prompts and
 that a failed model is never silently replaced.
 
 The prior model-specific 404 change passed GitHub core, engine, UI, app and
-cross-platform checks. For the inventory-only follow-up, **42 focused checks**
+cross-platform checks. For the inventory-only and Palmyra follow-ups, **48 focused checks**
 passed locally using the production client catalog, availability and discovery
 logic; extracted production inventory/cache/error logic and type definitions;
 and real Serde, JSON, Tokio, Tracing and Thiserror dependencies. The focused
