@@ -95,6 +95,7 @@ const MUSE_UPDATE_ENV: &[(&str, &str)] = &[
     ("MUSE_UPDATE_INTERVAL_SECONDS", "0"),
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UpdateCheck {
     Version(String),
     Available,
