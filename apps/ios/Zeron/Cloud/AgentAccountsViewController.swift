@@ -505,7 +505,7 @@ final class DeviceSignIn: NSObject, ASWebAuthenticationPresentationContextProvid
         if start.pasteCode {
             // API-key flows have no page; Claude's paste-code fallback does.
             if !start.url.isEmpty { open(start.url) }
-            guard let code = await askForCode(apiKey: start.url.isEmpty, harness: harness) else {
+            guard let code = await askForCode(apiKey: start.url.isEmpty) else {
                 client.deviceLoginCancel(deviceId: device, loginId: start.loginId)
                 throw CancellationError()
             }
@@ -564,21 +564,18 @@ final class DeviceSignIn: NSObject, ASWebAuthenticationPresentationContextProvid
         s.start()
     }
 
-    private func askForCode(apiKey: Bool = false, harness: String = "") async -> String? {
+    private func askForCode(apiKey: Bool = false) async -> String? {
         guard let host else { return nil }
-        let nvidia = apiKey && harness == "nvidia-nim"
         return await withCheckedContinuation { cont in
             let alert = UIAlertController(
-                title: apiKey ? (nvidia ? "NVIDIA API key" : "OpenAI API key") : "Paste the code",
+                title: apiKey ? "OpenAI API key" : "Paste the code",
                 message: apiKey
-                    ? (nvidia
-                        ? "Paste the key from NVIDIA API Catalog. It is sent only to the computer hosting NIM."
-                        : "Paste your OpenAI API key. It is sent only to the computer hosting Codex.")
+                    ? "Paste your OpenAI API key. It is sent only to the computer hosting Codex."
                     : "Copy the code the sign-in page shows, then paste it here.",
                 preferredStyle: .alert
             )
             alert.addTextField { field in
-                field.placeholder = apiKey ? (nvidia ? "nvapi-…" : "sk-…") : "Authorization code"
+                field.placeholder = apiKey ? "sk-…" : "Authorization code"
                 field.isSecureTextEntry = apiKey
                 field.autocorrectionType = .no
                 field.autocapitalizationType = .none

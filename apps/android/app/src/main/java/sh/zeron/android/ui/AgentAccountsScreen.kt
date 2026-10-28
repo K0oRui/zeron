@@ -380,8 +380,8 @@ fun AgentAccountsScreen(model: AppModel, target: AccountsTarget, signIn: Boolean
         }
     }
     codeRequest?.let { request ->
-        apiKeyHarness?.let { harness ->
-            DeviceApiKeyDialog(harness = harness, onDismiss = { request.complete(null) }, onKey = { request.complete(it) })
+        apiKeyHarness?.let {
+            DeviceApiKeyDialog(onDismiss = { request.complete(null) }, onKey = { request.complete(it) })
         } ?: PasteCodeDialog(onDismiss = { request.complete(null) }, onCode = { request.complete(it) })
     }
     removing?.let { a ->
@@ -512,27 +512,25 @@ private fun ApiKeyDialog(agent: CloudStore.Agent, onDismiss: () -> Unit, onSave:
 
 /** A computer-hosted API-key login: the key never enters Cloud or this phone's store. */
 @Composable
-private fun DeviceApiKeyDialog(harness: String, onDismiss: () -> Unit, onKey: (String) -> Unit) {
+private fun DeviceApiKeyDialog(onDismiss: () -> Unit, onKey: (String) -> Unit) {
     var key by remember { mutableStateOf("") }
     val focus = remember { FocusRequester() }
-    val nvidia = harness == "nvidia-nim"
     LaunchedEffect(Unit) { focus.requestFocus() }
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { ZIcon(ZIcons.Key, null) },
-        title = { Text(if (nvidia) "NVIDIA API key" else "OpenAI API key") },
+        title = { Text("OpenAI API key") },
         text = {
             Column {
                 Text(
-                    if (nvidia) "Paste the key from NVIDIA API Catalog. It is sent only to the computer hosting NIM."
-                    else "Paste your OpenAI API key. It is sent only to the computer hosting Codex.",
+                    "Paste your OpenAI API key. It is sent only to the computer hosting Codex.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     key, { key = it.trim() },
                     singleLine = true,
-                    placeholder = { Text(if (nvidia) "nvapi-…" else "sk-…") },
+                    placeholder = { Text("sk-…") },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
                     shape = RoundedCornerShape(16.dp),

@@ -50,13 +50,12 @@ pub const PROVIDERS: [HarnessId; 6] = [
 /// it whatever the preference says. Settings names them instead of letting
 /// the routed list imply full coverage (`Mock` is test-only and stays out of
 /// both lists).
-pub const UNROUTED: [HarnessId; 6] = [
+pub const UNROUTED: [HarnessId; 5] = [
     HarnessId::Devin,
     HarnessId::Hermes,
     HarnessId::Pi,
     HarnessId::Kilo,
     HarnessId::Muse,
-    HarnessId::NvidiaNim,
 ];
 
 const INSTALL_DEADLINE: Duration = Duration::from_secs(15 * 60);
@@ -1067,6 +1066,11 @@ mod tests {
     /// agent either has a route or is named as one Headroom cannot compress.
     #[test]
     fn provider_lists_match_the_route_table() {
+        assert_eq!(
+            PROVIDERS.len() + UNROUTED.len(),
+            HarnessId::ALL.len() - 1,
+            "every non-mock harness must occur in exactly one Headroom list"
+        );
         for harness in HarnessId::ALL {
             assert_eq!(
                 !routes(harness, 8787).is_empty(),

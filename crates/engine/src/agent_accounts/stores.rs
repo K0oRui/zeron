@@ -179,7 +179,6 @@ pub(super) fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
-        HarnessId::NvidiaNim => "nvidia-nim",
     }
 }
 
@@ -203,10 +202,6 @@ pub(super) fn unsupported_login(harness: HarnessId, provider: &str) -> EngineErr
         (HarnessId::Pi, "anthropic") => {
             "Claude logins for Pi stay with pi's own /login — zeron only mints Claude Code \
              logins for Claude Code."
-                .to_string()
-        }
-        (HarnessId::NvidiaNim, _) => {
-            "NVIDIA NIM accepts an NVIDIA API key (`nvapi-…`), not that login method."
                 .to_string()
         }
         _ => format!(

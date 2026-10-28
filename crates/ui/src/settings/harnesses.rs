@@ -127,7 +127,6 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
-        HarnessId::NvidiaNim => "nvidia-nim",
     }
 }
 
@@ -148,7 +147,6 @@ fn headroom_provider_labels(providers: &[HarnessId]) -> String {
             HarnessId::Antigravity => "Antigravity",
             HarnessId::Muse => "Muse",
             HarnessId::Mock => "Mock",
-            HarnessId::NvidiaNim => "NVIDIA NIM",
         })
         .collect();
     names.join(", ")
@@ -718,9 +716,10 @@ impl HarnessesPage {
                         Ok(mut stream) => {
                             while let Some(value) = stream.recv().await {
                                 retry = 1;
-                                let parsed =
-                                    serde_json::from_value::<Vec<HarnessUpdateStatus>>(value)
-                                        .map_err(|error| error.to_string());
+                                let parsed = zeron_proto::providers::decode_provider_rows::<
+                                    HarnessUpdateStatus,
+                                >(value, "harness")
+                                .map_err(|error| error.to_string());
                                 if this
                                     .update(cx, |page, cx| {
                                         page.updates = match parsed {
@@ -792,7 +791,10 @@ impl HarnessesPage {
             this.update(cx, |page, cx| {
                 page.switching = false;
                 page.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                    Ok(value) => match zeron_proto::providers::decode_provider_rows::<
+                        HarnessDescriptor,
+                    >(value, "id")
+                    {
                         Ok(list) => Loadable::Ready(list),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
@@ -853,7 +855,7 @@ impl HarnessesPage {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| {
-                    serde_json::from_value::<Vec<HarnessDescriptor>>(value)
+                    zeron_proto::providers::decode_provider_rows::<HarnessDescriptor>(value, "id")
                         .map_err(|error| error.to_string())
                 });
             this.update(cx, |page, cx| {
@@ -897,7 +899,10 @@ impl HarnessesPage {
                 }
                 match result {
                     Ok(value) => {
-                        if let Ok(list) = serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                        if let Ok(list) = zeron_proto::providers::decode_provider_rows::<
+                            HarnessDescriptor,
+                        >(value, "id")
+                        {
                             page.harnesses = Loadable::Ready(list);
                         }
                         if !enabled && page.expanded_harness == Some(harness) {
@@ -935,7 +940,10 @@ impl HarnessesPage {
             this.update(cx, |page, cx| {
                 page.checking_updates = false;
                 match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessUpdateStatus>>(value) {
+                    Ok(value) => match zeron_proto::providers::decode_provider_rows::<
+                        HarnessUpdateStatus,
+                    >(value, "harness")
+                    {
                         Ok(statuses) => page.updates = Loadable::Ready(statuses),
                         Err(error) => page.error = Some(error.to_string()),
                     },

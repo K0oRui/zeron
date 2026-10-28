@@ -195,10 +195,6 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
             "Paste an OpenAI API key. It is stored next to your current login — nothing \
              changes until you switch. API keys have no plan usage meters."
         }
-        (HarnessId::NvidiaNim, _) => {
-            "Paste an NVIDIA API key (`nvapi-…`). The first key is selected automatically; \
-             adding another never switches your current account for you."
-        }
         (HarnessId::Codex, _) => {
             "Finish signing in to ChatGPT in your browser. The new login is saved next to \
              your current one — nothing changes until you switch."
@@ -378,7 +374,7 @@ enum LoginStep {
         submitting: bool,
         error: Option<SharedString>,
     },
-    /// Raw provider key entry (OpenAI or NVIDIA), completed through the
+    /// Raw OpenAI API key entry, completed through the
     /// engine's expiring API-key login flow with no browser round-trip.
     ApiKey {
         submitting: bool,
@@ -882,13 +878,8 @@ impl AccountsPage {
                             submitting: false,
                             error: None,
                         };
-                        let placeholder = if flow.harness == HarnessId::NvidiaNim {
-                            "nvapi-…"
-                        } else {
-                            "sk-…"
-                        };
                         self.code_input.update(cx, |input, cx| {
-                            input.set_placeholder(placeholder, cx);
+                            input.set_placeholder("sk-…", cx);
                             input.set_text("", cx);
                         });
                     }
@@ -2199,7 +2190,6 @@ impl Render for AccountsPage {
             HarnessId::Kilo => (crate::icons::KILO_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
-            HarnessId::NvidiaNim => (crate::icons::NIM_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -2684,11 +2674,6 @@ mod tests {
             ..waiting(HarnessId::Codex, 1)
         };
         assert_eq!(api_flow.title(), "Add an API key for Codex");
-        let nim = login_options(HarnessId::NvidiaNim);
-        assert_eq!(nim.len(), 1);
-        assert_eq!(nim[0].provider, Some("api-key"));
-        assert!(!reports_usage(HarnessId::NvidiaNim));
-        assert!(login_copy(HarnessId::NvidiaNim, Some("api-key")).contains("nvapi-"));
         let opencode = login_options(HarnessId::Opencode);
         let labels: Vec<_> = opencode.iter().map(|o| o.label).collect();
         assert_eq!(labels, ["ChatGPT", "GitHub Copilot"]);

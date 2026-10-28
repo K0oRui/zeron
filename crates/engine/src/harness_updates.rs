@@ -48,6 +48,21 @@ struct Preferences {
     dismissed_versions: HashMap<HarnessId, String>,
 }
 
+impl Preferences {
+    fn decode(text: &str) -> Option<Self> {
+        let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+        for field in ["policies", "dismissedVersions"] {
+            if let Some(entries) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                entries.retain(|slug, _| HarnessId::from_slug(slug).is_some());
+            }
+        }
+        serde_json::from_value(value).ok()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LatestSource {
     AntigravityAcp,
@@ -394,12 +409,6 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "",
         },
-        HarnessId::NvidiaNim => ProviderSpec {
-            version_args: &["--version"],
-            latest: LatestSource::Manual,
-            update_args: None,
-            manual_command: "",
-        },
     }
 }
 
@@ -630,7 +639,7 @@ impl HarnessUpdateCoordinator {
         let prefs_path = data_dir.join("harness-update-prefs.json");
         let prefs: Preferences = std::fs::read_to_string(&prefs_path)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| Preferences::decode(&text))
             .unwrap_or_default();
         let order: Vec<_> = registry
             .descriptors()
@@ -1002,23 +1011,6 @@ impl HarnessUpdateCoordinator {
             return Ok(());
         }
         if self.settle_if_unmonitored(harness) {
-            return Ok(());
-        }
-        if harness == HarnessId::NvidiaNim {
-            // NIM ships inside Zeron, not as an independently installed CLI.
-            // Its release is the application's release; never probe a made-up
-            // executable or ask the user to update a separate provider.
-            self.mutate(harness, |status| {
-                status.installed_version = Some(env!("CARGO_PKG_VERSION").into());
-                status.latest_version = None;
-                status.channel = None;
-                status.can_apply = false;
-                status.manual_command = None;
-                status.phase = HarnessUpdatePhase::Current;
-                status.progress = None;
-                status.checked_at = Some(now_ms());
-                status.error = None;
-            });
             return Ok(());
         }
         let _check_slot = self
@@ -3115,24 +3107,26 @@ mod tests {
 
     use crate::registry::HarnessRegistry;
 
-    struct ExecutableHarness(PathBuf, HarnessId);
-
-    #[tokio::test]
-    async fn builtin_nim_update_check_does_not_look_for_a_cli() {
-        let temp = tempfile::tempdir().unwrap();
-        let registry = Arc::new(HarnessRegistry::new());
-        registry.register(Arc::new(ExecutableHarness(
-            PathBuf::new(),
-            HarnessId::NvidiaNim,
-        )));
-        let coordinator = super::HarnessUpdateCoordinator::new(temp.path(), registry);
-        coordinator.check_one(HarnessId::NvidiaNim).await.unwrap();
-        let status = coordinator.status(HarnessId::NvidiaNim);
-        assert_eq!(status.phase, HarnessUpdatePhase::Current);
-        assert!(status.error.is_none());
-        assert!(!status.can_apply);
-        assert_eq!(status.installed_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    #[test]
+    fn retired_provider_update_preferences_preserve_other_policies() {
+        let prefs = super::Preferences::decode(
+            r#"{
+            "policies": {"codex": "off", "removed-provider": "auto-when-idle"},
+            "dismissedVersions": {"claude-code": "2.0.0", "removed-provider": "1.0.0"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(prefs.policies.len(), 1);
+        assert_eq!(
+            prefs.policies[&HarnessId::Codex],
+            zeron_proto::HarnessUpdatePolicy::Off
+        );
+        assert_eq!(prefs.dismissed_versions.len(), 1);
+        assert_eq!(prefs.dismissed_versions[&HarnessId::ClaudeCode], "2.0.0");
+        assert!(super::Preferences::decode("not json").is_none());
     }
+
+    struct ExecutableHarness(PathBuf, HarnessId);
 
     #[cfg(unix)]
     #[tokio::test]

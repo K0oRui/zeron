@@ -20,11 +20,11 @@ struct Saved {
 
 fn location(root: &Path, harness: &dyn Harness, context: &ModelContext) -> PathBuf {
     let id = serde_json::to_value(harness.id()).unwrap();
-    // Kilo persists only free gateway rows; Devin persists only the rows its
-    // signed-in plan can run. The new names keep a previous unfiltered catalog
-    // from being served once during an upgrade.
+    // Kilo persists its full inventory, with balance filtering AFTER loading
+    // it. Do not reuse the old free-only cache on a funded account. Devin
+    // still persists only the rows its signed-in plan can run.
     let name = match harness.id() {
-        zeron_proto::HarnessId::Kilo => format!("free-{}.json", context.hash),
+        zeron_proto::HarnessId::Kilo => format!("inventory-{}.json", context.hash),
         zeron_proto::HarnessId::Devin => format!("plan-{}.json", context.hash),
         _ => format!("{}.json", context.hash),
     };

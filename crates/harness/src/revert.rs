@@ -1,6 +1,6 @@
 //! Rewind a provider's native session to a Zeron user message.
 //!
-//! OpenCode and NVIDIA NIM own their stores and override the harness methods.
+//! OpenCode owns its store and overrides the harness methods.
 //! Everyone else persists JSONL (or nothing): preview reports no restorable
 //! files, and commit truncates the file at the target user turn so the next
 //! resume does not replay messages the transcript no longer has.
@@ -133,7 +133,7 @@ pub fn session_file_in(
 ) -> Option<PathBuf> {
     let id = safe_id(resume_id(request)?)?;
     match harness {
-        HarnessId::Opencode | HarnessId::NvidiaNim | HarnessId::Mock => None,
+        HarnessId::Opencode | HarnessId::Mock => None,
         HarnessId::ClaudeCode => claude_session(&request.env, id),
         HarnessId::Codex => codex_rollout(&request.env, id),
         HarnessId::Pi => None,

@@ -40,6 +40,7 @@ type Handler = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
 struct MockServer {
     base: String,
     hits: Arc<Mutex<Vec<String>>>,
+    headers: Arc<Mutex<Vec<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -53,11 +54,14 @@ impl MockServer {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let hits: Arc<Mutex<Vec<String>>> = Arc::default();
         let handler: Arc<Handler> = Arc::new(handler);
+        let headers: Arc<Mutex<Vec<String>>> = Arc::default();
+        let task_headers = headers.clone();
         let task_hits = hits.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let handler = handler.clone();
                 let hits = task_hits.clone();
+                let headers = task_headers.clone();
                 tokio::spawn(async move {
                     let mut raw = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -90,6 +94,7 @@ impl MockServer {
                     let method = first.next().unwrap_or("").to_string();
                     let path = first.next().unwrap_or("").to_string();
                     lock(&hits).push(format!("{method} {path}"));
+                    lock(&headers).push(head);
                     let (status, reply) = handler(&method, &path, &body);
                     let response = http_response(
                         &format!("{status} X"),
@@ -104,6 +109,7 @@ impl MockServer {
         Self {
             base,
             hits,
+            headers,
             _task: task,
         }
     }
@@ -133,6 +139,7 @@ fn mocked(base: &str) -> ProbeEndpoints {
         claude_profile: format!("{base}/api/oauth/profile"),
         codex_usage: format!("{base}/backend-api/wham/usage"),
         grok_usage: format!("{base}/v1/billing?format=credits"),
+        kilo_balance: format!("{base}/api/profile/balance"),
         github_api: base.to_string(),
         github_login: base.to_string(),
         openai_auth: base.to_string(),
@@ -1955,4 +1962,176 @@ async fn a_failed_sign_ins_output_is_redacted_before_the_ui_sees_it() {
         message,
         "failed at https://auth.x.ai/device?… with code [code] token=[redacted]"
     );
+}
+
+fn kilo_catalog_rows() -> Vec<zeron_proto::Model> {
+    [
+        ("kilo/router/free", "Auto Free"),
+        ("kilo/anthropic/paid", "Paid"),
+        ("openai/independent", "ChatGPT"),
+    ]
+    .into_iter()
+    .map(|(id, label)| zeron_proto::Model {
+        id: id.into(),
+        label: label.into(),
+        description: None,
+        reasoning_levels: vec![],
+        options: vec![],
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn kilo_catalog_follows_the_current_balance_in_both_directions() {
+    let balance = Arc::new(AtomicUsize::new(25));
+    let current = balance.clone();
+    let server = MockServer::start(move |method, path, _| {
+        assert_eq!((method, path), ("GET", "/api/profile/balance"));
+        (
+            200,
+            serde_json::json!({"balance":current.load(Ordering::SeqCst)}).to_string(),
+        )
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = AgentAccountsConfig::isolated(tmp.path());
+    write(
+        &config.kilo_auth_file,
+        r#"{"kilo":{"type":"oauth","access":"kilo-fixture-token","accountId":"fixture-team"}}"#,
+    );
+    let accounts = AgentAccounts::with_endpoints(config, mocked(&server.base), Default::default());
+    let inventory = kilo_catalog_rows();
+    assert_eq!(
+        accounts
+            .filter_kilo_models(inventory.clone())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    balance.store(0, Ordering::SeqCst);
+    let free = accounts
+        .filter_kilo_models(inventory.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        free.iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["kilo/router/free", "openai/independent"]
+    );
+    // Same token and same raw (possibly disk-cached) catalog: topping up must
+    // not need another login or permanently lose the paid inventory.
+    balance.store(50, Ordering::SeqCst);
+    assert_eq!(
+        accounts.filter_kilo_models(inventory).await.unwrap().len(),
+        3
+    );
+    assert_eq!(lock(&server.hits).len(), 3);
+    for headers in lock(&server.headers).iter() {
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer kilo-fixture-token"));
+        assert!(headers.contains("x-kilocode-organizationid: fixture-team"));
+    }
+}
+
+#[tokio::test]
+async fn kilo_zero_balance_without_free_models_returns_an_authoritative_empty_list() {
+    let server = MockServer::start(|_, _, _| (200, r#"{"balance":0}"#.into())).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = AgentAccountsConfig::isolated(tmp.path());
+    write(
+        &config.kilo_auth_file,
+        r#"{"kilo":{"type":"api","key":"kilo-fixture-token"}}"#,
+    );
+    let accounts = AgentAccounts::with_endpoints(config, mocked(&server.base), Default::default());
+    let mut rows = kilo_catalog_rows();
+    rows.retain(|model| model.id == "kilo/anthropic/paid");
+    assert!(accounts.filter_kilo_models(rows).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn kilo_an_unavailable_balance_is_not_an_empty_balance() {
+    for (status, body) in [(503, "{}"), (200, "{}"), (200, r#"{"balance":null}"#)] {
+        let server = MockServer::start(move |_, _, _| (status, body.into())).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig::isolated(tmp.path());
+        write(
+            &config.kilo_auth_file,
+            r#"{"kilo":{"type":"api","key":"kilo-fixture-token"}}"#,
+        );
+        let accounts =
+            AgentAccounts::with_endpoints(config, mocked(&server.base), Default::default());
+        assert_eq!(
+            accounts
+                .filter_kilo_models(kilo_catalog_rows())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+}
+
+#[tokio::test]
+async fn kilo_anonymous_accounts_hide_only_paid_gateway_models_without_a_balance_request() {
+    let server = MockServer::start(|_, _, _| panic!("anonymous needs no balance request")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = AgentAccountsConfig::isolated(tmp.path());
+    write(
+        &config.kilo_auth_file,
+        r#"{"kilo":{"type":"api","key":"anonymous"}}"#,
+    );
+    let accounts = AgentAccounts::with_endpoints(config, mocked(&server.base), Default::default());
+    let rows = accounts
+        .filter_kilo_models(kilo_catalog_rows())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].id, "openai/independent");
+    assert!(lock(&server.hits).is_empty());
+}
+
+#[tokio::test]
+async fn kilo_does_not_apply_a_balance_from_an_account_switched_mid_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = AgentAccountsConfig::isolated(tmp.path());
+    write(
+        &config.kilo_auth_file,
+        r#"{"kilo":{"type":"api","key":"first-fixture-token"}}"#,
+    );
+    let auth_file = config.kilo_auth_file.clone();
+    let server = MockServer::start(move |_, _, _| {
+        write(
+            &auth_file,
+            r#"{"kilo":{"type":"api","key":"second-fixture-token"}}"#,
+        );
+        (200, r#"{"balance":0}"#.into())
+    })
+    .await;
+    let accounts = AgentAccounts::with_endpoints(config, mocked(&server.base), Default::default());
+    let error = accounts
+        .filter_kilo_models(kilo_catalog_rows())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("account changed"));
+    assert!(!error.to_string().contains("fixture-token"));
+}
+
+#[tokio::test]
+async fn codex_api_keys_keep_the_legacy_flow_on_generic_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = AgentAccounts::new(AgentAccountsConfig::isolated(tmp.path()));
+    let start = accounts
+        .start_login_with(HarnessId::Codex, Some("api-key"), None)
+        .await
+        .unwrap();
+    assert_eq!(start.mode, AgentLoginMode::ApiKey);
+    let snapshot = accounts
+        .complete_login(&start.login_id, "sk-test-12345678abcd")
+        .await
+        .unwrap();
+    assert!(snapshot.accounts.iter().any(|account| {
+        account.harness == HarnessId::Codex && account.auth_kind == Some(AgentAuthKind::ApiKey)
+    }));
 }

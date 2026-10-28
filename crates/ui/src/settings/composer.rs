@@ -76,10 +76,42 @@ pub struct ComposerDefaults {
 }
 
 impl ComposerDefaults {
+    fn decode(text: &str) -> Result<Self, serde_json::Error> {
+        let mut value: serde_json::Value = serde_json::from_str(text)?;
+        if let Some(settings) = value.as_object_mut()
+            && settings
+                .get("harness")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|slug| HarnessId::from_slug(slug).is_none())
+        {
+            settings.remove("harness");
+        }
+        for field in ["modelByHarness", "reasoningByModel", "modelOptionsByModel"] {
+            if let Some(entries) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                entries.retain(|slug, _| HarnessId::from_slug(slug).is_some());
+            }
+        }
+        if let Some(favorites) = value
+            .get_mut("favorites")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            favorites.retain(|favorite| {
+                favorite
+                    .get("harness")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|slug| HarnessId::from_slug(slug).is_some())
+            });
+        }
+        serde_json::from_value(value)
+    }
+
     /// Load from `{data_dir}/composer-defaults.json`; defaults on any failure.
     pub fn load(data_dir: &Path) -> Self {
         match std::fs::read_to_string(Self::path(data_dir)) {
-            Ok(text) => match serde_json::from_str::<ComposerDefaults>(&text) {
+            Ok(text) => match Self::decode(&text) {
                 Ok(defaults) => defaults,
                 Err(err) => {
                     tracing::warn!(error = %err, "composer-defaults corrupt; using defaults");
@@ -220,6 +252,70 @@ impl ComposerDefaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_provider_defaults_preserve_other_picks_and_favorites() {
+        let defaults = ComposerDefaults::decode(
+            r#"{
+            "harness": "removed-provider",
+            "device": "my-device",
+            "noProject": true,
+            "reasoning": "high",
+            "modelByHarness": {
+                "removed-provider": {"id": "old/model", "label": "Old"},
+                "codex": {"id": "gpt-5.2-codex", "label": "GPT-5.2"}
+            },
+            "reasoningByModel": {
+                "removed-provider": {"old/model": "low"},
+                "codex": {"gpt-5.2-codex": "medium"}
+            },
+            "modelOptionsByModel": {
+                "removed-provider": {"old/model": {}},
+                "codex": {"gpt-5.2-codex": {"serviceTier": "fast"}}
+            },
+            "favorites": [
+                {"harness": "removed-provider", "model": "old/model"},
+                {"harness": "codex", "model": "gpt-5.2-codex"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(defaults.harness, None);
+        assert_eq!(defaults.device.as_deref(), Some("my-device"));
+        assert!(defaults.no_project);
+        assert_eq!(defaults.reasoning, Some(ReasoningLevel::High));
+        assert_eq!(defaults.model_by_harness.len(), 1);
+        assert_eq!(
+            defaults.model_by_harness[&HarnessId::Codex].id,
+            "gpt-5.2-codex"
+        );
+        assert_eq!(defaults.reasoning_by_model.len(), 1);
+        assert_eq!(
+            defaults.reasoning_by_model[&HarnessId::Codex]["gpt-5.2-codex"],
+            ReasoningLevel::Medium
+        );
+        assert_eq!(defaults.model_options_by_model.len(), 1);
+        assert_eq!(
+            defaults.model_options_by_model[&HarnessId::Codex]["gpt-5.2-codex"]["serviceTier"],
+            "fast"
+        );
+        assert_eq!(defaults.favorites.len(), 1);
+        assert_eq!(defaults.favorites[0].harness, HarnessId::Codex);
+    }
+
+    #[test]
+    fn supported_last_harness_survives_a_retired_favorite() {
+        let defaults = ComposerDefaults::decode(
+            r#"{
+            "harness": "codex",
+            "favorites": [{"harness": "removed-provider", "model": "old/model"}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(defaults.harness, Some(HarnessId::Codex));
+        assert!(defaults.favorites.is_empty());
+        assert!(ComposerDefaults::decode("not json").is_err());
+    }
 
     #[test]
     fn round_trip() {

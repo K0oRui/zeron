@@ -1366,7 +1366,9 @@ pub enum AgentAuthKind {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentAccountsSnapshot {
+    #[serde(deserialize_with = "crate::providers::deserialize_provider_rows")]
     pub accounts: Vec<AgentAccount>,
+    #[serde(deserialize_with = "crate::providers::deserialize_provider_rows")]
     pub warnings: Vec<AgentAccountWarning>,
 }
 
@@ -1403,8 +1405,8 @@ pub enum AgentLoginMode {
     /// A loopback callback completes the sign-in in the browser (every
     /// provider's default); poll until done.
     Browser,
-    /// The user pastes a raw provider API key (Codex `OPENAI_API_KEY`,
-    /// NVIDIA `NVIDIA_API_KEY`). No browser flow runs; `CompleteAgentLogin`
+    /// The user pastes a raw provider API key (Codex `OPENAI_API_KEY`).
+    /// No browser flow runs; `CompleteAgentLogin`
     /// saves it into the same account store as an OAuth login.
     ApiKey,
 }

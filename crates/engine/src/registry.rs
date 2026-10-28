@@ -99,6 +99,34 @@ struct HarnessPrefsFile {
     enabled: Option<Vec<HarnessId>>,
 }
 
+impl HarnessPrefsFile {
+    fn decode(text: &str) -> Option<Self> {
+        let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+        for field in ["disabled", "enabled"] {
+            if let Some(ids) = value
+                .get_mut(field)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                ids.retain(|id| id.as_str().and_then(HarnessId::from_slug).is_some());
+            }
+        }
+        if let Some(titles) = value
+            .get_mut("titles")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let unsupported = titles
+                .get("harness")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|slug| HarnessId::from_slug(slug).is_none());
+            if unsupported {
+                titles.remove("harness");
+                titles.remove("model");
+            }
+        }
+        serde_json::from_value(value).ok()
+    }
+}
+
 /// Per-device automatic session title preferences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -183,7 +211,7 @@ pub struct HarnessRegistry {
     /// Spawn-time environment provider (Cloud runner only).
     run_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Spawn-time environment of the agent accounts zeron keeps itself
-    /// (Muse's per-account roots and NIM's selected API key); after the Cloud
+    /// (Muse's per-account roots); after the Cloud
     /// broker, never over it.
     account_environment: Mutex<Option<Arc<dyn RunEnvironment>>>,
     /// Credits Zeron in agents' commits ([`crate::commit_credit`]).
@@ -477,7 +505,7 @@ impl HarnessRegistry {
         let path = data_dir.join("harness-prefs.json");
         let loaded = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|text| serde_json::from_str::<HarnessPrefsFile>(&text).ok())
+            .and_then(|text| HarnessPrefsFile::decode(&text))
             .unwrap_or_default();
         *self.prefs() = loaded;
         *self
@@ -968,30 +996,53 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
     );
-    // NVIDIA NIM — authenticated OpenAI-compatible inference over HTTP.
-    // Its direct driver parks between turns and accepts the next prompt there.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::NvidiaNim,
-            name: "NVIDIA NIM".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        Box::new(|| zeron_harness::NvidiaNimHarness::new().installed()),
-        Box::new(|| {
-            Ok(Arc::new(zeron_harness::NvidiaNimHarness::new()) as Arc<dyn Harness>)
-        }),
-    );
     registry
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_provider_preferences_preserve_unrelated_choices() {
+        let prefs = HarnessPrefsFile::decode(
+            r#"{
+            "disabled": ["codex", "removed-provider"],
+            "titles": {"harness": "claude-code", "model": "claude-haiku-5-5"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
+        assert_eq!(prefs.titles.harness, Some(HarnessId::ClaudeCode));
+        assert_eq!(prefs.titles.model.as_deref(), Some("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn retired_title_provider_cannot_repurpose_its_model() {
+        let prefs = HarnessPrefsFile::decode(
+            r#"{
+            "disabled": ["codex"],
+            "titles": {"harness": "removed-provider", "model": "retired/model"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
+        assert_eq!(prefs.titles, TitleSettings::default());
+    }
+
+    #[test]
+    fn legacy_allow_lists_ignore_retired_provider_ids() {
+        let prefs = HarnessPrefsFile::decode(
+            r#"{
+            "enabled": ["codex", "removed-provider"],
+            "titles": {"model": "session-model"}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(prefs.enabled, Some(vec![HarnessId::Codex]));
+        assert_eq!(prefs.titles.model.as_deref(), Some("session-model"));
+        assert!(HarnessPrefsFile::decode("broken json").is_none());
+    }
 
     #[test]
     fn mid_turn_steering_requires_support_and_a_step_boundary() {
@@ -1071,7 +1122,6 @@ mod tests {
                 HarnessId::Kilo,
                 HarnessId::Antigravity,
                 HarnessId::Muse,
-                HarnessId::NvidiaNim,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());

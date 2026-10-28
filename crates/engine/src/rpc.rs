@@ -2628,14 +2628,42 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let context = if p.harness == HarnessId::Kilo {
+                    harness.model_context().map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    None
+                };
                 let models = crate::model_catalogs::list_with_lease(
                     self.repos.data_dir(),
-                    harness,
+                    harness.clone(),
                     p.force,
                     Some(lease),
                 )
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Balance is not part of the credential fingerprint and may
+                // change after a top-up or a turn. Apply it after ALL catalog
+                // sources, never persist a balance-filtered inventory.
+                let models = if p.harness == HarnessId::Kilo {
+                    let models = self
+                        .agent_accounts
+                        .filter_kilo_models(models)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let current = harness
+                        .model_context()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if current.as_ref().map(|context| &context.hash)
+                        != context.as_ref().map(|context| &context.hash)
+                    {
+                        return Err(RpcError::Failed(
+                            "Kilo account changed while loading models; retry.".into(),
+                        ));
+                    }
+                    models
+                } else {
+                    models
+                };
                 RpcReply::value(&models)
             }
             methods::LIST_SKILLS => {

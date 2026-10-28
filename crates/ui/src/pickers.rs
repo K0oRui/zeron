@@ -1932,7 +1932,10 @@ impl Pickers {
                 pickers.harnesses_revalidating = false;
                 pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                    Ok(value) => match zeron_proto::providers::decode_provider_rows::<
+                        HarnessDescriptor,
+                    >(value, "id")
+                    {
                         Ok(list) => Loadable::Ready(list),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
@@ -6430,33 +6433,18 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// Kilo advertises its whole gateway catalog, including rows that need
-/// credits. The rule is shared ([`zeron_proto::kilo`]) with the harness's
-/// discovery-side filter and the relay client, applied here so a catalog from
-/// an older engine still opens on the free rows only.
-fn kilo_model_is_free(model: &Model) -> bool {
-    zeron_proto::kilo::gateway_model_is_free(&model.id, &model.label)
-}
-
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
 /// fold (`models_from_session`) for catalogs served by OLDER engines (the
 /// space's device may run any version): the `default` alias row drops when a
 /// real row exists, an orphan `<model>[1m]` variant presents as its base id
 /// with the Context Window trait pinned to 1M, and Claude rows adopt the
 /// curated catalog's labels so the version number always shows ("Opus 5.5",
-/// not the wire's terse "Opus" alias — user request). Kilo keeps only its free
-/// rows. Idempotent over already-clean lists. The send path recomposes the
+/// not the wire's terse "Opus" alias — user request). The engine owns
+/// account/balance filtering; display normalization preserves its rows.
+/// Idempotent over already-clean lists. The send path recomposes the
 /// advertised id from the base + trait (`pick_model_value`), so a folded pick
 /// still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
-    // An older engine never filtered Kilo's gateway rows. Keep the free ones;
-    // if the rule matches nothing (a renamed free tier), show the list as-is
-    // rather than an empty picker.
-    let models = if harness == HarnessId::Kilo {
-        zeron_proto::kilo::keep_free_or_all(models, kilo_model_is_free)
-    } else {
-        models
-    };
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
     }
@@ -6562,7 +6550,6 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Kilo => (crate::icons::KILO_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
         HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
-        HarnessId::NvidiaNim => (crate::icons::NIM_MARK, None),
     }
 }
 
@@ -10486,7 +10473,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_keeps_only_free_kilo_rows_and_strips_the_prefix() {
+    fn normalize_preserves_funded_kilo_rows_and_strips_the_prefix() {
         let models = normalize_model_rows(
             HarnessId::Kilo,
             vec![
@@ -10502,9 +10489,10 @@ mod tests {
                 bare_model("kilo/freeform/model", "Kilo Gateway/Freeform"),
             ],
         );
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[0].label, "Auto Free");
         assert_eq!(models[1].label, "NVIDIA: Nemotron 3 Super (free)");
+        assert_eq!(models[2].label, "Anthropic: Claude Sonnet 5");
         assert_eq!(models[0].id, "kilo/kilo-auto/free");
     }
 

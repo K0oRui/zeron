@@ -51,9 +51,14 @@ impl HarnessInfo {
         Some(self.supports_steering? && self.steering_mode.as_deref()? == "step-boundary")
     }
 
-    /// Listed by the device and usable (installed, not disabled).
+    /// A real provider supported by this build, not a test harness.
+    pub(crate) fn supported(&self) -> bool {
+        self.id != "mock" && zeron_proto::HarnessId::from_slug(&self.id).is_some()
+    }
+
+    /// Listed by the device and usable (supported, installed, not disabled).
     pub fn offered(&self) -> bool {
-        self.installed && self.enabled != Some(false)
+        self.supported() && self.installed && self.enabled != Some(false)
     }
 }
 
@@ -168,7 +173,6 @@ pub fn harness_label(id: &str) -> String {
         "kilo" => "Kilo Code",
         "antigravity" => "Antigravity",
         "muse" => "Muse Code",
-        "nvidia-nim" => "NVIDIA NIM",
         "mock" => "Mock",
         other => return other.to_owned(),
     }
@@ -367,17 +371,8 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![],
             ),
         ],
-        "nvidia-nim" => zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK
-            .iter()
-            .map(|(id, label, context, output)| {
-                let description = format!(
-                    "{context} token context window · up to {output} output tokens"
-                );
-                model(id, label, &description, &[], vec![])
-            })
-            .collect(),
-        // claude-code (mock shares it), as Claude Code 2.1.307 reports them.
-        _ => vec![
+        // Claude Code 2.1.307 reports these (mock shares the catalog).
+        "claude-code" | "mock" => vec![
             model(
                 "claude-opus-5-5",
                 "Opus 5.5",
@@ -442,6 +437,7 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
                 vec![toggle("thinking", "Thinking")],
             ),
         ],
+        _ => Vec::new(),
     }
 }
 
@@ -513,27 +509,16 @@ fn curated_label(id: &str, catalog: &[ModelInfo]) -> Option<String> {
         .map(|m| m.label.clone())
 }
 
-/// Kilo advertises its whole gateway catalog, including rows that need
-/// credits. The rule is shared ([`zeron_proto::kilo`]) with the harness's
-/// discovery-side filter and the desktop picker, applied here so a catalog
-/// from an older engine still opens on the free rows only.
-fn kilo_model_is_free(model: &ModelInfo) -> bool {
-    zeron_proto::kilo::gateway_model_is_free(&model.id, &model.label)
-}
-
 /// Clean a live `ListModels` reply: drop a `default` placeholder when real
 /// rows exist, fold `[1m]`/`-1m` variants into a Context Window option, and
 /// prefer curated labels (legacy `HarnessCatalog.normalize`).
 pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    if zeron_proto::HarnessId::from_slug(harness).is_none() {
+        return Vec::new();
+    }
     let catalog = curated_catalog(harness);
-    // An older engine never filtered Kilo's gateway rows. Keep the free ones;
-    // if the rule matches nothing (a renamed free tier), show the list as-is
-    // rather than an empty picker.
-    let models = if harness == "kilo" {
-        zeron_proto::kilo::keep_free_or_all(models, kilo_model_is_free)
-    } else {
-        models
-    };
+    // Account balance filtering belongs to the host. Re-filtering here would
+    // hide paid models even after a funded account's host offered them.
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
     models
@@ -559,6 +544,9 @@ pub fn normalize_models(harness: &str, models: Vec<ModelInfo>) -> Vec<ModelInfo>
             }
             if let Some(label) = curated_label(&row.id, &catalog) {
                 row.label = label;
+            }
+            if harness == "kilo" {
+                row.label = zeron_proto::kilo::strip_gateway_label(&row.label).to_owned();
             }
             Some(row)
         })
@@ -610,6 +598,7 @@ pub fn model_label(harness: &str, model_id: &str) -> String {
 /// Last-known live catalogs on disk (`{data_dir}/catalogs/{device}.json`):
 /// pickers open instantly with the device's real list, and an unreachable
 /// device still shows what it offered last time before the static fallback.
+/// Unsupported provider IDs in older caches are discarded.
 #[derive(Debug, Clone)]
 pub(crate) struct DiskCatalog {
     dir: std::path::PathBuf,
@@ -621,6 +610,16 @@ struct DeviceCatalog {
     harnesses: Option<Vec<HarnessInfo>>,
     #[serde(default)]
     models: std::collections::BTreeMap<String, Vec<ModelInfo>>,
+}
+
+impl DeviceCatalog {
+    fn retain_supported(&mut self) {
+        if let Some(harnesses) = &mut self.harnesses {
+            harnesses.retain(HarnessInfo::supported);
+        }
+        self.models
+            .retain(|harness, _| zeron_proto::HarnessId::from_slug(harness).is_some());
+    }
 }
 
 fn file_safe(id: &str) -> String {
@@ -647,10 +646,12 @@ impl DiskCatalog {
     }
 
     fn load(&self, device_id: &str) -> DeviceCatalog {
-        std::fs::read(self.path(device_id))
+        let mut catalog: DeviceCatalog = std::fs::read(self.path(device_id))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        catalog.retain_supported();
+        catalog
     }
 
     fn store(&self, device_id: &str, catalog: &DeviceCatalog) {
@@ -672,7 +673,7 @@ impl DiskCatalog {
 
     pub(crate) fn put_harnesses(&self, device_id: &str, list: &[HarnessInfo]) {
         let mut catalog = self.load(device_id);
-        catalog.harnesses = Some(list.to_vec());
+        catalog.harnesses = Some(list.iter().filter(|row| row.supported()).cloned().collect());
         self.store(device_id, &catalog);
     }
 
@@ -689,9 +690,10 @@ impl DiskCatalog {
             let Ok(bytes) = std::fs::read(entry.path()) else {
                 continue;
             };
-            let Ok(catalog) = serde_json::from_slice::<DeviceCatalog>(&bytes) else {
+            let Ok(mut catalog) = serde_json::from_slice::<DeviceCatalog>(&bytes) else {
                 continue;
             };
+            catalog.retain_supported();
             for (harness, models) in &catalog.models {
                 learn_labels(harness, models);
             }
@@ -699,6 +701,9 @@ impl DiskCatalog {
     }
 
     pub(crate) fn put_models(&self, device_id: &str, harness: &str, list: &[ModelInfo]) {
+        if zeron_proto::HarnessId::from_slug(harness).is_none() {
+            return;
+        }
         learn_labels(harness, list);
         let mut catalog = self.load(device_id);
         catalog.models.insert(harness.to_owned(), list.to_vec());
@@ -732,18 +737,64 @@ mod tests {
     }
 
     #[test]
-    fn nim_fallback_uses_the_shared_chat_catalog() {
-        let models = fallback_models("nvidia-nim");
-        assert_eq!(models.len(), zeron_proto::providers::NVIDIA_NIM_FEATURED_FALLBACK.len());
-        assert_eq!(models[0].id, "nvidia/nemotron-3-ultra-550b-a55b");
-        assert!(models.iter().all(|model| {
-            !model
-                .description
-                .as_deref()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .contains("free")
-        }));
+    fn unsupported_providers_have_no_models_or_picker_rows() {
+        for harness in ["removed-provider", "nvidia-nim"] {
+            assert!(zeron_proto::HarnessId::from_slug(harness).is_none());
+            assert!(fallback_models(harness).is_empty());
+            assert!(normalize_models(harness, fallback_models("codex")).is_empty());
+            assert!(!HarnessInfo::fallback(harness, "Retired").offered());
+        }
+        assert!(!fallback_models("claude-code").is_empty());
+        assert!(!fallback_models("mock").is_empty());
+    }
+
+    #[test]
+    fn unsupported_disk_rows_are_ignored_without_losing_other_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCatalog::new(dir.path());
+        let mut legacy = DeviceCatalog {
+            harnesses: Some(vec![
+                HarnessInfo::fallback("removed-provider", "Retired"),
+                HarnessInfo::fallback("codex", "Codex"),
+            ]),
+            ..Default::default()
+        };
+        legacy.models.insert(
+            "removed-provider".into(),
+            vec![model(
+                "old/guessed",
+                "Retired Cached Label",
+                "",
+                &[],
+                vec![],
+            )],
+        );
+        legacy
+            .models
+            .insert("codex".into(), fallback_models("codex"));
+        cache.store("device", &legacy);
+        assert!(cache.models("device", "removed-provider").is_none());
+        assert!(!cache.models("device", "codex").unwrap().is_empty());
+        assert_eq!(cache.harnesses("device").unwrap()[0].id, "codex");
+        assert_eq!(cache.harnesses("device").unwrap().len(), 1);
+        cache.warm_labels();
+        assert_eq!(
+            model_label("removed-provider", "old/guessed"),
+            "old/guessed"
+        );
+        cache.put_models(
+            "device",
+            "removed-provider",
+            &[model("live/chat", "Retired Live Label", "", &[], vec![])],
+        );
+        assert!(cache.models("device", "removed-provider").is_none());
+        assert_eq!(model_label("removed-provider", "live/chat"), "live/chat");
+        cache.put_harnesses("device", legacy.harnesses.as_ref().unwrap());
+        let stored: DeviceCatalog =
+            serde_json::from_slice(&std::fs::read(cache.path("device")).unwrap()).unwrap();
+        assert!(!stored.models.contains_key("removed-provider"));
+        assert!(!stored.models["codex"].is_empty());
+        assert_eq!(stored.harnesses.unwrap().len(), 1);
     }
 
     #[test]
@@ -782,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_keeps_only_free_kilo_rows() {
+    fn normalize_preserves_funded_kilo_rows() {
         let live = vec![
             model(
                 "kilo/kilo-auto/free",
@@ -807,9 +858,25 @@ mod tests {
             ),
         ];
         let out = normalize_models("kilo", live);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 3);
         assert_eq!(out[0].id, "kilo/kilo-auto/free");
         assert_eq!(out[1].id, "kilo/nvidia/nemotron-3-super-120b-a12b:free");
+        assert_eq!(out[2].id, "kilo/anthropic/claude-sonnet-5");
+        assert_eq!(out[2].label, "Anthropic: Claude Sonnet 5");
+    }
+
+    #[test]
+    fn an_empty_authorized_catalog_replaces_previously_funded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCatalog::new(dir.path());
+        cache.put_models(
+            "device",
+            "kilo",
+            &[model("kilo/paid", "Paid", "", &[], vec![])],
+        );
+        cache.put_models("device", "kilo", &[]);
+        assert_eq!(cache.models("device", "kilo"), Some(vec![]));
+        assert!(normalize_models("kilo", vec![]).is_empty());
     }
 
     #[test]

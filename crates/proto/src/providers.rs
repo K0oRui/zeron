@@ -2,40 +2,16 @@
 //! settings follow (desktop Settings → Providers, the phone's Providers), so
 //! the platforms offer the same sign-ins, labels and switching. Pure.
 
-use crate::HarnessId;
+use serde::{Deserialize, de::DeserializeOwned};
 
-/// Last known NVIDIA featured chat models, shared by the engine and clients
-/// when live discovery is unavailable. Inventory membership alone does not
-/// establish chat support or free access, so arbitrary `/v1/models` rows are
-/// deliberately not copied into these static catalogs.
-pub const NVIDIA_NIM_FEATURED_FALLBACK: [(&str, &str, u64, u64); 4] = [
-    (
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "Nemotron 3 Ultra 550B",
-        1_048_576,
-        8_192,
-    ),
-    (
-        "nvidia/nemotron-3.5-super-vl-120b-a12b",
-        "Nemotron 3.5 Super VL",
-        1_048_576,
-        8_192,
-    ),
-    ("z-ai/glm-5-3", "GLM 5.3", 1_048_576, 8_192),
-    (
-        "deepseek-ai/deepseek-v4.1-flash",
-        "DeepSeek V4.1 Flash",
-        1_048_576,
-        16_384,
-    ),
-];
+use crate::HarnessId;
 
 /// The providers zeron can sign into, in display order: (harness, name, CLI
 /// command or login label — named in the empty-state copy, zeron
 /// settings.agents.tsx `PROVIDERS`). Every agent with a login of its own is
 /// here; what each one supports is documented engine-side (`agent_accounts`
 /// module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -47,7 +23,6 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
     (HarnessId::Muse, "Muse Code", "muse login"),
-    (HarnessId::NvidiaNim, "NVIDIA NIM", "NVIDIA API key"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
@@ -67,7 +42,7 @@ pub fn provider_name(harness: HarnessId) -> &'static str {
 /// Whether the provider reports plan usage. One that doesn't shows no meters
 /// and no "usage unavailable" note — there is nothing missing. Pure.
 pub fn reports_usage(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Antigravity | HarnessId::NvidiaNim)
+    !matches!(harness, HarnessId::Antigravity)
 }
 
 /// Providers whose agent holds exactly ONE login (Antigravity): once it is
@@ -91,10 +66,6 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Hermes => Some(
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
-        ),
-        HarnessId::NvidiaNim => Some(
-            "Connect an API key from NVIDIA API Catalog. Model availability and charges depend \
-             on your NVIDIA account; Zeron does not label inventory entries as free.",
         ),
         _ => None,
     }
@@ -120,7 +91,6 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
         // Codex signs in twice: the ChatGPT OAuth flow, or a pasted
         // `OPENAI_API_KEY` saved next to it (no browser round-trip).
         HarnessId::Codex => vec![option("oauth", "ChatGPT"), option("api-key", "API key")],
-        HarnessId::NvidiaNim => vec![option("api-key", "NVIDIA API key")],
         HarnessId::Opencode | HarnessId::Kilo => vec![
             option("openai", "ChatGPT"),
             option("github-copilot", "GitHub Copilot"),
@@ -153,5 +123,120 @@ pub fn add_option_label(harness: HarnessId, option: LoginOption, empty: bool) ->
         None => add_account_label(harness, empty),
         Some(_) if empty => format!("Connect {}", option.label),
         Some(_) => format!("Add {} account", option.label),
+    }
+}
+
+/// Decode a provider list from another engine without reviving unsupported
+/// providers or losing supported siblings. Malformed supported rows still fail.
+pub fn decode_provider_rows<T: DeserializeOwned>(
+    mut value: serde_json::Value,
+    harness_field: &str,
+) -> Result<Vec<T>, serde_json::Error> {
+    if let Some(rows) = value.as_array_mut() {
+        rows.retain(|row| {
+            row.get(harness_field)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|slug| HarnessId::from_slug(slug).is_some())
+        });
+    }
+    serde_json::from_value(value)
+}
+
+/// Serde adapter for account/warning lists whose provider field is `harness`.
+pub(crate) fn deserialize_provider_rows<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    decode_provider_rows(value, "harness").map_err(serde::de::Error::custom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_real_harness_has_one_provider_entry() {
+        assert_eq!(PROVIDERS.len(), HarnessId::ALL.len() - 1);
+        for harness in HarnessId::ALL {
+            assert_eq!(
+                PROVIDERS.iter().filter(|(id, _, _)| *id == harness).count(),
+                usize::from(harness != HarnessId::Mock),
+            );
+            assert_eq!(HarnessId::from_slug(harness.as_str()), Some(harness));
+            assert_eq!(
+                serde_json::to_value(harness).unwrap(),
+                json!(harness.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn retired_ids_are_not_harnesses_or_login_providers() {
+        for slug in ["removed-provider", "nvidia-nim"] {
+            assert!(HarnessId::from_slug(slug).is_none());
+            assert!(serde_json::from_value::<HarnessId>(json!(slug)).is_err());
+            assert!(!PROVIDERS.iter().any(|(id, _, _)| id.as_str() == slug));
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Row {
+        id: HarnessId,
+    }
+
+    #[test]
+    fn peer_provider_lists_skip_unsupported_rows_only() {
+        let rows: Vec<Row> = decode_provider_rows(
+            json!([
+                {"id": "codex"},
+                {"id": "removed-provider"},
+                {"id": "claude-code"}
+            ]),
+            "id",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, HarnessId::Codex);
+        assert_eq!(rows[1].id, HarnessId::ClaudeCode);
+        assert!(decode_provider_rows::<Row>(json!([{}]), "id").is_err());
+        assert!(decode_provider_rows::<Row>(json!({}), "id").is_err());
+    }
+
+    #[test]
+    fn peer_update_status_lists_skip_retired_providers() {
+        let rows: Vec<crate::HarnessUpdateStatus> = decode_provider_rows(
+            json!([
+                {"harness": "removed-provider", "phase": "current"},
+                {"harness": "codex", "phase": "current"}
+            ]),
+            "harness",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].harness, HarnessId::Codex);
+        assert_eq!(rows[0].phase, crate::HarnessUpdatePhase::Current);
+    }
+
+    #[test]
+    fn peer_account_snapshots_preserve_supported_accounts_and_warnings() {
+        let snapshot: crate::AgentAccountsSnapshot = serde_json::from_value(json!({
+            "accounts": [
+                {"id": "saved", "harness": "codex", "active": true},
+                {"harness": "removed-provider"}
+            ],
+            "warnings": [
+                {"harness": "codex", "message": "Keep this warning"},
+                {"harness": "removed-provider", "message": "Retired"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert_eq!(snapshot.accounts[0].harness, HarnessId::Codex);
+        assert!(snapshot.accounts[0].active);
+        assert_eq!(snapshot.warnings.len(), 1);
+        assert_eq!(snapshot.warnings[0].message, "Keep this warning");
     }
 }
