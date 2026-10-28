@@ -7,85 +7,97 @@ its model list. Discovery and inference use the selected account, with
 `NVIDIA_API_KEY` as the device-level fallback. Keys are never exported into the
 process environment or sent to NVIDIA's public featured-metadata host.
 
-The picker reads the complete `/v1/models` inventory, not just the featured
-models. Featured metadata supplies labels and context limits when available;
-a missing featured feed does not hide other inventory models. Explicit non-chat
-tasks and known embedding, reranking, reward, speech and image-generation
-families are excluded from the chat picker. Declared tasks, chat capabilities,
-supported endpoints and explicit availability flags also filter out models for
-other APIs. Unknown/new chat models do not have to appear in a static allow-list.
-Inventory membership still does **not** prove that NVIDIA's backing deployment
-is live or accessible to the selected key; Zeron does not send inference prompts
-just to test the catalog.
+### Free hosted endpoints only
 
-NIM now requires a key and uses **inventory only**: public featured metadata can
-enrich an inventory row, but cannot create an offered ID. Built-in NIM model
-suggestions have been removed. An empty inventory stays empty; a failed refresh
-shows an error instead of falling back to featured, static or previous rows.
-The harness keeps only a short-lived, key/endpoint-scoped memory inventory and
-clears it on refresh failure. The engine ignores legacy NIM disk catalogs, and
-mobile retires old NIM disk rows rather than using them offline. Other providers'
-fallback behavior is unchanged.
+For NVIDIA's public endpoint, the picker now offers only the intersection of:
 
-Desktop clears NIM rows while refreshing and on refresh failure. Saved selections
-absent from NIM's current inventory are not synthesized as picker choices. Desktop
-and mobile preserve NIM wire IDs exactly: CLI-specific `default`/`-1m`/`[1m]`
-alias normalization must not turn a real provider ID into a different model.
-An omitted model is chosen from the actual request key's inventory, never a
-hardcoded default. Update both the app and the device running chats for these
-rules to apply; no manual cache-file deletion is needed.
+1. The selected key's complete `/v1/models` inventory.
+2. NVIDIA's current **Free Endpoint** catalog, fetched without credentials from
+   `https://api.ngc.nvidia.com/v2/search/catalog/resources/ENDPOINT` using
+   `nimType=nim_type_preview`, with every result page checked.
+3. A public deployment spec declaring an NVIDIA-hosted chat-completions route,
+   a deployment function, and no unavailable banner.
+4. Models not rejected by actual requests for this endpoint/key.
 
-### Known unavailable public-hosted entries
+This is the designation behind NVIDIA's [Free Endpoint filter](https://build.nvidia.com/models?filters=nimType%3Anim_type_preview).
+A downloadable model, a paid partner endpoint, a featured recommendation, or a
+`(free)` display name is **not** enough. Each record must carry the actual free
+mark. NGC's `AVAILABLE` attribute describes download availability, not hosted
+inference, and does not disqualify a hosted-only free endpoint.
 
-`writer/palmyra-fin-70b-32k` is excluded from Zeron's picker and implicit defaults
-for NVIDIA's public hosted endpoint **before** a failed prompt, even if
-`/v1/models` still lists it.
-On 2026-10-28 its [NVIDIA model page](https://build.nvidia.com/writer/palmyra-fin-70b-32k)
-returned a 404 page, matching the reported function/account-not-found inference
-failure. This is a dated public-route exclusion, not a claim that the model's
-weights or every private deployment have been retired. Other Writer IDs and
-self-hosted/custom NIM endpoints are not excluded by this rule.
+Wire IDs are intersected exactly with the authenticated inventory. The public
+spec's example/default/enum IDs handle card slugs that differ from API IDs;
+Zeron does not guess aliases, change punctuation in a request, use an NGC org as
+a model publisher, or add models absent from the inventory. A spec without
+explicit model IDs can only match the literal publisher/card-name ID. Featured
+metadata remains optional label/context enrichment, never an allow-list or
+pricing authority. New free models do not need a built-in ID entry.
 
-The exclusion is applied after memory-cache loading and does not expire when a
-15-minute rejection timer runs out. Explicit model requests remain allowed; a
-successful nonempty completion can restore the entry **only for that endpoint
-and key**, provided it is still in the inventory. This positive evidence survives
-restart in the same private store. A later definitive model rejection revokes it,
-including after the short negative-cache timer expires. Inventory metadata alone
-cannot claim this proof; no test prompts are sent automatically.
+Public free discovery and deployment checks are **GET metadata requests only**;
+no inference prompts, credit-consuming probes, or paid fallback requests are
+sent. NVIDIA describes these endpoints as free for development/prototyping,
+subject to its terms and rate limits, not as an unlimited production service.
+A free badge and public deployment metadata still cannot guarantee entitlement
+or uptime for every account; only an actual request can establish that.
 
-An existing chat's selected model is not silently replaced. Choose a different
-model in that chat rather than repeatedly sending to the old selection. The
-error now says this instead of implying the hosted entry returns after a timer.
+Free-catalog or deployment-metadata failures show an error instead of offering
+unverified inventory, old rows, or a hardcoded list. Successful empty results
+stay empty. Public descriptions identify the free hosted endpoint and its rate
+limits. **The same check applies before inference**, including a saved chat's
+explicit model and title requests: a model not verified by the current free
+catalog is rejected before any inference POST. A different model is never
+silently substituted.
 
-### Other model-specific failures
+### Caches, accounts, and custom endpoints
 
-If an actual chat request returns NVIDIA's `404` / `Function …: Not found for
-account …` response (or a structured `model_not_found` rejection), an entry not in
-the known hosted exclusion set is hidden for **15 minutes**, scoped to the exact
-endpoint and API key. This filter
-runs after inventory loading (including the short-lived memory cache), including
-when every row is rejected. Refreshing the inventory cannot immediately resurrect
-the same broken model. Other models, accounts and endpoints are unaffected.
+NIM keeps only a short-lived, key/endpoint/policy-scoped memory catalog and
+clears it on refresh failure. The engine ignores legacy NIM disk catalogs;
+mobile retires old NIM disk rows instead of offering them offline. Built-in NIM
+model suggestions remain removed. Desktop clears NIM rows while refreshing and
+on failure, and does not synthesize missing saved selections as choices.
+Desktop and mobile preserve provider wire IDs exactly. The policy/context
+version is now `openai-chat-completions-free-v4` to invalidate earlier inventories.
 
-The short-lived evidence survives an app restart in private files containing
-only model IDs and timestamps under a hashed endpoint/key namespace. It expires
-automatically; an explicit retry is still allowed, and a successful response
-restores the model immediately. Zeron never silently substitutes a different
-model. Generic route `404`s, authentication failures, throttling and server or
-network failures do not hide catalog rows. NVIDIA controls deployment/access;
-this error is **not** evidence of a zero balance or an invalid key.
+An omitted model is chosen from the actual request key's eligible catalog.
+An existing chat's selected model is not silently replaced: choose a free model
+in that chat. Update both the app and the device running chats for these rules
+to apply; no manual cache-file deletion is needed.
 
-`NVIDIA_NIM_BASE_URL` accepts either the API origin or an OpenAI-style base URL
-ending in `/v1`; Zeron does not append `/v1` twice. Catalog caches are scoped to
-the endpoint and selected key, and a key change during discovery discards the
-old response. Authentication failures are not disguised as a public/static
-catalog.
+`NVIDIA_NIM_BASE_URL` accepts an origin or an OpenAI-style base ending in `/v1`.
+The public free designation applies only to NVIDIA's public HTTPS endpoint,
+including its explicit default port. Custom/self-hosted NIMs retain their own
+inventory, prices and access rules; NVIDIA's public free catalog cannot certify
+them as free. They are not annotated as free or restricted by the hosted catalog.
+Other providers' catalog/balance policies are unchanged.
 
-NVIDIA's inventory does **not** report model prices or account balances. Zeron
-therefore does not claim these models are free or infer a zero balance from an
-API key. A payment-required response explains that inference credits must be
-checked with NVIDIA.
+### Account-specific failures and recovery
+
+A definitive model-specific `404` (`Function …: Not found for account …`,
+`model_not_found`, etc.) or structured model-retirement `410` excludes the model
+from public hosted choices and implicit defaults **until a successful explicit
+retry**, not just for 15 minutes. A metadata refresh or app restart cannot
+resurrect that failure. Explicit retries are allowed only while the model still
+qualifies as a free hosted chat endpoint; successful retry restores that model
+for this key without making another key or endpoint eligible.
+
+The evidence is private, atomic, key/endpoint-scoped storage containing only
+model IDs and timestamps under a hashed namespace. Custom endpoints keep the
+previous 15-minute negative-cache policy. Generic route errors, authentication,
+billing, throttling, network problems and server failures are not model-specific
+rejection evidence. An inference-access denial is not automatically an invalid
+key or an empty balance: check Public API Endpoints permissions and trial limits.
+NVIDIA's [staff confirmation](https://forums.developer.nvidia.com/t/request-more-4-000-credits-option-on-build-nvidia-com/344567/2)
+says the hosted credit system was replaced by model-specific trial rate limits.
+A payment-required response does not enable any paid fallback.
+
+`writer/palmyra-fin-70b-32k` additionally retains the dated public-route exclusion:
+on 2026-10-28 its [NVIDIA model page](https://build.nvidia.com/writer/palmyra-fin-70b-32k)
+rendered a 404 page, matching the reported inference rejection. This is not a
+claim that its weights or every private deployment are retired. A nonempty
+successful explicit retry can override that dated exclusion only for its key,
+and only if the model now also passes the live free-hosted policy. Positive
+proof survives restart and a later definitive rejection revokes it. Other
+Writer IDs and self-hosted deployments are not banned.
 
 ## Kilo Gateway
 
@@ -132,15 +144,16 @@ The HTTP fixtures assert that discovery does not send inference prompts and
 that a failed model is never silently replaced.
 
 The prior model-specific 404 change passed GitHub core, engine, UI, app and
-cross-platform checks. For the inventory-only and Palmyra follow-ups, **48 focused checks**
-passed locally using the production client catalog, availability and discovery
-logic; extracted production inventory/cache/error logic and type definitions;
+cross-platform checks. For the free-hosted, inventory-only and Palmyra follow-ups,
+**62 focused checks** passed locally using the production client catalog,
+availability, discovery and free-hosted metadata policy; extracted production
+inventory/cache/error logic and type definitions;
 and real Serde, JSON, Tokio, Tracing and Thiserror dependencies. The focused
 client tests use a standard-library temporary-directory fixture. These checks
 are not a full production-workspace build.
 
 Changed Rust passed parser checks, offline workspace metadata validation and
 `git diff --check`. Full local workspace tests remain blocked by the uncached
-`gpui` Git dependency. New HTTP/default-model, engine-cache and desktop-picker
-fixtures are included for normal CI. Live authenticated NVIDIA calls have not
+`gpui` Git dependency. New free-catalog HTTP/no-paid-POST/default-model,
+engine-cache and desktop-picker fixtures are included for normal CI. Live authenticated NVIDIA calls have not
 been run in this sandbox.

@@ -1,11 +1,11 @@
 //! NVIDIA NIM over its OpenAI-compatible HTTP API.
 //!
-//! Discovery uses the selected account's `/v1/models` inventory, enriched by
-//! featured metadata (not restricted to featured models). Explicit non-chat
-//! tasks and known embedding/reward endpoints stay out of the chat picker.
-//! NVIDIA exposes neither a balance nor prices here, so inventory membership
-//! is never treated as evidence of free access or a working deployment.
-//! Confirmed model-not-found responses are temporarily excluded per endpoint/key.
+//! Public hosted discovery intersects the selected key's `/v1/models` with
+//! NVIDIA's current "Free Endpoint" catalog and compatible chat-deployment
+//! specs. Featured metadata enriches labels only. No inference probes, paid
+//! fallback, or assumptions about a balance or account entitlement are made.
+//! Confirmed hosted model rejections stay excluded until a successful retry.
+//! Custom/self-hosted NIMs retain their own inventory and pricing semantics.
 //! Runs use
 //! `POST /v1/chat/completions` with the selected
 //! account's `NVIDIA_API_KEY`, stream text/reasoning/usage over SSE, and keep
@@ -35,6 +35,7 @@ use crate::{
 
 mod availability;
 mod discovery;
+mod hosted;
 use availability::{AvailabilityScope, AvailabilityStore};
 use discovery::is_chat_model;
 
@@ -82,6 +83,7 @@ pub struct NvidiaNimHarness {
     client: reqwest::Client,
     base_url: String,
     featured_url: String,
+    hosted_catalog: Option<hosted::Catalog>,
     api_key_source: Option<Arc<ApiKeySource>>,
     models_cache: crate::catalog::Catalog,
     availability_store: Arc<AvailabilityStore>,
@@ -99,13 +101,14 @@ impl Default for NvidiaNimHarness {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let base_url = normalize_base_url(&base_url);
-        let featured_url = if base_url == NIM_BASE_URL {
+        let featured_url = if discovery::is_public_hosted(&base_url) {
             NIM_FEATURED_URL.into()
         } else {
             format!("{base_url}/featured-models.json")
         };
         Self {
             client,
+            hosted_catalog: discovery::is_public_hosted(&base_url).then(hosted::Catalog::public),
             base_url,
             featured_url,
             api_key_source: None,
@@ -128,11 +131,23 @@ impl NvidiaNimHarness {
     /// hosted endpoints above.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = normalize_base_url(&base_url.into());
-        self.featured_url = if self.base_url == NIM_BASE_URL {
+        self.hosted_catalog =
+            discovery::is_public_hosted(&self.base_url).then(hosted::Catalog::public);
+        self.featured_url = if discovery::is_public_hosted(&self.base_url) {
             NIM_FEATURED_URL.into()
         } else {
             format!("{}/featured-models.json", self.base_url)
         };
+        self
+    }
+
+    /// Route public-catalog metadata to local HTTP fixtures, never credentials.
+    #[cfg(test)]
+    fn with_hosted_catalog(mut self, root: &str) -> Self {
+        self.hosted_catalog = Some(hosted::Catalog {
+            search_url: format!("{root}/free-endpoints"),
+            specs_url: format!("{root}/endpoint-specs"),
+        });
         self
     }
 
@@ -169,10 +184,15 @@ impl NvidiaNimHarness {
     }
 
     fn availability(&self, api_key: &str) -> AvailabilityScope {
-        self.availability_store.scope(
+        let scope = self.availability_store.scope(
             Sha256::digest(format!("nim-availability-v1\0{}\0{api_key}", self.base_url).as_bytes())
                 .into(),
-        )
+        );
+        if self.hosted_catalog.is_some() {
+            scope.until_success()
+        } else {
+            scope
+        }
     }
 
     fn context(&self) -> Result<ModelContext, HarnessError> {
@@ -186,16 +206,24 @@ impl NvidiaNimHarness {
                 "{:x}",
                 Sha256::digest(
                     format!(
-                        "chat-inventory-v3\0{}\0{}\0{}",
+                        "free-chat-inventory-v4\0{}\0{}\0{}\0{}\0{}",
                         self.base_url,
                         self.featured_url,
-                        key.unwrap_or_default()
+                        key.unwrap_or_default(),
+                        self.hosted_catalog
+                            .as_ref()
+                            .map(|catalog| catalog.search_url.as_str())
+                            .unwrap_or_default(),
+                        self.hosted_catalog
+                            .as_ref()
+                            .map(|catalog| catalog.specs_url.as_str())
+                            .unwrap_or_default()
                     )
                     .as_bytes()
                 )
             ),
             binary_path: PathBuf::from(self.base_url.as_str()),
-            binary_version: Some("openai-chat-completions-v3".into()),
+            binary_version: Some("openai-chat-completions-free-v4".into()),
         }
     }
 
@@ -214,10 +242,11 @@ impl NvidiaNimHarness {
 
     async fn discover_models_with_key(&self, key: &str) -> Result<Vec<Model>, HarnessError> {
         let inventory_url = format!("{}/v1/models", self.base_url);
-        let (inventory, featured) = tokio::join!(
+        let (inventory, featured, free) = tokio::join!(
             get_json(&self.client, &inventory_url, Some(key), "model inventory"),
-            // Public metadata may enrich inventory rows, never create them.
-            get_json(&self.client, &self.featured_url, None, "featured catalog")
+            // Public metadata is unauthenticated and never creates wire IDs.
+            get_json(&self.client, &self.featured_url, None, "featured catalog"),
+            self.free_endpoint_resources(),
         );
         let inventory: NimModelsResponse = serde_json::from_value(inventory?).map_err(|_| {
             HarnessError::Protocol("NVIDIA NIM returned an invalid model inventory.".into())
@@ -229,7 +258,112 @@ impl NvidiaNimHarness {
             .unwrap_or_default();
         // An empty successful inventory is authoritative, including when every
         // advertised row belongs to a different API. Never revive featured rows.
-        Ok(inventory_models(inventory.data, metadata))
+        let models = inventory_models(inventory.data, metadata);
+        match free? {
+            Some(resources) => self.free_hosted_models(models, resources).await,
+            None => Ok(models), // Custom endpoints have their own pricing/entitlements.
+        }
+    }
+
+    async fn catalog_for_key(&self, key: &str) -> Result<ModelCatalog, HarnessError> {
+        let context = self.context_for_key(Some(key));
+        self.models_cache
+            .get_with_policy(
+                false,
+                Duration::from_secs(25),
+                crate::catalog::CatalogPolicy::InventoryOnly,
+                || Ok(context.key()),
+                || self.discover_models_with_key(key),
+            )
+            .await
+    }
+
+    async fn free_endpoint_resources(&self) -> Result<Option<Vec<hosted::Resource>>, HarnessError> {
+        let Some(catalog) = &self.hosted_catalog else {
+            return Ok(None);
+        };
+        let mut resources = Vec::new();
+        let mut total = None;
+        for index in 0..hosted::MAX_PAGES {
+            let query = json!({
+                "query":"*", "page":index, "pageSize":hosted::PAGE_SIZE,
+                "filters":[{"field":"nimType", "value":"nim_type_preview"}],
+            });
+            let mut url = reqwest::Url::parse(&catalog.search_url)
+                .map_err(|_| HarnessError::Protocol("Invalid NVIDIA free-catalog URL.".into()))?;
+            url.query_pairs_mut().append_pair("q", &query.to_string());
+            let value = get_json(&self.client, url.as_str(), None, "free-endpoint catalog").await?;
+            let page =
+                hosted::page(value, index).map_err(|error| HarnessError::Protocol(error.into()))?;
+            if total.is_some_and(|total| total != page.total) {
+                return Err(HarnessError::Protocol(
+                    "NVIDIA's free-endpoint catalog changed during pagination; refresh it.".into(),
+                ));
+            }
+            total = Some(page.total);
+            let finished = index * hosted::PAGE_SIZE + page.count == page.total;
+            resources.extend(page.resources);
+            if finished {
+                return Ok(Some(resources));
+            }
+        }
+        Err(HarnessError::Protocol(
+            "NVIDIA's free-endpoint catalog exceeded the pagination limit.".into(),
+        ))
+    }
+
+    async fn free_hosted_models(
+        &self,
+        models: Vec<Model>,
+        resources: Vec<hosted::Resource>,
+    ) -> Result<Vec<Model>, HarnessError> {
+        let catalog = self
+            .hosted_catalog
+            .as_ref()
+            .expect("hosted discovery policy");
+        let candidates = resources.into_iter().filter(|resource| {
+            resource.location().is_some()
+                && models
+                    .iter()
+                    .any(|model| resource.could_describe(&model.id))
+        });
+        let checks: Vec<_> = futures::stream::iter(candidates)
+            .map(|resource| async move {
+                let (org, name) = resource.location().expect("validated spec path");
+                let url = format!("{}/{org}/{name}/spec", catalog.specs_url);
+                let spec = get_hosted_spec(&self.client, &url).await?;
+                Ok::<_, HarnessError>((resource, spec))
+            })
+            .buffer_unordered(hosted::SPEC_CONCURRENCY)
+            .collect()
+            .await;
+        let mut eligible = HashMap::new();
+        for check in checks {
+            let (resource, spec) = check?;
+            let Some(spec) = spec else { continue };
+            for id in resource.model_ids(&spec) {
+                eligible
+                    .entry(id)
+                    .or_insert_with(|| resource.label().map(str::to_owned));
+            }
+        }
+        Ok(models
+            .into_iter()
+            .filter_map(|mut model| {
+                let label = eligible.get(&model.id)?;
+                if model.label == model.id
+                    && let Some(label) = label
+                {
+                    model.label = label.clone();
+                }
+                let free = "Free NVIDIA-hosted endpoint · NVIDIA rate limits apply";
+                model.description = Some(match model.description {
+                    Some(description) => format!("{free} · {description}"),
+                    None => free.into(),
+                });
+                Some(model)
+            })
+            .collect())
     }
 }
 
@@ -379,13 +513,50 @@ fn visible_inventory_models(
     models
 }
 
+// All public runs, including persisted selections and titles, pass this
+// guard before a request is built. `models` is the free-hosted intersection.
+fn choose_model(
+    selected: Option<&str>,
+    models: Vec<Model>,
+    free_only: bool,
+    base_url: &str,
+    availability: &AvailabilityScope,
+) -> Result<String, crate::HarnessError> {
+    if let Some(model) = selected {
+        if free_only && !models.iter().any(|row| row.id == model) {
+            return Err(crate::HarnessError::Protocol(format!(
+                "'{}' could not be verified as a current free NVIDIA-hosted chat endpoint \
+                 for this key. No inference request was sent. Choose a free model in this chat.",
+                crate::redact::redact_output(model),
+            )));
+        }
+        return Ok(model.to_owned());
+    }
+    visible_inventory_models(models, base_url, availability)
+        .into_iter()
+        .next()
+        .map(|model| model.id)
+        .ok_or_else(|| {
+            crate::HarnessError::Protocol(if free_only {
+                "No usable free NVIDIA-hosted chat model is currently in this key's catalog. \
+                 Paid and unverified fallbacks are disabled."
+                    .into()
+            } else {
+                "No chat model is currently available in this NIM endpoint's inventory.".into()
+            })
+        })
+}
+
 fn record_model_success(
     base_url: &str,
     model: &str,
     answer: &str,
     availability: &AvailabilityScope,
 ) -> std::io::Result<()> {
-    if !answer.trim().is_empty() && discovery::known_unavailable_on_hosted(base_url, model) {
+    if answer.trim().is_empty() {
+        return Ok(()); // An empty completion cannot establish usable access.
+    }
+    if discovery::known_unavailable_on_hosted(base_url, model) {
         availability.verify(model)
     } else {
         availability.allow(model)
@@ -425,6 +596,29 @@ async fn get_json(
     }
     response.json::<Value>().await.map_err(|error| {
         HarnessError::Protocol(format!("NVIDIA NIM {what} returned invalid JSON: {error}"))
+    })
+}
+
+async fn get_hosted_spec(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Option<Value>, HarnessError> {
+    let response = client.get(url)
+        .header(reqwest::header::USER_AGENT, NIM_USER_AGENT)
+        .timeout(DISCOVERY_TIMEOUT)
+        .send().await
+        .map_err(|_| HarnessError::Protocol("NVIDIA's free chat deployment metadata could not be verified; no unverified models were offered.".into()))?;
+    let status = response.status();
+    if matches!(status.as_u16(), 404 | 410) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(HarnessError::Protocol(format!(
+            "NVIDIA's free chat deployment metadata returned {status}; no unverified models were offered."
+        )));
+    }
+    response.json::<Value>().await.map(Some).map_err(|_| {
+        HarnessError::Protocol("NVIDIA returned invalid free chat deployment metadata.".into())
     })
 }
 
@@ -515,39 +709,23 @@ impl Harness for NvidiaNimHarness {
         .filter(|key| !key.is_empty())
         .ok_or_else(missing_api_key)?;
         let availability = self.availability(&api_key);
-        let model = match request
+        let selected = request
             .model
-            .clone()
-            .map(|model| model.trim().to_owned())
-            .filter(|model| !model.is_empty())
-        {
-            Some(model) => model,
-            None => {
-                let context = self.context_for_key(Some(&api_key));
-                let models = self
-                    .models_cache
-                    .get_with_policy(
-                        false,
-                        Duration::from_secs(25),
-                        crate::catalog::CatalogPolicy::InventoryOnly,
-                        || Ok(context.key()),
-                        || self.discover_models_with_key(&api_key),
-                    )
-                    .await?
-                    .models;
-                visible_inventory_models(models, &self.base_url, &availability)
-                    .into_iter()
-                    .next()
-                    .map(|model| model.id)
-                    .ok_or_else(|| {
-                        HarnessError::Protocol(
-                            "No chat model is currently available in NVIDIA NIM's inventory. \
-                         Refresh the model list or try another provider."
-                                .into(),
-                        )
-                    })?
-            }
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let models = if self.hosted_catalog.is_some() || selected.is_none() {
+            self.catalog_for_key(&api_key).await?.models
+        } else {
+            Vec::new()
         };
+        let model = choose_model(
+            selected,
+            models,
+            self.hosted_catalog.is_some(),
+            &self.base_url,
+            &availability,
+        )?;
         let session_id = request
             .resume
             .clone()
@@ -1001,10 +1179,7 @@ async fn run_session(session: Session) {
                     if let Err(error) = availability.reject(&model) {
                         tracing::warn!(%error, "Could not persist NVIDIA NIM model rejection");
                     }
-                    model_unavailable_message(
-                        &model,
-                        discovery::known_unavailable_on_hosted(&base_url, &model),
-                    )
+                    model_unavailable_message(&model, discovery::is_public_hosted(&base_url))
                 };
                 let _ = send(
                     &event_tx,
@@ -1222,12 +1397,12 @@ async fn read_error_snippet(
 fn http_error(status: reqwest::StatusCode, snippet: &str) -> String {
     match status.as_u16() {
         401 | 403 => format!(
-            "NVIDIA NIM rejected the API key ({status}). Connect a valid `nvapi-…` key in \
-             Settings → Providers → NVIDIA NIM."
+            "NVIDIA NIM denied inference access ({status}). Check the key in Settings → Providers \
+             → NVIDIA NIM and your NVIDIA account's Public API Endpoints permissions."
         ),
         402 => format!(
-            "NVIDIA NIM has no inference credits available ({status}). Check your NVIDIA \
-             account balance or choose a model your account can access without credits.{}",
+            "NVIDIA NIM returned Payment Required ({status}). Check your NVIDIA account's \
+             free/trial access and limits. Zeron has not switched to a paid model.{}",
             error_detail(snippet)
         ),
         404 => format!(
@@ -1246,12 +1421,18 @@ fn http_error(status: reqwest::StatusCode, snippet: &str) -> String {
 // Match a model-specific rejection, not a generic route 404 or auth/rate-limit
 // failure. Inventory membership is not evidence that NVIDIA's function is live.
 fn is_model_unavailable(status: u16, value: &Value) -> bool {
-    if status != 404 {
+    if !matches!(status, 404 | 410) {
         return false;
     }
     if matches!(
         value.pointer("/error/code").and_then(Value::as_str),
-        Some("model_not_found" | "model_not_available" | "model_not_deployed")
+        Some(
+            "model_not_found"
+                | "model_not_available"
+                | "model_not_deployed"
+                | "model_deprecated"
+                | "model_retired"
+        )
     ) {
         return true;
     }
@@ -1259,21 +1440,24 @@ fn is_model_unavailable(status: u16, value: &Value) -> bool {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    message.starts_with("function ") && message.contains("not found for account")
+    (status == 404 && message.starts_with("function ") && message.contains("not found for account"))
+        || (status == 410
+            && message.contains("model")
+            && (message.contains("deprecated") || message.contains("no longer supported")))
 }
 
-fn model_unavailable_message(model: &str, hosted_exclusion: bool) -> String {
-    if hosted_exclusion {
+fn model_unavailable_message(model: &str, hosted: bool) -> String {
+    if hosted {
         return format!(
-            "NVIDIA's public NIM endpoint rejected '{}' for this key (404). \
-             This known unavailable hosted entry is excluded from the model list and \
-             automatic defaults. Choose another model in this chat. A successful explicit \
-             retry can restore it for this key. This is not a balance error.",
+            "NVIDIA's public NIM endpoint cannot serve '{}' for this key. \
+             It is excluded from free model choices and automatic defaults until a successful \
+             explicit retry. Choose another model in this chat. \
+             This is not a balance error.",
             crate::redact::redact_output(model),
         );
     }
     format!(
-        "NVIDIA NIM's deployment for '{}' is unavailable to this API key (404). \
+        "NVIDIA NIM's deployment for '{}' is unavailable to this API key. \
          Hidden from this account's model list for 15 minutes. Choose another model, \
          or explicitly retry this one later; a successful retry restores it. \
          This error does not indicate your account balance.",
@@ -1829,6 +2013,280 @@ mod tests {
         );
     }
 
+    fn free_resource(name: &str, free: bool) -> Value {
+        json!({
+            "name":name, "orgName":"fixture-org", "displayName":"Free Chat",
+            "labels":[
+                {"key":"publisher","unresolvedValues":["vendor"]},
+                {"key":"general","values":if free {vec!["Free Endpoint"]} else {vec!["Download Available"]}}
+            ],
+            // This is download availability, not hosted availability.
+            "attributes":[{"key":"AVAILABLE","value":"false"}]
+        })
+    }
+
+    fn free_page(resources: Vec<Value>) -> Value {
+        json!({
+            "params":{"page":0,"pageSize":100}, "resultTotal":resources.len(),
+            "results":[{"groupValue":"ENDPOINT","totalCount":resources.len(),"resources":resources}]
+        })
+    }
+
+    fn free_spec(name: &str, wire_id: &str, path: &str) -> Value {
+        json!({
+            "artifactName":name, "nvcfFunctionId":"fixture-deployment",
+            "nvcfInferencePath":path, "attributes":json!({"showUnavailableBanner":false}).to_string(),
+            "openAPISpec":json!({
+                "servers":[{"url":"https://integrate.api.nvidia.com/v1"}],
+                "paths":{path:{"post":{"x-nvai-meta":{"examples":[{
+                    "requestJson":json!({"model":wire_id}).to_string()
+                }]}}}}
+            }).to_string()
+        })
+    }
+
+    #[test]
+    fn free_only_guard_covers_explicit_selections_defaults_and_successful_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = Arc::new(AvailabilityStore::new(tmp.path().join("availability")))
+            .scope([1; 32])
+            .until_success();
+        let models = inventory_models(vec![json!({"id":"vendor/free"})], vec![]);
+        let base = "https://integrate.api.nvidia.com";
+        let error =
+            choose_model(Some("vendor/paid"), models.clone(), true, base, &scope).unwrap_err();
+        assert!(error.to_string().contains("No inference request was sent"));
+        assert_eq!(
+            choose_model(Some("vendor/free"), models.clone(), true, base, &scope).unwrap(),
+            "vendor/free"
+        );
+        assert_eq!(
+            choose_model(None, models.clone(), true, base, &scope).unwrap(),
+            "vendor/free"
+        );
+        assert!(choose_model(None, vec![], true, base, &scope).is_err());
+        scope.reject("vendor/free").unwrap();
+        record_model_success(base, "vendor/free", " ", &scope).unwrap();
+        assert!(choose_model(None, models.clone(), true, base, &scope).is_err());
+        // A deliberate retry can recover access, but cannot bypass free pricing.
+        assert_eq!(
+            choose_model(Some("vendor/free"), models, true, base, &scope).unwrap(),
+            "vendor/free"
+        );
+        assert_eq!(
+            choose_model(
+                Some("private/model"),
+                vec![],
+                false,
+                "http://localhost:8000",
+                &scope
+            )
+            .unwrap(),
+            "private/model"
+        );
+    }
+
+    #[test]
+    fn hosted_fixture_uses_the_declared_dynamic_chat_path() {
+        let page = hosted::page(free_page(vec![free_resource("card-slug", true)]), 0).unwrap();
+        let spec = free_spec("card-slug", "vendor/exact-wire-id", "/v1/chat/completions");
+        assert_eq!(
+            page.resources[0].model_ids(&spec),
+            HashSet::from(["vendor/exact-wire-id".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn public_hosted_catalog_only_offers_free_deployed_chat_and_blocks_paid_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut prompts = 0;
+            for _ in 0..8 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, headers, body) = read_request(&mut socket).await;
+                let authenticated = headers.to_ascii_lowercase().contains("authorization:");
+                if path == "/v1/chat/completions" {
+                    prompts += 1;
+                    assert_eq!(
+                        body["model"], "vendor/free-5.3",
+                        "never a paid/guessed default"
+                    );
+                    assert!(authenticated);
+                    respond(&mut socket, "200 OK", "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Free answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").await;
+                    continue;
+                }
+                assert!(
+                    headers.starts_with("GET "),
+                    "catalog discovery never sends probes"
+                );
+                let value = if path == "/v1/models" {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("bearer nvapi-free-fixture")
+                    );
+                    json!({"data":[
+                        {"id":"vendor/paid"}, {"id":"vendor/free-5.3"},
+                        {"id":"vendor/retired"}, {"id":"vendor/embedding"}, {"id":"vendor/unknown"}
+                    ]})
+                } else {
+                    assert!(
+                        !authenticated,
+                        "no key goes to public free/deployment metadata"
+                    );
+                    if path.starts_with("/free-endpoints?") {
+                        let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+                        let (_, query) = url.query_pairs().find(|(key, _)| key == "q").unwrap();
+                        let query: Value = serde_json::from_str(&query).unwrap();
+                        assert_eq!(query["filters"][0]["value"], "nim_type_preview");
+                        free_page(vec![
+                            free_resource("free-5-3", true),
+                            free_resource("paid", false),
+                            free_resource("retired", true),
+                            free_resource("embedding", true),
+                            free_resource("no-inventory", true),
+                        ])
+                    } else if path == "/featured-models.json" {
+                        json!({"featured-models":[{"model":"vendor/paid","model-name":"Misleading (free) label"}]})
+                    } else if path == "/endpoint-specs/fixture-org/retired/spec" {
+                        respond(&mut socket, "404 Not Found", "application/json", "{}").await;
+                        continue;
+                    } else if path == "/endpoint-specs/fixture-org/free-5-3/spec" {
+                        free_spec("free-5-3", "vendor/free-5.3", "/v1/chat/completions")
+                    } else if path == "/endpoint-specs/fixture-org/embedding/spec" {
+                        free_spec("embedding", "vendor/embedding", "/v1/embeddings")
+                    } else if path == "/endpoint-specs/fixture-org/no-inventory/spec" {
+                        free_spec(
+                            "no-inventory",
+                            "vendor/no-inventory",
+                            "/v1/chat/completions",
+                        )
+                    } else {
+                        panic!("unexpected catalog request {path}");
+                    }
+                };
+                respond(
+                    &mut socket,
+                    "200 OK",
+                    "application/json",
+                    &value.to_string(),
+                )
+                .await;
+            }
+            assert_eq!(prompts, 1, "only the actual user turn sends inference");
+        });
+        let harness = NvidiaNimHarness::new()
+            .with_base_url(&base)
+            .with_hosted_catalog(&base)
+            .with_store_root(tmp.path())
+            .with_api_key_source(|| Ok(Some("nvapi-free-fixture".into())));
+        let catalog = harness.model_catalog(true).await.unwrap();
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vendor/free-5.3"]
+        );
+        assert!(
+            catalog.models[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("Free NVIDIA-hosted")
+        );
+        assert_eq!(harness.models().await.unwrap(), catalog.models);
+        let mut request = run_request();
+        request.model = Some("vendor/paid".into());
+        let (controls, _steering, _, _) = run_controls();
+        let error = harness
+            .run(request, controls)
+            .await
+            .err()
+            .expect("paid model is blocked");
+        assert!(error.to_string().contains("No inference request was sent"));
+        let mut request = run_request();
+        request.model = None;
+        let (controls, steering, _, _) = run_controls();
+        let stream = harness.run(request, controls).await.unwrap();
+        drop(steering); // Let the parked session finish after its real user turn.
+        let events: Vec<_> = stream.collect().await;
+        assert!(events.into_iter().any(
+            |event| matches!(event, Ok(AgentEvent::TextDelta { text }) if text == "Free answer")
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_free_catalog_errors_and_empty_results_never_offer_paid_inventory() {
+        for response in [None, Some("not json"), Some("empty")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let attempts = if response == Some("empty") { 1 } else { 3 };
+                for _ in 0..3 * attempts {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (path, headers, _) = read_request(&mut socket).await;
+                    assert!(headers.starts_with("GET "));
+                    if path.starts_with("/free-endpoints?") {
+                        assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                        match response {
+                            None => {
+                                respond(
+                                    &mut socket,
+                                    "503 Service Unavailable",
+                                    "application/json",
+                                    "{}",
+                                )
+                                .await
+                            }
+                            Some("empty") => {
+                                respond(
+                                    &mut socket,
+                                    "200 OK",
+                                    "application/json",
+                                    &free_page(vec![]).to_string(),
+                                )
+                                .await
+                            }
+                            Some(body) => {
+                                respond(&mut socket, "200 OK", "application/json", body).await
+                            }
+                        }
+                    } else {
+                        let body = if path == "/v1/models" {
+                            r#"{"data":[{"id":"vendor/paid"}]}"#
+                        } else {
+                            assert_eq!(path, "/featured-models.json");
+                            r#"{"featured-models":[{"model":"vendor/paid"}]}"#
+                        };
+                        respond(&mut socket, "200 OK", "application/json", body).await;
+                    }
+                }
+            });
+            let harness = NvidiaNimHarness::new()
+                .with_base_url(&base)
+                .with_hosted_catalog(&base)
+                .with_api_key_source(|| Ok(Some("nvapi-free-fixture".into())));
+            let catalog = harness.model_catalog(true).await;
+            if response == Some("empty") {
+                assert!(catalog.unwrap().models.is_empty());
+                let (controls, _steering, _, _) = run_controls();
+                let mut request = run_request();
+                request.model = Some("vendor/paid".into());
+                assert!(harness.run(request, controls).await.is_err());
+            } else {
+                assert!(catalog.is_err());
+            }
+            assert!(harness.fallback_models().is_empty());
+            server.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn empty_inventory_is_authoritative_even_with_healthy_featured_metadata() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2124,6 +2582,15 @@ mod tests {
                 "error":{"code":"model_not_found", "message":"Unknown model"}
             })
         ));
+        assert!(is_model_unavailable(
+            410,
+            &json!({"detail":"This model is no longer supported."})
+        ));
+        assert!(is_model_unavailable(
+            410,
+            &json!({"error":{"code":"model_retired"}})
+        ));
+        assert!(!is_model_unavailable(410, &json!({"detail":"Gone"})));
         for status in [400, 401, 402, 403, 429, 500, 503] {
             assert!(!is_model_unavailable(status, &problem));
         }
@@ -2427,7 +2894,9 @@ mod tests {
             reqwest::StatusCode::PAYMENT_REQUIRED,
             r#"{"error":{"message":"No credit for nvapi-private-fixture-1234567890"}}"#,
         );
-        assert!(error.contains("no inference credits"));
+        assert!(error.contains("Payment Required"));
+        assert!(error.contains("has not switched to a paid model"));
+        assert!(!error.contains("no inference credits"));
         assert!(!error.contains("nvapi-private-fixture"));
     }
 
@@ -2609,7 +3078,7 @@ mod tests {
         let status = loop {
             let event = stream.next().await.unwrap().unwrap();
             if let AgentEvent::Error { message } = &event {
-                saw_error |= message.contains("rejected the API key");
+                saw_error |= message.contains("denied inference access");
                 assert!(!message.contains("nvapi-fixture-key-123456"));
             }
             if let AgentEvent::Done { status, .. } = event {

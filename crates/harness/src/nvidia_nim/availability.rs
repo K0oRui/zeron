@@ -28,6 +28,7 @@ pub(super) struct AvailabilityStore {
 pub(super) struct AvailabilityScope {
     store: Arc<AvailabilityStore>,
     key: [u8; 32],
+    until_success: bool,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -59,6 +60,7 @@ impl AvailabilityStore {
         AvailabilityScope {
             store: self.clone(),
             key,
+            until_success: false,
         }
     }
 
@@ -128,6 +130,13 @@ impl AvailabilityStore {
 }
 
 impl AvailabilityScope {
+    /// Public free-only choices must not revive a known failure on a timer.
+    /// An actual successful explicit retry still clears the rejection.
+    pub(super) fn until_success(mut self) -> Self {
+        self.until_success = true;
+        self
+    }
+
     pub(super) fn unavailable(&self) -> HashSet<String> {
         self.unavailable_at(now())
     }
@@ -173,7 +182,7 @@ impl AvailabilityScope {
         let evidence = accounts
             .entry(self.key)
             .or_insert_with(|| self.store.load(&self.key));
-        prune(&mut evidence.models, now);
+        prune(&mut evidence.models, now, self.until_success);
         evidence.models.keys().cloned().collect()
     }
 
@@ -190,7 +199,7 @@ impl AvailabilityScope {
         let evidence = accounts
             .entry(self.key)
             .or_insert_with(|| self.store.load(&self.key));
-        prune(&mut evidence.models, now);
+        prune(&mut evidence.models, now, self.until_success);
         let changed = if reject {
             evidence.verified.remove(model);
             evidence.models.insert(model.to_owned(), now);
@@ -219,10 +228,11 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn prune(models: &mut ModelTimes, now: u64) {
-    // A backward clock adjustment must not hide a model indefinitely either.
+fn prune(models: &mut ModelTimes, now: u64, until_success: bool) {
+    // Future timestamps are not evidence. Custom endpoints retain the short TTL;
+    // public hosted failures require an actual successful retry.
     models.retain(|_, rejected_at| {
-        *rejected_at <= now && now - *rejected_at < REJECTION_TTL.as_secs()
+        *rejected_at <= now && (until_success || now - *rejected_at < REJECTION_TTL.as_secs())
     });
 }
 
@@ -266,6 +276,35 @@ mod tests {
         let restarted = dir.store().scope([1; 32]);
         assert!(restarted.unavailable_at(1001).contains("fixture/chat"));
         assert_eq!(restarted.unavailable_at(1001).len(), 1);
+    }
+
+    #[test]
+    fn hosted_failures_do_not_expire_but_a_success_clears_them() {
+        let dir = TempDir::new();
+        let account = dir.store().scope([1; 32]).until_success();
+        account.update("fixture/free", true, 1000).unwrap();
+        assert!(
+            account
+                .unavailable_at(1000 + 86400 * 365)
+                .contains("fixture/free")
+        );
+        let restarted = dir.store().scope([1; 32]).until_success();
+        assert!(restarted.unavailable().contains("fixture/free"));
+        assert!(
+            dir.store()
+                .scope([2; 32])
+                .until_success()
+                .unavailable()
+                .is_empty()
+        );
+        restarted.allow("fixture/free").unwrap();
+        assert!(
+            dir.store()
+                .scope([1; 32])
+                .until_success()
+                .unavailable()
+                .is_empty()
+        );
     }
 
     #[test]

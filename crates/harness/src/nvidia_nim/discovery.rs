@@ -163,11 +163,14 @@ pub(super) fn is_chat_model(id: &str, row: &Value) -> bool {
 /// https://build.nvidia.com/writer/palmyra-fin-70b-32k
 /// An actual successful completion may override this exclusion for its key.
 pub(super) fn known_unavailable_on_hosted(base_url: &str, model: &str) -> bool {
+    is_public_hosted(base_url) && model == "writer/palmyra-fin-70b-32k"
+}
+
+pub(super) fn is_public_hosted(base_url: &str) -> bool {
     let base_url = base_url.trim().trim_end_matches('/');
     let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
-    let public_host = base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com")
-        || base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com:443");
-    public_host && model == "writer/palmyra-fin-70b-32k"
+    base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com")
+        || base_url.eq_ignore_ascii_case("https://integrate.api.nvidia.com:443")
 }
 
 #[cfg(test)]
