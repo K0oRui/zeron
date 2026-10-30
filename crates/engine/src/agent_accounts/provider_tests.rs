@@ -273,29 +273,45 @@ fn grok_auth_prefers_auth_x_ai_and_keys_by_identity() {
 }
 
 #[test]
-fn grok_usage_uses_the_grok_build_share_of_the_period() {
+fn grok_usage_reads_the_credit_percent_and_names_the_window() {
+    // The 1.0.70 shape: `creditUsagePercent` (0–100) plus a plain
+    // `currentPeriod` window — no `productUsage[]`, no period-type enum.
     let body = serde_json::json!({
         "config": {
             "creditUsagePercent": 12.0,
-            "productUsage": [
-                { "product": "Chat", "usagePercent": 80.0 },
-                { "product": "GrokBuild", "usagePercent": 45.0 },
-            ],
+            "monthlyLimit": { "val": 200 },
             "currentPeriod": {
-                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2030-01-01T00:00:00Z",
                 "end": "2030-01-08T00:00:00Z",
             },
+            "billingPeriodStart": "2030-01-01T00:00:00Z",
+            "isUnifiedBillingUser": true,
+            "history": [{ "billingCycle": { "month": "2030-01" }, "includedUsed": 10, "totalUsed": 24 }],
         }
     });
     let snapshot = grok_usage_snapshot(&body).unwrap();
     assert_eq!(snapshot.windows.len(), 1);
     assert_eq!(snapshot.windows[0].label, "Week");
-    assert!((snapshot.windows[0].used_fraction - 0.45).abs() < 1e-6);
+    assert!((snapshot.windows[0].used_fraction - 0.12).abs() < 1e-6);
     assert!(snapshot.windows[0].resets_at.is_some());
-    // Blended percent when the product breakdown is missing.
-    let blended = serde_json::json!({ "config": { "creditUsagePercent": 12.0 } });
-    let snapshot = grok_usage_snapshot(&blended).unwrap();
+
+    // A monthly window is named "Month", a bare window "Period".
+    let monthly = serde_json::json!({
+        "config": {
+            "creditUsagePercent": 50.0,
+            "currentPeriod": {
+                "start": "2030-01-01T00:00:00Z",
+                "end": "2030-02-01T00:00:00Z",
+            },
+        }
+    });
+    let snapshot = grok_usage_snapshot(&monthly).unwrap();
+    assert_eq!(snapshot.windows[0].label, "Month");
+    let bare = serde_json::json!({ "config": { "creditUsagePercent": 12.0 } });
+    let snapshot = grok_usage_snapshot(&bare).unwrap();
     assert_eq!(snapshot.windows[0].label, "Period");
+    assert!((snapshot.windows[0].used_fraction - 0.12).abs() < 1e-6);
+    // A config with nothing usable is schema drift, not a zero meter.
     assert!(grok_usage_snapshot(&serde_json::json!({ "config": {} })).is_none());
 }
 
@@ -305,7 +321,7 @@ fn grok_usage_treats_an_omitted_percent_as_zero() {
     let body = serde_json::json!({
         "config": {
             "currentPeriod": {
-                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2030-01-01T00:00:00Z",
                 "end": "2030-01-08T00:00:00Z",
             },
             "onDemandCap": { "val": 0 },
@@ -318,19 +334,6 @@ fn grok_usage_treats_an_omitted_percent_as_zero() {
     assert_eq!(snapshot.windows[0].label, "Week");
     assert_eq!(snapshot.windows[0].used_fraction, 0.0);
     assert!(snapshot.windows[0].resets_at.is_some());
-
-    // A present product with an omitted percentage is zero too.
-    let body = serde_json::json!({
-        "config": {
-            "currentPeriod": {
-                "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                "end": "2030-01-08T00:00:00Z",
-            },
-            "productUsage": [{ "product": "GrokBuild" }],
-        }
-    });
-    let snapshot = grok_usage_snapshot(&body).unwrap();
-    assert_eq!(snapshot.windows[0].used_fraction, 0.0);
 }
 
 #[test]
@@ -338,7 +341,7 @@ fn grok_usage_falls_back_to_on_demand_spend() {
     let body = serde_json::json!({
         "config": {
             "currentPeriod": {
-                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2030-01-01T00:00:00Z",
                 "end": "2030-01-08T00:00:00Z",
             },
             "onDemandCap": { "val": 200 },

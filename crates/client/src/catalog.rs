@@ -190,18 +190,16 @@ pub fn fallback_models(harness: &str) -> Vec<ModelInfo> {
         )]
     };
     match harness {
+        // Mirrors grok 1.0.70's own catalog and `grok_spec`'s static rows:
+        // grok-4.6 is the CLI's default (and takes `xhigh`), grok-4.5's ladder
+        // stops at High. A row the agent does not advertise is skipped by the
+        // config-option set, so a stale id here fails silently — keep it in
+        // step with the CLI release the harness targets.
         "grok" => vec![
-            model(
-                "grok-4.7",
-                "Grok 4.7",
-                "xAI's frontier coding model, up to 500k context",
-                &["low", "medium", "high", "xhigh"],
-                vec![],
-            ),
             model(
                 "grok-4.6",
                 "Grok 4.6",
-                "xAI's coding model, up to 500k context",
+                "xAI's frontier coding model, up to 500k context",
                 &["low", "medium", "high", "xhigh"],
                 vec![],
             ),
@@ -726,14 +724,20 @@ mod tests {
 
     #[test]
     fn grok_fallback_mirrors_the_engine_catalog() {
+        // grok 1.0.70 advertises exactly [grok-4.6 (default), grok-4.5]; a
+        // row the CLI does not know (the old `grok-4.7`) would be dropped by
+        // the agent silently, leaving the run on the agent's own default.
         let models = fallback_models("grok");
-        assert_eq!(models[0].id, "grok-4.7");
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["grok-4.6", "grok-4.5"]
+        );
+        assert_eq!(models[0].label, "Grok 4.6");
         assert_eq!(
             models[0].reasoning_levels,
             vec!["low", "medium", "high", "xhigh"]
         );
-        assert!(models.iter().any(|m| m.id == "grok-4.6"));
-        assert!(models.iter().any(|m| m.id == "grok-4.5"));
+        assert_eq!(models[1].reasoning_levels, vec!["low", "medium", "high"]);
     }
 
     #[test]

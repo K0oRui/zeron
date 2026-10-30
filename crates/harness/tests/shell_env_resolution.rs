@@ -62,9 +62,9 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         "snapshot should carry the shell-shaped PATH, got: {snapshot}"
     );
 
-    // The agent binaries are only reachable through the snapshot; the
-    // launch program (not the npx fallback) must be the shell-PATH binary,
-    // proving resolution consulted the login-shell snapshot.
+    // The agent binaries are only reachable through the snapshot, so the
+    // launch program must be the shell-PATH binary — proving resolution
+    // consulted the login-shell snapshot.
     // Native drivers consult the same snapshot for the agent CLI itself.
     assert!(
         zeron_harness::ClaudeHarness::new().installed(),

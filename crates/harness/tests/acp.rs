@@ -769,14 +769,15 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
     assert_eq!(harness.steering_mode(), SteeringMode::StepBoundary);
-    // Grok Build advertises Low/Medium/High; the xhigh effort arrives per
-    // model (4.6/4.7) through the catalog, not through this ladder.
+    // The default model (grok-4.6) advertises Low/Medium/High/xhigh;
+    // grok-4.5's ladder stops at High and arrives per model via the catalog.
     assert_eq!(
         harness.reasoning_levels(),
         &[
             zeron_proto::ReasoningLevel::Low,
             zeron_proto::ReasoningLevel::Medium,
             zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
         ]
     );
 }

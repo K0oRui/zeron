@@ -169,6 +169,19 @@ fn typed_call(update: &Value) -> ToolCall {
     let kind = update
         .get("kind")
         .and_then(Value::as_str)
+        // Grok's OPENING `tool_call` frame carries no top-level `kind` — it
+        // stamps it on `_meta.x.ai/tool` instead (`{name, kind, label,
+        // read_only}`), and only the first `tool_call_update` repeats it.
+        // Without this fallback the chip is born
+        // `Unknown { name: "run_terminal_command" }` (snake_case, no Exec
+        // icon) and re-types a beat later.
+        .or_else(|| {
+            update
+                .get("_meta")?
+                .get("x.ai/tool")?
+                .get("kind")?
+                .as_str()
+        })
         .unwrap_or("other");
     let title = str_field(update, "title");
     let raw = update.get("rawInput").filter(|v| !v.is_null());
@@ -442,6 +455,134 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             }
         }
         "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
+        _ => notice_events(update),
+    }
+}
+
+/// Grok's `retry_state` payload differs per variant (1.0.70, captured live
+/// against a failing gateway):
+///
+/// - `retrying`:  `{error_type, is_rate_limited, attempt, max_retries, reason}`
+/// - `failed`:    `{error_type, message}` — NO `attempt`, and `message` is a
+///   multi-line diagnostic ("Unauthorized (401) from …" plus an indented
+///   `Model:`/`Auth:`/`Version:` block), so only its first line is a sentence
+/// - `exhausted`: `{attempts, is_rate_limited, reason}` — `attempts`, PLURAL,
+///   and no `error_type` at all
+///
+/// `error_type` is a category (`api`, `http`, `auth`, `rate_limited`), never
+/// prose: rendering it raw is what produced "Grok could not reach the model:
+/// api". It is only consulted when the frame carries no text, and then as a
+/// phrase ([`retry_category`]).
+const RETRY_TEXT_CAP: usize = 200;
+
+/// The frame's own sentence, whichever field this variant uses.
+fn retry_reason(update: &Value) -> Option<String> {
+    ["reason", "message"]
+        .iter()
+        .filter_map(|key| update.get(*key).and_then(Value::as_str))
+        .map(|text| text.lines().next().unwrap_or("").trim())
+        .find(|line| !line.is_empty())
+        .map(|line| cap_text(line, RETRY_TEXT_CAP))
+}
+
+/// A human phrase for the machine category, for frames that carry no text.
+fn retry_category(update: &Value) -> Option<&'static str> {
+    match str_field(update, "error_type").as_str() {
+        "api" => Some("the model API failed"),
+        "http" => Some("the connection to the API failed"),
+        "auth" => Some("the sign-in was rejected"),
+        "rate_limited" | "rate_limit" => Some("the account is rate limited"),
+        "stream" => Some("the model stream broke"),
+        "timeout" => Some("the request timed out"),
+        _ => None,
+    }
+}
+
+/// How many attempts the frame reports: `attempt` on `retrying`, `attempts`
+/// on `exhausted`, and nothing at all on `failed`.
+fn retry_attempts(update: &Value) -> u64 {
+    ["attempt", "attempts"]
+        .iter()
+        .find_map(|key| update.get(*key).and_then(Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn retry_max_retries(update: &Value) -> u64 {
+    update
+        .get("max_retries")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+/// What to tell the user about a retry that ended the turn: `failed` (the
+/// agent gave up at once) or `exhausted` (it burned its retry budget). The
+/// run loop folds this into the terminal error, so "The agent failed to
+/// complete the turn." can say WHY.
+pub(crate) fn retry_failure(update: &Value) -> Option<String> {
+    let kind = str_field(update, "type");
+    if !matches!(kind.as_str(), "failed" | "exhausted") {
+        return None;
+    }
+    // Nothing to add means nothing to add: the Done already says the turn
+    // failed, and inventing text for an unrecognized category is worse than
+    // the generic sentence.
+    let why = retry_reason(update).or_else(|| retry_category(update).map(str::to_owned))?;
+    let attempts = retry_attempts(update);
+    Some(if attempts > 1 {
+        format!("{why} (after {attempts} attempts)")
+    } else {
+        why
+    })
+}
+
+/// Updates that tell the user something the transcript would otherwise hide.
+/// Grok (1.0.70) is the source: `retry_state` (the model stream died and the
+/// agent is silently retrying — the run reads as frozen for minutes) and
+/// context-compaction trouble, which arrives either on `session/update` or
+/// wrapped in `_x.ai/session_notification`. `map_update`'s catch-all and
+/// [`crate::acp::session_update_events`] both route here, so either channel
+/// surfaces them.
+///
+/// The chips go out as [`AgentEvent::Error`] — zeron's mid-run notice
+/// channel (the doc folds it into a warning chip); it does not end the turn.
+pub(crate) fn notice_events(update: &Value) -> Vec<AgentEvent> {
+    let message = |text: String| vec![AgentEvent::Error { message: text }];
+    match str_field(update, "sessionUpdate").as_str() {
+        "retry_state" => {
+            match str_field(update, "type").as_str() {
+                // One chip per streak: attempt 1 is where a streak starts, and
+                // every attempt would bury the transcript (1.0.70 retries up
+                // to 15 times).
+                "retrying" if retry_attempts(update) <= 1 => {
+                    let why = retry_reason(update)
+                        .or_else(|| retry_category(update).map(str::to_owned));
+                    let max = retry_max_retries(update);
+                    message(match (why, max) {
+                        (Some(why), max) if max > 1 => {
+                            format!("Grok is retrying: {why} (up to {max} attempts)")
+                        }
+                        (Some(why), _) => format!("Grok is retrying: {why}"),
+                        (None, max) if max > 1 => {
+                            format!("Grok is retrying a failed model call (up to {max} attempts)")
+                        }
+                        (None, _) => "Grok is retrying a failed model call".into(),
+                    })
+                }
+                // The give-up states are the END of the turn, and the run
+                // loop folds them into its Done error ([`retry_failure`]).
+                // The doc writes an error part for a `Done` error too, so a
+                // chip here would say everything twice (the convention codex
+                // states in `normalize::settle_turn_error`).
+                _ => Vec::new(),
+            }
+        }
+        "auto_compact_failed" => message(
+            "Grok could not compact the conversation; the next turn may exceed its context window"
+                .into(),
+        ),
+        "auto_compact_cancelled" => message(
+            "Grok cancelled context compaction; the next turn may exceed its context window".into(),
+        ),
         _ => Vec::new(),
     }
 }
@@ -563,6 +704,198 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Grok's opening tool_call frame has no top-level `kind` — it is only on
+    /// `_meta.x.ai/tool.kind` — and the chip must be typed from the first
+    /// frame, not after the follow-up update.
+    #[test]
+    fn grok_tool_call_typing_falls_back_to_the_xai_meta_kind() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "run_terminal_command",
+            "rawInput": { "command": "echo hello", "description": "say hello" },
+            "_meta": {
+                "x.ai/tool": {
+                    "name": "run_terminal_command",
+                    "kind": "execute",
+                    "label": "Run Command",
+                    "namespace": "grok_build",
+                    "read_only": false,
+                },
+            },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "call_1".into(),
+                call: ToolCall::Exec {
+                    command: "echo hello".into(),
+                },
+            }]
+        );
+        // A top-level kind still wins over the meta one.
+        let explicit = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_2",
+            "kind": "read",
+            "rawInput": { "path": "/w/a.rs" },
+            "_meta": { "x.ai/tool": { "kind": "execute" } },
+        });
+        assert!(matches!(
+            map_update(&explicit).first(),
+            Some(AgentEvent::ToolCall {
+                call: ToolCall::ReadFile { .. },
+                ..
+            })
+        ));
+    }
+
+    /// A silent retry streak is the main "Grok looks stuck" report: one chip
+    /// when it starts, none for attempts 2..n. Payloads captured live from
+    /// 1.0.70 against a failing gateway.
+    #[test]
+    fn grok_retry_states_surface_one_chip_per_streak() {
+        let retrying = |attempt: u64| {
+            json!({
+                "sessionUpdate": "retry_state",
+                "type": "retrying",
+                "attempt": attempt,
+                "max_retries": 15,
+                "reason": "API error (status 500 Internal Server Error): mock upstream 500",
+                "error_type": "api",
+            })
+        };
+        assert_eq!(
+            notice_events(&retrying(1)),
+            vec![AgentEvent::Error {
+                message: "Grok is retrying: API error (status 500 Internal Server Error): \
+                          mock upstream 500 (up to 15 attempts)"
+                    .into()
+            }]
+        );
+        assert!(notice_events(&retrying(2)).is_empty());
+        // The give-up frames are the turn's END, carried by the Done instead
+        // of a chip: the doc already writes an error part for a Done error.
+        assert!(
+            notice_events(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "exhausted",
+                "attempts": 4,
+                "reason": "API error (status 429 Too Many Requests): rate_limit_error",
+                "is_rate_limited": true,
+            }))
+            .is_empty()
+        );
+        // A frame with no text at all still names the category as a phrase.
+        assert_eq!(
+            notice_events(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "retrying",
+                "attempt": 1,
+                "max_retries": 0,
+                "error_type": "http",
+            })),
+            vec![AgentEvent::Error {
+                message: "Grok is retrying: the connection to the API failed".into()
+            }]
+        );
+        // Lifecycle noise stays silent.
+        assert!(notice_events(&json!({ "sessionUpdate": "turn_completed" })).is_empty());
+        assert!(
+            notice_events(&json!({
+                "sessionUpdate": "auto_compact_failed",
+            }))
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("compact")))
+        );
+    }
+
+    /// The `failed` variant spells its text `message`, not `reason`, and that
+    /// message is a multi-line diagnostic. Only its first line is a sentence,
+    /// and the machine `error_type` must never reach the user — that is the
+    /// "Grok could not reach the model: api" report.
+    #[test]
+    fn grok_failed_retry_text_never_leaks_the_error_type() {
+        let failed = json!({
+            "sessionUpdate": "retry_state",
+            "type": "failed",
+            "error_type": "auth",
+            "message": "Unauthorized (401) from http://127.0.0.1:8905/v1/chat/completions: \
+                        authentication_error: mock unauthorized\n\n  Model:     grok-4.6\n  \
+                        Auth:      ApiKey\n  Version:   1.0.70\n  Available: (none)",
+        });
+        // No chip: the run loop's Done carries it.
+        assert!(notice_events(&failed).is_empty());
+        let why = retry_failure(&failed).expect("failed is a give-up state");
+        assert!(
+            why.starts_with("Unauthorized (401) from http://127.0.0.1:8905/v1/chat/completions"),
+            "{why}"
+        );
+        assert!(!why.contains("Model:"), "the diagnostic block is dropped: {why}");
+        // A frame with only the machine category must not echo it.
+        let why = retry_failure(&json!({
+            "sessionUpdate": "retry_state",
+            "type": "failed",
+            "error_type": "api",
+        }))
+        .expect("failed is a give-up state");
+        assert_eq!(why, "the model API failed");
+        assert!(!why.contains("api"), "the raw error_type leaked: {why}");
+        // An unknown category is never echoed raw, and adds nothing: the
+        // generic Done sentence stands rather than inventing text.
+        assert_eq!(
+            retry_failure(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "failed",
+                "error_type": "some_future_kind",
+            })),
+            None
+        );
+    }
+
+    /// What the run loop folds into the terminal error: the give-up states
+    /// answer, the still-retrying one does not.
+    #[test]
+    fn grok_retry_failure_describes_only_the_give_up_states() {
+        assert_eq!(
+            retry_failure(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "failed",
+                "error_type": "api",
+                "message": "stream ended before a finish reason\n\n  Model: grok-4.6",
+            })),
+            Some("stream ended before a finish reason".to_owned())
+        );
+        assert_eq!(
+            retry_failure(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "exhausted",
+                "attempts": 3,
+                "reason": "API error (status 503)",
+            })),
+            Some("API error (status 503) (after 3 attempts)".to_owned())
+        );
+        assert_eq!(
+            retry_failure(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "failed",
+                "error_type": "auth",
+            })),
+            Some("the sign-in was rejected".to_owned())
+        );
+        // A streak still in progress is not a failure yet.
+        assert_eq!(
+            retry_failure(&json!({
+                "sessionUpdate": "retry_state",
+                "type": "retrying",
+                "attempt": 1,
+                "reason": "API error (status 500)",
+            })),
+            None
+        );
+        assert_eq!(retry_failure(&json!({ "sessionUpdate": "turn_completed" })), None);
     }
 
     #[test]

@@ -53,7 +53,6 @@ pub(super) fn spec() -> AcpAgentSpec {
         // The CLI *is* the ACP server, so a managed adapter copy would be a
         // second full agent install; the user's own `kilo` is the one that
         // holds their logins and config.
-        npm_package: None,
         archive: None,
         extra_paths: install_paths,
         cli_executable: "kilo",

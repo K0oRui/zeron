@@ -1,4 +1,11 @@
-//! Managed installs for npm-distributed ACP adapters.
+//! Managed installs for npm-distributed ACP adapter SDKs.
+//!
+//! Today the only consumer is Cursor's SDK shim ([`ensure_installed_shim`]).
+//! Grok used to live here too, but `@xai-official/grok` is not an adapter —
+//! it is the CLI itself, and its postinstall/launcher rewrite
+//! `$GROK_HOME/bin` while the ok-marker froze zeron's copy at whatever
+//! version was installed first (see `acp::grok_spec`), so its installation is
+//! the CLI's own business.
 //!
 //! The old fallback spawned `npx -y <pkg>` at chat time, which put every
 //! user's npm state in the hot path: a cold cache meant a multi-minute
@@ -9,13 +16,13 @@
 //! ONCE into a zeron-owned prefix (`~/.zeron/adapters/<pkg>/<version>` on
 //! Unix, the local app-data directory on Windows), with its own npm cache
 //! beside it, so a root-owned or read-only user cache cannot break us. Every
-//! subsequent launch spawns `node <entry>` directly — no npm anywhere near a
-//! chat turn.
+//! subsequent launch spawns `node <entry>` (or the shim) directly — no npm
+//! anywhere near a chat turn.
 //!
 //! Install is atomic: npm runs in a `.tmp-*` sibling which is renamed into
-//! place only after the bin entry resolves and a marker file is written, so a
+//! place only after the entry/shim resolves and a marker file is written, so a
 //! killed install can never masquerade as a working adapter, and concurrent
-//! installers (two daemons, prewarm racing a run) converge on whichever
+//! installers (two daemons, discovery racing a run) converge on whichever
 //! rename won.
 
 use std::ffi::{OsStr, OsString};
@@ -110,39 +117,6 @@ fn install_dir_in(root: &Path, pin: &NpmPin) -> PathBuf {
 
 fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
     adapters_root().map(|root| install_dir_in(&root, pin))
-}
-
-/// The package's bin entry inside an install dir, from its own package.json
-/// (`bin` as a string, or a map preferring `bin_name`).
-fn bin_entry(dir: &Path, pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
-    let pkg_dir = dir.join("node_modules").join(pin.name);
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join("package.json")).ok()?).ok()?;
-    let rel = match manifest.get("bin")? {
-        serde_json::Value::String(entry) => entry.clone(),
-        serde_json::Value::Object(map) => map
-            .get(bin_name)
-            .or_else(|| map.values().next())
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)?,
-        _ => return None,
-    };
-    let entry = pkg_dir.join(rel);
-    entry.is_file().then_some(entry)
-}
-
-/// The bin entry of a COMPLETED managed install, `None` when absent.
-pub(crate) fn installed_entry(pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
-    let root = adapters_root()?;
-    installed_entry_in(&root, pin, bin_name)
-}
-
-fn installed_entry_in(root: &Path, pin: &NpmPin, bin_name: &str) -> Option<PathBuf> {
-    let dir = install_dir_in(root, pin);
-    if !dir.join(OK_MARKER).is_file() {
-        return None;
-    }
-    bin_entry(&dir, pin, bin_name)
 }
 
 fn npm_cli_for_node(node: &Path) -> Option<PathBuf> {
@@ -346,74 +320,6 @@ pub(crate) fn windows_handle_busy(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
-/// Ensure the pinned package is installed; returns its bin entry. Failures
-/// carry npm's own output — the whole point is that a dying npm stops being
-/// an undiagnosable one-liner.
-pub(crate) async fn ensure_installed(
-    pin: NpmPin,
-    bin_name: &str,
-    display_name: &str,
-) -> Result<PathBuf, HarnessError> {
-    if let Some(entry) = installed_entry(&pin, bin_name) {
-        return Ok(entry);
-    }
-    let _guard = install_lock().lock().await;
-    if let Some(entry) = installed_entry(&pin, bin_name) {
-        return Ok(entry);
-    }
-
-    let Some(npm) = find_npm() else {
-        return Err(HarnessError::NotInstalled(format!(
-            "npm (required to install the {display_name} ACP adapter {}; searched \
-             PATH, the login shell's PATH, and fnm/nvm/volta/pnpm/bun install dirs)",
-            pin.spec()
-        )));
-    };
-    let root = adapters_root().ok_or_else(|| {
-        HarnessError::Install("cannot locate a platform data directory for managed adapters".into())
-    })?;
-    let final_dir = install_dir_in(&root, &pin);
-    let tmp_dir = root.join(format!(
-        ".tmp-{}-{}-{}",
-        pin.dir_name(),
-        pin.version,
-        std::process::id()
-    ));
-    let cache_dir = root.join(".npm-cache");
-    let install = install_into(&npm, &pin, &tmp_dir, &cache_dir, display_name).await;
-    if let Err(e) = install {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-    if bin_entry(&tmp_dir, &pin, bin_name).is_none() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(HarnessError::Install(format!(
-            "npm install {} completed but the package has no runnable bin entry",
-            pin.spec()
-        )));
-    }
-    std::fs::write(tmp_dir.join(OK_MARKER), pin.version)?;
-    if let Some(parent) = final_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if rename_into_place(&tmp_dir, &final_dir).await.is_err() {
-        // Lost a cross-process race (or a stale dir): keep whatever is in
-        // place if it's complete, else replace it.
-        if installed_entry(&pin, bin_name).is_none() {
-            let _ = std::fs::remove_dir_all(&final_dir);
-            rename_into_place(&tmp_dir, &final_dir).await?;
-        } else {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        }
-    }
-    installed_entry(&pin, bin_name).ok_or_else(|| {
-        HarnessError::Install(format!(
-            "install of {} finished but its bin entry did not resolve",
-            pin.spec()
-        ))
-    })
-}
-
 /// A zeron-owned shim script materialized INSIDE a managed install dir, for
 /// SDK packages with no bin entry (`@cursor/sdk`): the shim resolves the SDK
 /// from the sibling `node_modules`. Returns the shim path when the install is
@@ -451,10 +357,10 @@ fn materialize_shim(dir: &Path, name: &str, contents: &str) -> std::io::Result<P
     Ok(shim)
 }
 
-/// Like [`ensure_installed`], for a package consumed as a LIBRARY by a
-/// zeron-owned shim rather than through a bin entry. Installs the pin once,
-/// writes `contents` to a content-addressed sibling of `shim_name`, and returns the shim
-/// path (spawn it via [`launch_for_entry`]).
+/// A package consumed as a LIBRARY by a zeron-owned shim rather than through
+/// a bin entry. Installs the pin once, writes `contents` to a content-addressed
+/// sibling of `shim_name`, and returns the shim path (spawn it via
+/// [`launch_for_entry`]).
 pub(crate) async fn ensure_installed_shim(
     pin: NpmPin,
     display_name: &str,
@@ -718,53 +624,6 @@ mod tests {
         assert!(describe_npm_exit(status(243)).contains("EACCES"));
         assert!(describe_npm_exit(status(226)).contains("EROFS"));
         assert_eq!(describe_npm_exit(status(1)), "exit code 1");
-    }
-
-    #[test]
-    fn bin_entry_reads_string_and_map_shapes() {
-        let dir = tempfile::tempdir().unwrap();
-        let pin = NpmPin::parse("@scope/tool@1.0.0");
-        let pkg = dir.path().join("node_modules").join("@scope").join("tool");
-        std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(pkg.join("dist.js"), "x").unwrap();
-
-        std::fs::write(
-            pkg.join("package.json"),
-            r#"{"name":"@scope/tool","bin":"dist.js"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            bin_entry(dir.path(), &pin, "tool"),
-            Some(pkg.join("dist.js"))
-        );
-
-        std::fs::write(
-            pkg.join("package.json"),
-            r#"{"name":"@scope/tool","bin":{"tool":"dist.js","other":"missing.js"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            bin_entry(dir.path(), &pin, "tool"),
-            Some(pkg.join("dist.js"))
-        );
-
-        // Marker gating uses an isolated managed root, never the process HOME.
-        let root = dir.path().join("isolated-adapters");
-        let installed = install_dir_in(&root, &pin);
-        let installed_pkg = installed.join("node_modules").join("@scope").join("tool");
-        std::fs::create_dir_all(&installed_pkg).unwrap();
-        std::fs::write(installed_pkg.join("dist.js"), "x").unwrap();
-        std::fs::write(
-            installed_pkg.join("package.json"),
-            r#"{"name":"@scope/tool","bin":"dist.js"}"#,
-        )
-        .unwrap();
-        assert_eq!(installed_entry_in(&root, &pin, "tool"), None);
-        std::fs::write(installed.join(OK_MARKER), pin.version).unwrap();
-        assert_eq!(
-            installed_entry_in(&root, &pin, "tool"),
-            Some(installed_pkg.join("dist.js"))
-        );
     }
 
     #[test]

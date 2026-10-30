@@ -858,19 +858,22 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
-    // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
-    // steers deliver at turn boundaries; the effort ladder applies per
-    // session via the `thought_level` config option.
+    // AcpHarness::grok() exactly — including `StepBoundary` (a steer preempts
+    // the generation and continues the live turn; this slot used to say
+    // `TurnBoundary`, which flipped the composer's affordance the moment the
+    // harness was first resolved). The ladder is what the CLI's default model
+    // (`grok-4.6`) accepts; per-model ladders narrow it at session start.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Grok,
             name: "Grok".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
+                ReasoningLevel::XHigh,
             ],
             installed: true,
             can_install: false,
@@ -1136,14 +1139,16 @@ mod tests {
         assert_eq!(grok.id(), HarnessId::Grok);
         assert_eq!(grok.display_name(), "Grok");
         assert_eq!(grok.steering_mode(), SteeringMode::StepBoundary);
-        // grok-4.5's ladder stops at High; the xhigh effort arrives per model
-        // (4.6/4.7) through the catalog, not through the harness default.
+        // The harness ladder is the default model's (grok-4.6 accepts xhigh);
+        // grok-4.5 stops at High and its narrower ladder arrives per model
+        // through the catalog.
         assert_eq!(
             grok.reasoning_levels(),
             &[
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
-                ReasoningLevel::High
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
             ]
         );
         // Cursor, Devin, Hermes and Pi mirror their specs the same way.
@@ -1528,6 +1533,29 @@ mod tests {
             .descriptors()
             .into_iter()
             .find(|d| d.id == HarnessId::Codex)
+            .unwrap();
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.supports_steering, after.supports_steering);
+        assert_eq!(before.steering_mode, after.steering_mode);
+        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// Grok's slot had exactly that drift: the static descriptor said
+    /// `TurnBoundary` while `AcpHarness::grok()` is `StepBoundary`, and its
+    /// ladder stopped at High while the default model accepts xhigh.
+    #[test]
+    fn grok_lazy_descriptor_matches_resolved_harness() {
+        let registry = default_registry();
+        let before = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Grok)
+            .unwrap();
+        registry.resolve(HarnessId::Grok).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Grok)
             .unwrap();
         assert_eq!(before.name, after.name);
         assert_eq!(before.supports_steering, after.supports_steering);

@@ -151,13 +151,19 @@
   downloaded the adapter's dependency tree (claude-agent-acp's is ~570MB).
 - Replaced by `adapter_install`: pinned packages install ONCE into
   `~/.zeron/adapters/<pkg>/<version>` (`$ZERON_ADAPTERS_DIR` overrides) with
-  a zeron-owned npm cache beside them, atomically (tmp dir + bin-entry
+  a zeron-owned npm cache beside them, atomically (tmp dir + entry
   verification + `.zeron-install-ok` marker + rename), then every launch is
-  `node <entry>` directly. Discovery probes never block on npm (background
-  install + static-catalog fallback); `run()` blocks, and install failures
-  carry npm's full output plus the decoded errno. The engine prewarms
-  adapters for present CLIs at boot. Handshake additionally bounded at 120s
-  (a hung agent used to spin "Working" forever).
+  `node <entry>` directly. Install failures carry npm's full output plus the
+  decoded errno. Handshake additionally bounded at 120s (a hung agent used to
+  spin "Working" forever).
+- 2026-10-28: the npm path is now SDK-only (Cursor's shim). Grok was its last
+  package-with-a-bin consumer, and that was wrong twice over: the package is
+  the CLI itself (not an adapter), and installing it rewrites the user's own
+  `$GROK_HOME/bin` from the package's `postinstall`/launcher while the
+  `.zeron-install-ok` marker freezes zeron's copy at that version. Grok is
+  installed by its own installer / `npm i -g` (see `install.rs`), and the
+  boot-time prewarm loop went away with it — its guard (`executable ==
+  cli_executable`) could never fire.
 
 ## Citations
 agentclientprotocol.com (v1 spec + schema), agentclientprotocol org repos
