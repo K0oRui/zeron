@@ -3,8 +3,13 @@
 use serde_json::{json, Value};
 use tracing::warn;
 
-use super::Server;
+use super::{percent_encode_path, unwrap_data, Protocol, Server};
 use crate::{HarnessError, RevertTarget};
+
+/// 2.x pages `/api/session/{id}/message`; follow its cursors so an older
+/// revert target is not cut off by the first page.
+const MESSAGE_PAGE: usize = 200;
+const MESSAGE_PAGES_MAX: usize = 64;
 
 pub(super) async fn preview(
     server: &Server,
@@ -24,6 +29,25 @@ pub(super) async fn commit(
     files: bool,
 ) -> Result<(), HarnessError> {
     let message_id = locate(server, session_id, directory, target).await?;
+    if server.protocol().await == Protocol::V2 {
+        // 2.x splits revert into stage (moves the boundary, optionally
+        // reverting files) and commit. There is no single-call revert.
+        server
+            .post_json(
+                &format!("/api/session/{session_id}/revert/stage"),
+                directory,
+                &json!({ "messageID": message_id, "files": files }),
+            )
+            .await?;
+        return server
+            .post_json(
+                &format!("/api/session/{session_id}/revert/commit"),
+                directory,
+                &json!({}),
+            )
+            .await
+            .map(|_| ());
+    }
     let path = format!("/session/{session_id}/revert");
     let body = json!({ "messageID": message_id, "files": files });
     match server.post_json(&path, directory, &body).await {
@@ -79,6 +103,10 @@ fn user_turns(messages: &[Value]) -> Vec<crate::revert::UserTurn> {
 }
 
 fn is_user(message: &Value) -> bool {
+    // 2.x tags messages by `type`; 1.x carries a nested role.
+    if message.get("type").and_then(Value::as_str) == Some("user") {
+        return true;
+    }
     let role = message
         .pointer("/info/role")
         .and_then(Value::as_str)
@@ -145,6 +173,9 @@ async fn list_messages(
     session_id: &str,
     directory: Option<&str>,
 ) -> Result<Vec<Value>, HarnessError> {
+    if server.protocol().await == Protocol::V2 {
+        return list_messages_v2(server, session_id, directory).await;
+    }
     let path = format!("/session/{session_id}/message");
     let body = server.get_json(&path, directory).await?;
     if let Some(items) = body.as_array() {
@@ -156,15 +187,50 @@ async fn list_messages(
     }
 }
 
+/// 2.x returns `{data: [message], cursor}`; `order` applies to the first
+/// page only, later pages follow the cursor it hands back.
+async fn list_messages_v2(
+    server: &Server,
+    session_id: &str,
+    directory: Option<&str>,
+) -> Result<Vec<Value>, HarnessError> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MESSAGE_PAGES_MAX {
+        let path = match &cursor {
+            Some(cursor) => format!(
+                "/api/session/{session_id}/message?limit={MESSAGE_PAGE}&cursor={}",
+                percent_encode_path(cursor)
+            ),
+            None => format!("/api/session/{session_id}/message?limit={MESSAGE_PAGE}&order=asc"),
+        };
+        let body = server.get_json(&path, directory).await?;
+        if let Some(items) = body.get("data").and_then(Value::as_array) {
+            out.extend(items.iter().cloned());
+        }
+        cursor = body
+            .pointer("/cursor/next")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 async fn diff_paths(
     server: &Server,
     session_id: &str,
     directory: Option<&str>,
     message_id: &str,
 ) -> Result<Vec<String>, HarnessError> {
-    let path = format!("/session/{session_id}/diff?messageID={message_id}");
+    let path = match server.protocol().await {
+        Protocol::V1 => format!("/session/{session_id}/diff?messageID={message_id}"),
+        Protocol::V2 => format!("/api/session/{session_id}/diff?from={message_id}"),
+    };
     let body = match server.get_json(&path, directory).await {
-        Ok(body) => body,
+        Ok(body) => unwrap_data(body),
         Err(error) => {
             warn!(%error, "opencode session diff unavailable");
             return Ok(Vec::new());

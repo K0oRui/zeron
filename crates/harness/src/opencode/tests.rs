@@ -1564,7 +1564,7 @@ fn canonical_command_removed_after_discovery_is_not_downgraded_to_prompt_text() 
     // The project-scoped catalog changed after composer discovery. A
     // canonical selection retains command intent and fails explicitly.
     let live = commands_from_wire(&json!([]));
-    let error = native_command_request(&delivered, &live, true).unwrap_err();
+    let error = native_command_request(&delivered, &live, &[], true).unwrap_err();
     assert_eq!(
         error.to_string(),
         "harness protocol error: The selected OpenCode command /project-review is no longer available in this project"
@@ -1573,7 +1573,7 @@ fn canonical_command_removed_after_discovery_is_not_downgraded_to_prompt_text() 
     // Identical raw slash text was never a composer selection, so it keeps
     // the historical ordinary-prompt fallback.
     assert!(
-        native_command_request(&delivered, &live, false)
+        native_command_request(&delivered, &live, &[], false)
             .unwrap()
             .is_none()
     );
@@ -3855,10 +3855,9 @@ async fn revert_lists_files_then_posts_v1_rewind() {
                     posts.lock().unwrap().push((path.to_owned(), body));
                 }
                 let (status, payload) = match (method, path) {
-                    ("GET", "/global/health") => (
-                        "200 OK",
-                        json!({ "healthy": true, "version": "1.18.31" }),
-                    ),
+                    ("GET", "/global/health") => {
+                        ("200 OK", json!({ "healthy": true, "version": "1.18.31" }))
+                    }
                     ("GET", "/session/ses_1") => ("200 OK", json!({ "id": "ses_1" })),
                     ("GET", "/session/ses_1/message") => (
                         "200 OK",
@@ -3925,5 +3924,179 @@ async fn revert_lists_files_then_posts_v1_rewind() {
             path.ends_with("/revert") && body["messageID"] == "msg_c" && body["files"] == true
         }),
         "{posted:?}"
+    );
+}
+
+/// 2.x pages the message timeline by cursor and splits revert into stage plus
+/// commit, so the older turn lives past the first page and the v1 routes must
+/// stay untouched.
+#[tokio::test]
+async fn revert_pages_v2_messages_and_stages_before_commit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, Value)>::new()));
+    let recorded = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = recorded.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let start = head.lines().next().unwrap_or_default().to_owned();
+                let content_length = head
+                    .lines()
+                    .filter_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .next()
+                    .unwrap_or(0);
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                while buf.len() < header_end + content_length {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let body: Value =
+                    serde_json::from_slice(&buf[header_end..header_end + content_length])
+                        .unwrap_or(Value::Null);
+                let mut parts = start.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default().to_owned();
+                let path = target.split('?').next().unwrap_or_default();
+                seen.lock()
+                    .unwrap()
+                    .push((method.to_owned(), target.clone(), body));
+                let (status, payload) = match (method, path) {
+                    ("GET", "/api/info") => {
+                        ("200 OK", json!({ "healthy": true, "version": "2.0.20" }))
+                    }
+                    ("GET", "/api/session/ses_1") => {
+                        ("200 OK", json!({ "data": { "id": "ses_1" } }))
+                    }
+                    ("GET", "/api/session/ses_1/message") if target.contains("cursor=") => (
+                        "200 OK",
+                        json!({
+                            "data": [{ "id": "msg_c", "type": "user", "text": "second" }],
+                            "cursor": {}
+                        }),
+                    ),
+                    ("GET", "/api/session/ses_1/message") => (
+                        "200 OK",
+                        json!({
+                            "data": [
+                                { "id": "msg_a", "type": "user", "text": "first" },
+                                { "id": "msg_b", "type": "assistant",
+                                  "content": [{ "type": "text", "text": "ok" }] }
+                            ],
+                            "cursor": { "next": "page-two" }
+                        }),
+                    ),
+                    ("GET", "/api/session/ses_1/diff") => (
+                        "200 OK",
+                        json!({ "data": [{ "path": "src/main.rs" }, { "path": "README.md" }] }),
+                    ),
+                    ("POST", "/api/session/ses_1/revert/stage") => {
+                        ("200 OK", json!({ "data": { "messageID": "msg_c" } }))
+                    }
+                    ("POST", "/api/session/ses_1/revert/commit") => ("204 No Content", Value::Null),
+                    _ => ("404 Not Found", json!({ "missing": path })),
+                };
+                let body = payload.to_string();
+                let response = if status.starts_with("204") {
+                    format!("HTTP/1.1 {status}\r\nconnection: close\r\n\r\n")
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    let harness = OpencodeHarness::new().with_base_url(base);
+    let request: RunRequest = serde_json::from_value(json!({
+        "prompt": "x", "cwd": "/tmp", "sandbox": "workspace-write", "resume": "ses_1"
+    }))
+    .unwrap();
+    let target = crate::RevertTarget {
+        message_id: "z2".into(),
+        user_index: 1,
+        text: "second".into(),
+    };
+    let files = crate::Harness::revert_preview(&harness, request.clone(), target.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        files,
+        vec!["README.md".to_string(), "src/main.rs".to_string()]
+    );
+    crate::Harness::revert_commit(&harness, request, target, true)
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    let paths: Vec<&str> = seen.iter().map(|(_, target, _)| target.as_str()).collect();
+    assert!(
+        paths
+            .iter()
+            .any(|target| target.starts_with("/api/session/ses_1/message?limit=200&order=asc")),
+        "{paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|target| target.ends_with("/message?limit=200&cursor=page-two")),
+        "{paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|target| target.starts_with("/api/session/ses_1/diff?from=msg_c")),
+        "{paths:?}"
+    );
+    let stage = seen
+        .iter()
+        .position(|(method, target, body)| {
+            method == "POST"
+                && target == "/api/session/ses_1/revert/stage"
+                && body["messageID"] == "msg_c"
+                && body["files"] == true
+        })
+        .unwrap_or_else(|| panic!("no staged revert in {seen:?}"));
+    let commit = seen
+        .iter()
+        .position(|(method, target, _)| {
+            method == "POST" && target == "/api/session/ses_1/revert/commit"
+        })
+        .unwrap_or_else(|| panic!("no revert commit in {seen:?}"));
+    assert!(stage < commit, "commit ran before stage: {seen:?}");
+    // 2.x scopes by header and rejects unknown query params; the v1 rewind
+    // routes would answer HTML through the web-UI catch-all, not a 404.
+    assert!(
+        !paths.iter().any(|target| target.contains("directory=")
+            || (target.contains("/revert") && !target.starts_with("/api/"))
+            || (target.contains("/diff?") && !target.starts_with("/api/"))),
+        "{paths:?}"
     );
 }

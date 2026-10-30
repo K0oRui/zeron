@@ -668,10 +668,17 @@ impl Harness for OpencodeHarness {
             .to_str()
             .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
         let mut server = self.server(Some(directory), None).await?;
-        let result = server.commands_wire(Some(directory)).await;
+        let protocol = server.protocol().await;
+        let result = match protocol {
+            Protocol::V1 => server.commands_wire(Some(directory)).await.map(|commands| {
+                merge_skill_commands(&mut skills, &commands);
+            }),
+            Protocol::V2 => server.skills_wire(Some(directory)).await.map(|catalog| {
+                merge_v2_skills(&mut skills, &catalog);
+            }),
+        };
         server.shutdown(self.kill_grace).await;
-        let commands = result?;
-        merge_skill_commands(&mut skills, &commands);
+        result?;
         Ok(Some(skills))
     }
 
@@ -1319,6 +1326,13 @@ impl Server {
         Ok(unwrap_data(raw))
     }
 
+    /// 2.x skill catalog (`{data:[Skill.Info]}`). 1.x folded skills into the
+    /// command list, so it has no route of its own.
+    async fn skills_wire(&self, directory: Option<&str>) -> Result<Value, HarnessError> {
+        let raw = self.get_json("/api/skill", directory).await?;
+        Ok(unwrap_data(raw))
+    }
+
     /// Is the session mid-turn? V1 keeps a status map on `/session/status`;
     /// V2 lists running sessions on `/api/session/active`. `Err` = can't
     /// tell — the caller treats that as still running.
@@ -1403,17 +1417,34 @@ impl Server {
             Protocol::V1 => format!("/session/{session_id}/message/{message_id}"),
             Protocol::V2 => format!("/api/session/{session_id}/message/{message_id}"),
         };
-        match tokio::time::timeout(bound, self.get_json(&path, dir)).await {
-            Ok(Ok(message)) => [
+        if let Ok(Ok(message)) = tokio::time::timeout(bound, self.get_json(&path, dir)).await
+            && [
                 message.pointer("/info/id"),
                 message.pointer("/data/id"),
                 message.get("id"),
             ]
             .into_iter()
             .flatten()
-            .any(|id| id.as_str() == Some(message_id)),
-            _ => false,
+            .any(|id| id.as_str() == Some(message_id))
+        {
+            return true;
         }
+        // An admitted prompt sits in the inbox until the loop picks it up;
+        // the message route only knows delivered ones.
+        if self.protocol().await == Protocol::V2
+            && let Ok(Ok(inbox)) = tokio::time::timeout(
+                bound,
+                self.get_json(&format!("/api/session/{session_id}/inbox"), dir),
+            )
+            .await
+        {
+            return unwrap_data(inbox)
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(message_id));
+        }
+        false
     }
 
     /// Requests still waiting on an answer, as bus payloads. The bus never
@@ -1782,6 +1813,55 @@ fn merge_skill_commands(skills: &mut Vec<zeron_proto::invocation::Skill>, comman
     }
 }
 
+/// 2.x dropped the `source` field: skills are their own catalog on
+/// `/api/skill`, not commands. They still appear in the composer as `/name`;
+/// delivery attaches them to a prompt instead of calling the command route.
+fn merge_v2_skills(skills: &mut Vec<zeron_proto::invocation::Skill>, catalog: &Value) {
+    for entry in catalog.as_array().into_iter().flatten() {
+        let Some(name) = skill_command_name(entry) else {
+            continue;
+        };
+        let description = entry
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(skill) = skills.iter_mut().find(|skill| skill.name == name) {
+            skill.command = Some(zeron_proto::invocation::SkillCommand {
+                name: name.into(),
+                harness: HarnessId::Opencode,
+            });
+            continue;
+        }
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("opencode-skill:{name}"));
+        skills.push(zeron_proto::invocation::Skill {
+            name: name.into(),
+            path,
+            description: description.into(),
+            enabled: true,
+            command: Some(zeron_proto::invocation::SkillCommand {
+                name: name.into(),
+                harness: HarnessId::Opencode,
+            }),
+        });
+    }
+}
+
+/// The composer name for a 2.x skill: its frontmatter name when usable as a
+/// slash command, else its id.
+fn skill_command_name(entry: &Value) -> Option<&str> {
+    let id = entry.get("id").and_then(Value::as_str)?;
+    entry
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| zeron_proto::invocation::valid_skill_command_name(name))
+        .or(Some(id).filter(|id| zeron_proto::invocation::valid_skill_command_name(id)))
+}
+
 fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
     commands
         .as_array()
@@ -1815,6 +1895,9 @@ struct V2ModelList {
 struct V2Model {
     #[serde(rename = "providerID")]
     provider_id: String,
+    /// `Model.Info.id`, the value `POST /api/session/{id}/model` takes as
+    /// `model.id`. It is not `Model.Info.modelID`, which is the provider's
+    /// own name for the model and never rides the session.
     id: String,
     name: Option<String>,
     #[serde(default)]
@@ -1904,6 +1987,32 @@ struct Session {
     /// True only when the composer supplied a canonical leading command or
     /// provider-backed skill. Raw slash text deliberately stays false.
     initial_native_command_selected: bool,
+}
+
+/// A 2.x skill a leading `/name` can deliver. `name` is what the composer
+/// puts on the wire; `id` is what `POST /api/session/{id}/prompt` accepts in
+/// `skills` (they differ when the skill's frontmatter renames it).
+struct SkillBinding {
+    name: String,
+    id: String,
+}
+
+/// `{data:[Skill.Info]}` → the bindings `post_prompt` can resolve. A name
+/// that cannot be a slash command is skipped, matching discovery.
+fn skill_bindings(catalog: &Value) -> Vec<SkillBinding> {
+    catalog
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?;
+            let name = skill_command_name(entry)?;
+            Some(SkillBinding {
+                name: name.into(),
+                id: id.into(),
+            })
+        })
+        .collect()
 }
 
 fn new_message_id() -> String {
@@ -2246,6 +2355,16 @@ async fn run_session(session: Session) {
             .map(|v| commands_from_wire(&v))
             .unwrap_or_default(),
     };
+    // 2.x skills are not commands: remember name → id so a leading `/name`
+    // can be delivered as a prompt attachment instead of a command call.
+    let skills = match server.protocol().await {
+        Protocol::V2 => server
+            .skills_wire(dir)
+            .await
+            .map(|v| skill_bindings(&v))
+            .unwrap_or_default(),
+        Protocol::V1 => Vec::new(),
+    };
     if !commands.is_empty()
         && !send(
             &event_tx,
@@ -2301,6 +2420,7 @@ async fn run_session(session: Session) {
         &session_id,
         dir,
         &commands,
+        &skills,
         &request.prompt,
         initial_native_command_selected,
         turn_generation,
@@ -2449,6 +2569,7 @@ async fn run_session(session: Session) {
                         &session_id,
                         dir,
                         &commands,
+                        &skills,
                         &steer,
                         native_command_selected,
                         turn_generation,
@@ -2854,6 +2975,7 @@ async fn run_session(session: Session) {
                                     &session_id,
                                     dir,
                                     &commands,
+                                    &skills,
                                     &prompt,
                                     native_command_selected,
                                     turn_generation,
@@ -3385,6 +3507,7 @@ async fn post_prompt(
     session_id: &str,
     dir: Option<&str>,
     commands: &[SlashCommand],
+    skills: &[SkillBinding],
     prompt: &str,
     native_command_selected: bool,
     turn_generation: u64,
@@ -3398,62 +3521,77 @@ async fn post_prompt(
         attachments,
     } = spec;
     let protocol = server.protocol().await;
+    let mut text = prompt;
+    let mut skill_id: Option<&str> = None;
     if let Some((name, arguments)) =
-        native_command_request(prompt, commands, native_command_selected)?
+        native_command_request(prompt, commands, skills, native_command_selected)?
     {
-        if !attachments.is_empty() {
-            return Err(HarnessError::Protocol(
-                "OpenCode commands cannot include attachments; send them in a separate prompt"
-                    .into(),
-            ));
-        }
-        // 1.x names the args `arguments`; 2.x `text`.
-        let (path, cmd_body) = match protocol {
-            Protocol::V1 => (
-                format!("/session/{session_id}/command"),
-                json!({ "command": name, "arguments": arguments }),
-            ),
-            Protocol::V2 => (
-                format!("/api/session/{session_id}/command"),
-                command_body_v2(server.version.get(), name, &arguments, attachments),
-            ),
-        };
-        let server = server.handle();
-        let dir_owned = dir.map(str::to_owned);
-        let path_owned = path.clone();
-        let updates = updates.clone();
-        tokio::spawn(async move {
-            // The command endpoint blocks for the whole turn; the bus
-            // carries the real events, so this response is ignored —
-            // but it must not be cut off mid-turn by CALL_TIMEOUT.
-            let mut req = server
-                .request(reqwest::Method::POST, &path_owned)
-                .json(&cmd_body);
-            req = server.scoped(req, dir_owned.as_deref()).await;
-            let failure = match req.send().await {
-                Ok(response) if response.status().is_success() => None,
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    Some(post_error_message(&path_owned, status, &body))
-                }
-                Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
-            };
-            if let Some(message) = failure {
-                let _ = updates.send(TurnUpdate {
-                    generation: turn_generation,
-                    signal: TurnSignal::CommandFailed(message),
-                });
+        // A skill and a command can share a name; the command registry wins,
+        // matching the catalog order the composer showed.
+        if protocol == Protocol::V1 || commands.iter().any(|command| command.name == name) {
+            if !attachments.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "OpenCode commands cannot include attachments; send them in a separate prompt"
+                        .into(),
+                ));
             }
-        });
-        return Ok(false);
+            // 1.x names the args `arguments`; 2.x `text`.
+            let (path, cmd_body) = match protocol {
+                Protocol::V1 => (
+                    format!("/session/{session_id}/command"),
+                    json!({ "command": name, "arguments": arguments }),
+                ),
+                Protocol::V2 => (
+                    format!("/api/session/{session_id}/command"),
+                    command_body_v2(server.version.get(), name, &arguments, attachments),
+                ),
+            };
+            let server = server.handle();
+            let dir_owned = dir.map(str::to_owned);
+            let path_owned = path.clone();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                // The command endpoint blocks for the whole turn; the bus
+                // carries the real events, so this response is ignored —
+                // but it must not be cut off mid-turn by CALL_TIMEOUT.
+                let mut req = server
+                    .request(reqwest::Method::POST, &path_owned)
+                    .json(&cmd_body);
+                req = server.scoped(req, dir_owned.as_deref()).await;
+                let failure = match req.send().await {
+                    Ok(response) if response.status().is_success() => None,
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        Some(post_error_message(&path_owned, status, &body))
+                    }
+                    Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
+                };
+                if let Some(message) = failure {
+                    let _ = updates.send(TurnUpdate {
+                        generation: turn_generation,
+                        signal: TurnSignal::CommandFailed(message),
+                    });
+                }
+            });
+            return Ok(false);
+        }
+        // 2.x: `/api/session/{id}/command` only knows configured commands.
+        // A skill rides the prompt as a `skills` attachment instead.
+        let Some(binding) = skills.iter().find(|skill| skill.name == name) else {
+            return Err(HarnessError::Protocol(format!(
+                "The selected OpenCode command /{name} is no longer available in this project"
+            )));
+        };
+        skill_id = Some(&binding.id);
+        text = arguments;
     }
     let message_id = prompt_message_id();
-    let (path, body) = match protocol {
+    let (path, mut body) = match protocol {
         Protocol::V1 => (
             format!("/session/{session_id}/prompt_async"),
             prompt_body(
-                prompt,
+                text,
                 model.map(|(provider, model)| (provider.as_str(), model.as_str())),
                 variant,
                 attachments,
@@ -3462,9 +3600,12 @@ async fn post_prompt(
         ),
         Protocol::V2 => (
             format!("/api/session/{session_id}/prompt"),
-            prompt_body_v2(prompt, attachments, Some(&message_id)),
+            prompt_body_v2(text, attachments, Some(&message_id)),
         ),
     };
+    if let Some(id) = skill_id {
+        body["skills"] = json!([{ "id": id }]);
+    }
     let server = server.handle();
     let session_id = session_id.to_owned();
     let updates = updates.clone();
@@ -3589,6 +3730,7 @@ fn prompt_message_id() -> String {
 fn native_command_request<'a>(
     prompt: &'a str,
     commands: &[SlashCommand],
+    skills: &[SkillBinding],
     selected: bool,
 ) -> Result<Option<(&'a str, &'a str)>, HarnessError> {
     let Some((name, arguments)) = zeron_proto::invocation::leading_command(prompt) else {
@@ -3600,7 +3742,9 @@ fn native_command_request<'a>(
             Ok(None)
         };
     };
-    if commands.iter().any(|command| command.name == name) {
+    if commands.iter().any(|command| command.name == name)
+        || skills.iter().any(|skill| skill.name == name)
+    {
         Ok(Some((name, arguments)))
     } else if selected {
         Err(HarnessError::Protocol(format!(
