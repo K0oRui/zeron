@@ -90,6 +90,7 @@ mod pull_request_pane;
 mod session_hover_card;
 mod session_info;
 mod session_lanes;
+mod settings_search;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -98,22 +99,30 @@ pub(crate) mod spaces;
 mod thread_search;
 use side_chats::SideChatTab;
 mod tabs;
+use tabs::NewSessionTarget;
 mod voice_stage;
 use voice_stage::VOICE_STAGE_ORB_SCALE;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-/// `connected` already includes the engine's degradation grace. A brief
-/// focus-triggered dial needs no sidebar status; queued changes or a sustained
-/// outage still deserve one.
-fn chat_sync_pill_caption(chat: &zeron_proto::ChatConnectivity) -> Option<&'static str> {
-    use zeron_proto::ChatSyncState as S;
-    let sustained_or_queued = !chat.connected || chat.pending_pushes > 0;
-    match chat.sync_state {
-        S::Waiting if sustained_or_queued => Some("Sync queued — changes are saved"),
-        S::Connecting if sustained_or_queued => Some("Syncing…"),
-        S::Offline if !chat.connected => Some("Offline — changes are saved"),
-        _ => None,
+/// The sidebar line speaks for the whole connection, and whether its glyph
+/// is the amber dot (else the reconnect spinner). One chat's sync reads in
+/// its own composer and transcript, so the two never tell different
+/// stories. A failed local save is the exception, whichever chat it hit:
+/// it outranks the network.
+fn connection_pill_caption(conn: &zeron_proto::Connectivity) -> Option<(&'static str, bool)> {
+    use zeron_proto::{ChatSyncState, ConnectivityState as S};
+    if conn
+        .chats
+        .iter()
+        .any(|chat| chat.sync_state == ChatSyncState::StorageError)
+    {
+        return Some(("Changes could not be saved", true));
+    }
+    match conn.state {
+        S::Disabled | S::Connected => None,
+        S::Offline => Some(("Offline — sends are saved", true)),
+        S::Reconnecting => Some(("Reconnecting…", false)),
     }
 }
 
@@ -404,6 +413,8 @@ pub fn cluster_clearance(
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
+/// Everything is written in US keys and bound where the active keyboard layout
+/// types them (see [`localize_key_bindings`]); re-run on a layout switch.
 pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
@@ -418,7 +429,8 @@ pub fn apply_keymap(
             platform_combo(fallback)
         }
     }
-    crate::appshots::set_shortcut(&keymap.capture_appshot);
+    let equivalents = crate::settings::key_equivalents(cx);
+    crate::appshots::set_shortcut(&keymap.capture_appshot, &equivalents);
     cx.clear_key_bindings();
     // `clear_key_bindings` also removes the contextual editing actions that
     // gpui-base installed at startup. Reinitialize the component layer before
@@ -539,6 +551,72 @@ pub fn apply_keymap(
             ),
         ]
     }));
+    localize_key_bindings(cx, &equivalents);
+    crate::settings::set_bound_key_equivalents(equivalents);
+}
+
+/// Move every binding to the key the active layout types for it. Combos are
+/// written in US keys, like the macOS menus they mirror; Apple relocates
+/// those per layout (AZERTY ⌘1 is ⌘&, ⌘/ is ⌘:, ⌘[ is ⌘^) and gpui ships
+/// the same table, but `KeyBinding::new` never applies it — to Zeron's
+/// bindings or gpui-base's editor map. Order is kept: gpui breaks ties
+/// between equally deep matches by binding order.
+fn localize_key_bindings(cx: &mut App, equivalents: &crate::settings::KeyEquivalents) {
+    if equivalents.is_empty() {
+        return;
+    }
+    let bindings: Vec<KeyBinding> = cx
+        .key_bindings()
+        .borrow()
+        .bindings()
+        .map(|binding| localize_binding(binding, equivalents))
+        .collect();
+    cx.clear_key_bindings();
+    cx.bind_keys(bindings);
+}
+
+fn localize_binding(
+    binding: &KeyBinding,
+    equivalents: &crate::settings::KeyEquivalents,
+) -> KeyBinding {
+    let mut moved = false;
+    let source = binding
+        .keystrokes()
+        .iter()
+        .map(|keystroke| {
+            let keystroke = keystroke.inner();
+            let key = crate::settings::localize_key(&keystroke.key, equivalents);
+            moved |= key != keystroke.key.as_str();
+            Keystroke {
+                key: key.into_owned(),
+                ..keystroke.clone()
+            }
+            .unparse()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !moved {
+        return binding.clone();
+    }
+    match KeyBinding::load(
+        &source,
+        binding.action().boxed_clone(),
+        binding.predicate(),
+        false,
+        binding.action_input(),
+        &gpui::DummyKeyboardMapper,
+    ) {
+        Ok(mut localized) => {
+            if let Some(meta) = binding.meta() {
+                localized.set_meta(meta);
+            }
+            localized
+        }
+        Err(error) => {
+            tracing::warn!(%error, %source, "unbindable localized shortcut; keeping US key");
+            binding.clone()
+        }
+    }
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -682,6 +760,25 @@ impl SettingsSection {
             SettingsSection::General => "General",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+        }
+    }
+
+    /// The section's glyph, in the nav and on its settings-search hits.
+    fn icon(self) -> &'static str {
+        match self {
+            SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Cloud => icons::CLOUD,
+            SettingsSection::Billing => icons::WALLET,
+            SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Files => icons::FOLDER,
+            SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Voice => icons::MICROPHONE,
+            SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::General => icons::SETTINGS,
+            SettingsSection::Appshots => icons::MONITOR,
+            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         }
     }
 }
@@ -2271,7 +2368,6 @@ pub struct Shell {
     subagent_seq: u64,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
-    side_chat_creating: bool,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2297,6 +2393,8 @@ pub struct Shell {
     settings_focus_pending: bool,
     settings_restore_pending: bool,
     settings_return_route: Route,
+    /// The field atop the Settings sidebar, made on its first render.
+    settings_search: Option<settings_search::SettingsSearch>,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     pull_requests_page: Option<Entity<PullRequestsPage>>,
@@ -2390,6 +2488,8 @@ pub struct Shell {
     chat_hover_resync: bool,
     /// The sidebar row whose hover card shows (or waits out its dwell).
     session_hover_card: session_hover_card::SessionHoverCard,
+    /// Draws that card in gpui's tooltip layer.
+    session_card_view: Entity<session_hover_card::SessionCardView>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// In-flight reorder for the pinned section only.
@@ -2697,6 +2797,26 @@ impl Shell {
                     this.pending_workspace_command = Some(*command);
                     cx.notify();
                 }
+                ComposerEvent::AnnotationsChanged(numbers) => {
+                    let key = this.panel_key(cx);
+                    for surface in this.right_tabs.get(&key).into_iter().flatten() {
+                        if let RightSurface::Browser(id) = surface
+                            && let Some(browser) = this.browsers.get(id)
+                        {
+                            browser.read(cx).keep_markers(numbers);
+                        }
+                    }
+                }
+                ComposerEvent::AnnotationHovered(number) => {
+                    let key = this.panel_key(cx);
+                    for surface in this.right_tabs.get(&key).into_iter().flatten() {
+                        if let RightSurface::Browser(id) = surface
+                            && let Some(browser) = this.browsers.get(id)
+                        {
+                            browser.read(cx).focus_marker(*number);
+                        }
+                    }
+                }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -2860,7 +2980,6 @@ impl Shell {
             subagent_seq: 0,
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
-            side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2882,6 +3001,7 @@ impl Shell {
             settings_focus_pending: matches!(route, Route::Settings(_)),
             settings_restore_pending: false,
             settings_return_route: Route::Chat,
+            settings_search: None,
             nav,
             pull_requests_page: None,
             pull_request_pane: Default::default(),
@@ -2938,6 +3058,10 @@ impl Shell {
             title_marquee: Default::default(),
             chat_hover_resync: false,
             session_hover_card: Default::default(),
+            session_card_view: {
+                let shell = cx.weak_entity();
+                cx.new(|_| session_hover_card::SessionCardView::new(shell))
+            },
             sidebar_scroll: gpui::ScrollHandle::new(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
@@ -3133,7 +3257,6 @@ impl Shell {
         self.sync_search_warm(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
-            self.side_chat_creating = false;
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.show_notice(crate::toast::ToastKind::Info, notice, cx);
@@ -4294,6 +4417,26 @@ impl Shell {
                 }
                 crate::browser::BrowserEvent::Close => {
                     this.close_right_surface(RightSurface::Browser(id), window, cx)
+                }
+                crate::browser::BrowserEvent::Annotation {
+                    annotation,
+                    marker,
+                    last,
+                } => {
+                    // Only the session that owns this tab receives its picks.
+                    if this.panel_key(cx) == owner {
+                        let annotation = annotation.clone();
+                        let last = *last;
+                        if last && let Some(browser) = this.browsers.get(&id) {
+                            browser.read(cx).release_keyboard();
+                        }
+                        let number = this.composer.update(cx, |composer, cx| {
+                            composer.add_browser_annotation(annotation, last, window, cx)
+                        });
+                        if let (Some(number), Some(browser)) = (number, this.browsers.get(&id)) {
+                            browser.read(cx).label_marker(*marker, number);
+                        }
+                    }
                 }
             }
         });
@@ -5595,6 +5738,15 @@ impl Shell {
 
     fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
         self.command_palette = None;
+        // A settings-search landing belongs to the page it was asked on, and
+        // a query to the visit: however Settings is left, the next visit
+        // starts from the sections.
+        if route != self.route {
+            settings::search::clear_reveal();
+        }
+        if matches!(self.route, Route::Settings(_)) && !matches!(route, Route::Settings(_)) {
+            self.reset_settings_search(cx);
+        }
         let was_pull_requests = matches!(self.route, Route::PullRequests);
         let will_show_pull_requests = matches!(route, Route::PullRequests);
         if was_pull_requests && !will_show_pull_requests {
@@ -6036,6 +6188,36 @@ impl Shell {
         }
     }
 
+    /// Whether a dialog or menu that Escape would close is open over Settings:
+    /// [`Self::dismiss_settings_escape_surface`] without the dismissing.
+    fn settings_escape_surface_open(&self, cx: &App) -> bool {
+        if self.sync_flow.has_visible_overlay() || self.user_menu.is_open() {
+            return true;
+        }
+        let Route::Settings(section) = self.route else {
+            return false;
+        };
+        match section.canonical() {
+            SettingsSection::Devices => self
+                .devices_page
+                .as_ref()
+                .is_some_and(|page| page.read(cx).has_escape_surface()),
+            SettingsSection::Harnesses => self
+                .harnesses_page
+                .as_ref()
+                .is_some_and(|page| page.read(cx).has_escape_surface(cx)),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .as_ref()
+                .is_some_and(|page| page.read(cx).has_escape_surface()),
+            SettingsSection::Archived => self
+                .archived_page
+                .as_ref()
+                .is_some_and(|page| page.read(cx).has_escape_surface()),
+            _ => false,
+        }
+    }
+
     /// Escape bubbling out of the settings page. Focused controls — open
     /// dropdowns, the shortcut recorder, a dialog's own input — consume it
     /// before it gets here. What remains open without holding focus closes
@@ -6432,13 +6614,17 @@ impl Shell {
                     ));
                     self.shortcuts_page = Some(page);
                 }
+                let keep_focus = self.settings_search_focused(window, cx);
                 match &self.shortcuts_page {
                     Some(page) => {
                         page.update(cx, |page, _| {
                             page.show_section(
                                 section == SettingsSection::Appshots,
                                 section == SettingsSection::General,
-                            )
+                            );
+                            if keep_focus {
+                                page.keep_focus();
+                            }
                         });
                         page.clone().into_any_element()
                     }
@@ -8585,6 +8771,7 @@ impl Shell {
                     match button {
                         gpui::WindowButton::Minimize => linux_caption_button(
                             "window-minimize",
+                            "Minimize",
                             icons::WINDOW_MINIMIZE,
                             false,
                             theme,
@@ -8592,18 +8779,24 @@ impl Shell {
                         )
                         .into_any_element(),
                         gpui::WindowButton::Maximize => {
-                            let (id, icon_path) = if is_maximized {
-                                ("window-restore", icons::WINDOW_RESTORE)
+                            let (id, label, icon_path) = if is_maximized {
+                                ("window-restore", "Restore", icons::WINDOW_RESTORE)
                             } else {
-                                ("window-maximize", icons::WINDOW_MAXIMIZE)
+                                ("window-maximize", "Maximize", icons::WINDOW_MAXIMIZE)
                             };
-                            linux_caption_button(id, icon_path, false, theme, |_, window, _| {
-                                window.zoom_window()
-                            })
+                            linux_caption_button(
+                                id,
+                                label,
+                                icon_path,
+                                false,
+                                theme,
+                                |_, window, _| window.zoom_window(),
+                            )
                             .into_any_element()
                         }
                         gpui::WindowButton::Close => linux_caption_button(
                             "window-close",
+                            "Close",
                             icons::CLOSE,
                             true,
                             theme,
@@ -8845,7 +9038,12 @@ impl Shell {
         let sidebar_width = self.settings.sidebar_width;
         // Dropdowns contain themselves to the page pane beside this column.
         settings::widgets::set_sidebar_width(sidebar_width, cx);
-        let nav = self.render_settings_nav(section, &theme, window, cx);
+        let search_field = self.render_settings_search_field(&theme, window, cx);
+        let nav = if self.settings_searching(cx) {
+            self.render_settings_search_results(&theme, cx)
+        } else {
+            self.render_settings_nav(section, &theme, window, cx)
+        };
         // The footer uses the chat sidebar's theme so the account and
         // settings buttons render identically in both places.
         let footer_theme = Theme::of(cx).clone();
@@ -8863,9 +9061,19 @@ impl Shell {
             .flex_row()
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let key = &event.keystroke.key;
+                let modifiers = event.keystroke.modifiers;
                 if key == "escape" {
                     if !this.dismiss_settings_escape_surface(cx) {
                         this.close_settings(cx);
+                    }
+                    cx.stop_propagation();
+                } else if key == "f"
+                    && modifiers.secondary()
+                    && modifiers.number_of_modifiers() == 1
+                {
+                    // A dialog over the page keeps the keyboard.
+                    if !this.settings_escape_surface_open(cx) {
+                        this.focus_settings_search(window, cx);
                     }
                     cx.stop_propagation();
                 } else if key == "tab" {
@@ -8914,6 +9122,13 @@ impl Shell {
                             .child("Back"),
                         ),
                     )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(Theme::SPACE_SM))
+                            .pt(px(Theme::SPACE_SM))
+                            .child(search_field),
+                    )
                     .child(div().flex_1().min_h_0().child(nav))
                     .child(div().p(px(Theme::SPACE_SM)).flex_none().child(footer)),
             )
@@ -8951,21 +9166,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cloud_offered = self.state.read(cx).cloud_offered();
-        let section_icon = |item: SettingsSection| match item {
-            SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Cloud => icons::CLOUD,
-            SettingsSection::Billing => icons::WALLET,
-            SettingsSection::Harnesses => icons::WIDGET,
-            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
-            SettingsSection::Appearance => icons::TUNING,
-            SettingsSection::Files => icons::FOLDER,
-            SettingsSection::Notifications => icons::BELL,
-            SettingsSection::Voice => icons::MICROPHONE,
-            SettingsSection::Shortcuts => icons::KEYBOARD,
-            SettingsSection::General => icons::SETTINGS,
-            SettingsSection::Appshots => icons::MONITOR,
-            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
-        };
         settings::widgets::scroll_faded(
             "settings-nav-scroll",
             div()
@@ -9057,11 +9257,7 @@ impl Shell {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_settings(item, cx)
                                     }))
-                                    .child(
-                                        icon(section_icon(item))
-                                            .size(px(16.0))
-                                            .text_color(tab_text),
-                                    )
+                                    .child(icon(item.icon()).size(px(16.0)).text_color(tab_text))
                                     .child(SharedString::from(item.label()))
                                 }),
                         ),
@@ -9519,14 +9715,7 @@ impl Shell {
             && !preview
             && rename_input.is_none()
             && self.session_hover_card.shown() == Some(id.as_str()))
-        .then(|| {
-            self.render_session_hover_card(
-                &id,
-                time_ago.clone(),
-                cx,
-            )
-        })
-        .flatten();
+        .then(|| self.render_session_hover_card(&id, time_ago.clone(), cx));
         let card_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
@@ -10138,64 +10327,29 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    /// Global connection health, with selected-chat queue and storage status.
-    /// Persistence failures take precedence even when the network is offline.
-    /// No surface,
+    /// Global connection health and any chat's storage failure (see
+    /// [`connection_pill_caption`]). No surface,
     /// no border (v0.2.12 feedback): a bare spinner + faint caption while
     /// reconnecting; an amber dot only when the OS says offline. The
     /// transport error belongs in logs, not the sidebar.
     fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use zeron_proto::ConnectivityState as S;
-        let conn = self.state.read(cx).connectivity.clone();
-        let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn
-            .chats
-            .iter()
-            .find(|c| Some(c.chat_id.as_str()) == selected);
-        let chat_state = chat.map(|c| c.sync_state);
-        let (label, glyph): (SharedString, AnyElement) = match conn.state {
-            _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
-                "Changes could not be saved".into(),
-                div()
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(theme.warning)
-                    .into_any_element(),
-            ),
-            S::Disabled => return None,
-            S::Connected => {
-                let caption = chat_sync_pill_caption(chat?)?;
-                (
-                    caption.into(),
-                    loaders::mini_mono_spinner(
-                        "chat-sync-spinner",
-                        2.0,
-                        theme.text_muted,
-                        self.sidebar_pane.entity_id(),
-                        cx,
-                    )
-                    .into_any_element(),
-                )
-            }
-            S::Offline => (
-                "Offline — sends are saved".into(),
-                div()
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(theme.warning)
-                    .into_any_element(),
-            ),
-            S::Reconnecting => (
-                "Reconnecting…".into(),
-                loaders::mini_mono_spinner(
-                    "connection-spinner",
-                    2.0,
-                    theme.text_muted,
-                    self.sidebar_pane.entity_id(),
-                    cx,
-                )
-                .into_any_element(),
-            ),
+        let (caption, warning) = connection_pill_caption(&self.state.read(cx).connectivity)?;
+        let label: SharedString = caption.into();
+        let glyph = if warning {
+            div()
+                .size(px(5.0))
+                .rounded_full()
+                .bg(theme.warning)
+                .into_any_element()
+        } else {
+            loaders::mini_mono_spinner(
+                "connection-spinner",
+                2.0,
+                theme.text_muted,
+                self.sidebar_pane.entity_id(),
+                cx,
+            )
+            .into_any_element()
         };
         Some(
             crate::motion::fade_in(
@@ -11312,12 +11466,16 @@ impl Shell {
         // Settings is a toggle: while its page is up the button keeps the
         // hover wash + full-strength glyph, and a click returns to chat.
         let settings_open = matches!(self.route, Route::Settings(_));
-        let settings_tooltip: SharedString = match (settings_open, cfg!(target_os = "macos")) {
-            (false, true) => "Settings · ⌘,".into(),
-            (false, false) => "Settings · Ctrl+,".into(),
-            (true, true) => "Close settings · ⌘,".into(),
-            (true, false) => "Close settings · Ctrl+,".into(),
-        };
+        let settings_tooltip: SharedString = format!(
+            "{} · {}",
+            if settings_open {
+                "Close settings"
+            } else {
+                "Settings"
+            },
+            crate::settings::badge_combo("mod-,")
+        )
+        .into();
         let voice_trigger = self.render_voice_trigger(theme, cx);
         div()
             .w_full()
@@ -13401,9 +13559,11 @@ impl Shell {
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                     let chat_id = match surface {
+                        // A pending fork has no chat to act on yet.
                         RightSurface::SideChat(id) => this
                             .side_chats
                             .get(&id)
+                            .filter(|tab| tab.fork.is_none())
                             .and_then(|tab| tab.state.read(cx).selected_chat.clone())
                             .unwrap_or_default(),
                         _ => String::new(),
@@ -14057,6 +14217,7 @@ fn windows_caption_button(
 /// of the drag strip's event surface (see [`window_control_button`]).
 fn linux_caption_button(
     id: &'static str,
+    label: &'static str,
     icon_path: &'static str,
     close: bool,
     theme: &Theme,
@@ -14081,6 +14242,9 @@ fn linux_caption_button(
         .rounded(px(6.0))
         .cursor_pointer()
         .hover(move |style| style.bg(hover_bg))
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .tooltip(crate::settings::widgets::text_tooltip(label))
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
@@ -14595,7 +14759,10 @@ impl Render for Shell {
                         this.open_add_space_on_device(&action.device, cx);
                         return;
                     }
-                    this.open_new_session(Some(action.project_id.clone()), cx);
+                    this.open_new_session(
+                        Some(NewSessionTarget::Project(action.project_id.clone())),
+                        cx,
+                    );
                     // Stage after the composer has swapped to the new
                     // session's draft, which runs on the state observation
                     // `open_new_session` just queued. A draft already waiting
@@ -15111,7 +15278,8 @@ impl Render for Shell {
             // element at the window edges.
             .children(Self::render_linux_resize_borders(window));
         self.render_time = None;
-        root
+        // Wheel notches anywhere in the window glide (Appearance → Motion).
+        crate::smooth_scroll::smooth_scroll(root)
     }
 }
 
@@ -15200,48 +15368,50 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_sync_status_waits_for_grace_or_queued_changes() {
-        use zeron_proto::{ChatConnectivity, ChatSyncState as S};
+    fn connection_pill_is_global_only() {
+        use zeron_proto::{ChatConnectivity, ChatSyncState as S, Connectivity, ConnectivityState};
 
-        let mut chat = ChatConnectivity {
-            chat_id: "remote".into(),
-            sync_state: S::Local,
+        let chat = |chat_id: &str, sync_state| ChatConnectivity {
+            chat_id: chat_id.into(),
+            sync_state,
             connected: false,
             delivery_live: false,
-            pending_pushes: 0,
+            pending_pushes: 3,
         };
-        assert_eq!(chat_sync_pill_caption(&chat), None);
-
-        for state in [S::Waiting, S::Connecting, S::Offline] {
-            chat.sync_state = state;
-            chat.connected = true;
-            assert_eq!(chat_sync_pill_caption(&chat), None, "transient {state:?}");
+        // A slow open or a sustained per-chat stall reads in that chat's own
+        // composer and transcript; the sidebar line stays quiet.
+        let mut conn = Connectivity {
+            state: ConnectivityState::Connected,
+            chats: [S::Waiting, S::Connecting, S::Offline, S::Unknown, S::Local]
+                .into_iter()
+                .enumerate()
+                .map(|(i, state)| chat(&format!("chat-{i}"), state))
+                .collect(),
+            ..Connectivity::default()
+        };
+        assert_eq!(connection_pill_caption(&conn), None);
+        conn.state = ConnectivityState::Disabled;
+        assert_eq!(connection_pill_caption(&conn), None);
+        conn.state = ConnectivityState::Reconnecting;
+        assert_eq!(
+            connection_pill_caption(&conn),
+            Some(("Reconnecting…", false))
+        );
+        conn.state = ConnectivityState::Offline;
+        assert_eq!(
+            connection_pill_caption(&conn),
+            Some(("Offline — sends are saved", true))
+        );
+        // A failed local save outranks the network, whichever chat it hit
+        // (not only the selected one).
+        conn.chats.push(chat("background", S::StorageError));
+        for state in [ConnectivityState::Offline, ConnectivityState::Connected] {
+            conn.state = state;
+            assert_eq!(
+                connection_pill_caption(&conn),
+                Some(("Changes could not be saved", true))
+            );
         }
-
-        chat.sync_state = S::Waiting;
-        chat.connected = false;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Sync queued — changes are saved")
-        );
-        chat.sync_state = S::Connecting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
-        chat.sync_state = S::Offline;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Offline — changes are saved")
-        );
-
-        // Real pending pushes remain visible even with a live room.
-        chat.connected = true;
-        chat.pending_pushes = 1;
-        chat.sync_state = S::Waiting;
-        assert_eq!(
-            chat_sync_pill_caption(&chat),
-            Some("Sync queued — changes are saved")
-        );
-        chat.sync_state = S::Connecting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
 
     #[test]
@@ -15471,6 +15641,7 @@ mod tests {
             last_turn_outcome: None,
             terminal_activity: None,
             running_subagents: 0,
+            background_tasks: Vec::new(),
         }
     }
 
@@ -17212,12 +17383,14 @@ mod exit_regressions {
                     settings.reduce_motion = crate::motion::ReduceMotion::On;
                     settings.pause_animations_in_background = true;
                 });
+                settings::set_smooth_scrolling(false, cx);
                 // Any shell-owned change (sidebar width, panels) republishes
                 // the working copy; it must not revert the motion choices.
                 shell.schedule_save(cx);
                 let saved = settings::current(cx);
                 assert_eq!(saved.reduce_motion, crate::motion::ReduceMotion::On);
                 assert!(saved.pause_animations_in_background);
+                assert!(!saved.smooth_scrolling);
             })
             .unwrap();
     }
@@ -18351,15 +18524,79 @@ mod exit_regressions {
                     state.apply_spaces(vec![space("one"), space("two")]);
                 });
                 shell.settings.space_filter = None;
-                shell.open_new_session(Some("two".into()), cx);
+                shell.open_new_session(Some(NewSessionTarget::Project("two".into())), cx);
                 let state = shell.state.read(cx);
                 assert!(state.selected_chat.is_none());
                 assert_eq!(state.selected_space.as_deref(), Some("two"));
 
                 // The explicit project wins over a standing filter.
                 shell.settings.space_filter = Some("one".into());
-                shell.open_new_session(Some("two".into()), cx);
+                shell.open_new_session(Some(NewSessionTarget::Project("two".into())), cx);
                 assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("two"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn new_session_without_a_project_homes_the_canvas_on_that_device(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.apply_spaces(vec![zeron_proto::Space {
+                        id: "repo".into(),
+                        device_id: "local".into(),
+                        path: "/repo".into(),
+                        name: None,
+                        git_detected: false,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        repository_id: None,
+                        github_repo: None,
+                        created_at: Utc::now(),
+                    }]);
+                    state.select_space(Some("repo".into()), cx);
+                });
+                // The opt-out wins over a standing filter, which the shell
+                // then drops so the first send stays visible.
+                shell.settings.space_filter = Some("repo".into());
+                shell.open_new_session(Some(NewSessionTarget::NoProject("remote".into())), cx);
+                let state = shell.state.read(cx);
+                assert!(state.selected_chat.is_none());
+                assert!(state.no_project);
+                assert!(state.selected_space.is_none());
+                assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+                shell.on_state_changed(&shell.state.clone(), cx);
+                assert!(shell.settings.space_filter.is_none());
             })
             .unwrap();
     }
@@ -19701,6 +19938,22 @@ impl Shell {
     pub fn fixture_transcript(&self) -> Entity<crate::transcript::Transcript> {
         self.transcript.clone()
     }
+    /// A session row's click in the sidebar.
+    pub fn fixture_open_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.open_chat(chat_id.to_owned(), cx);
+    }
+    /// A side chat's row under its parent.
+    pub fn fixture_open_side_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.open_child_chat_tab(chat_id, cx);
+    }
+    /// The session card's "Fork chat".
+    pub fn fixture_fork_chat(&mut self, cx: &mut Context<Self>) {
+        self.create_side_chat(cx);
+    }
+    pub fn fixture_open_browser(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_surfaces_open(true, cx);
+        self.add_browser_surface(Some(url), window, cx);
+    }
 }
 
 #[cfg(test)]
@@ -19993,6 +20246,105 @@ mod settings_modal_regressions {
             (Route::Chat, Some("newer".into()))
         );
         assert_eq!(press(&keymap.new_session), (Route::Chat, None));
+    }
+
+    /// An AZERTY Mac types ⌘& on the key AppKit reads as ⌘1, and ⌘⇧& — which
+    /// gpui reports as a literal ⌘1 — is no shortcut there. Bound in US keys
+    /// only, Jump to session 1 answered the second and not the first.
+    #[gpui::test]
+    fn azerty_jumps_from_the_key_appkit_reads_as_cmd_1(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let window = cx.add_window(|_, cx| {
+            let mut shell = test_shell(dir.path(), cx);
+            shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+            shell.state.update(cx, |state, _| {
+                state.workspace_scope = Some(WorkspaceScope::Local);
+                state.local_device_id = Some("local".into());
+                state.chats = ["older", "newer"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, id)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "title": id, "deviceId": "local", "archived": false,
+                            "createdAt": Utc::now() - chrono::Duration::minutes(10 - ix as i64),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                state.selected_chat = Some("older".into());
+            });
+            shell
+        });
+        // `Shell::new` bound the keymap against the test platform, which has
+        // no layout table; localize it as an AZERTY Mac's `apply_keymap` does.
+        cx.run_until_parked();
+        cx.update(|cx| localize_key_bindings(cx, &settings::azerty_key_equivalents()));
+        let mut press = |combo: &str| {
+            cx.simulate_keystrokes(window.into(), &platform_combo(combo));
+            window
+                .read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone())
+                .unwrap()
+        };
+        assert_eq!(press("mod-1"), Some("older".into()));
+        assert_eq!(press("mod-&"), Some("newer".into()));
+    }
+
+    /// Localizing moves exactly the bindings whose key the layout relocates —
+    /// Zeron's and gpui-base's alike — and keeps the rest, in order.
+    #[gpui::test]
+    fn azerty_keymap_moves_only_relocated_keys(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let keymap = KeymapConfig::default();
+        cx.update(|cx| apply_keymap(cx, &keymap, ComposerSendBehavior::default()));
+        let azerty = settings::azerty_key_equivalents();
+        let sources = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                cx.key_bindings()
+                    .borrow()
+                    .bindings()
+                    .map(|binding| {
+                        let keys = binding
+                            .keystrokes()
+                            .iter()
+                            .map(|keystroke| keystroke.inner().unparse())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (binding.action().name(), keys)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = sources(cx);
+        cx.update(|cx| localize_key_bindings(cx, &azerty));
+        let after = sources(cx);
+        assert_eq!(before.len(), after.len());
+        for ((action, us), (localized_action, localized)) in before.iter().zip(&after) {
+            assert_eq!(action, localized_action, "binding order must hold");
+            let expected = us
+                .split(' ')
+                .map(|keystroke| settings::localize_combo(keystroke, &azerty))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(localized, &expected, "{action}");
+        }
+        let bound = |action: &str| {
+            after
+                .iter()
+                .filter(|(name, _)| *name == action)
+                .map(|(_, keys)| keys.as_str())
+                .collect::<Vec<_>>()
+        };
+        let primary = platform_combo("mod");
+        // Every jump slot shares the action name: slot 1 now sits on &, and
+        // none stays on the literal 1 that AZERTY types only with Shift.
+        let jumps = bound(JumpSession(0).name());
+        assert!(jumps.contains(&format!("{primary}-&").as_str()));
+        assert!(!jumps.contains(&format!("{primary}-1").as_str()));
+        assert!(bound(OpenModelPicker.name()).contains(&format!("{primary}-:").as_str()));
+        assert!(bound(crate::browser::Back.name()).contains(&format!("{primary}-^").as_str()));
+        assert!(bound(ToggleSidebar.name()).contains(&format!("{primary}-b").as_str()));
     }
 
     #[gpui::test]

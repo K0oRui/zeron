@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +92,7 @@ pub struct RevertTarget {
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    processes: std::sync::Arc<background::BackgroundWork>,
 }
 
 impl TurnControl {
@@ -115,6 +116,52 @@ impl TurnControl {
     /// would kill work nobody asked to stop.
     pub fn background_live(&self) -> bool {
         self.background.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Driver: the background processes the runtime runs now, oldest first —
+    /// its whole set, not a delta. (Background agents are subagents, shown as
+    /// such; they count in [`Self::set_background`] only.)
+    pub fn set_background_processes(&self, processes: Vec<zeron_proto::BackgroundTask>) {
+        self.processes.set(processes);
+    }
+
+    /// Driver: where a listed process's output can be read.
+    pub fn set_background_output(&self, id: &str, source: OutputSource) {
+        self.processes.set_output(id, source);
+    }
+
+    /// Driver: output the wire delivered for a process, kept as its tail.
+    pub fn append_background_output(&self, id: &str, chunk: &str) {
+        self.processes.append_output(id, chunk);
+    }
+
+    /// Driver: drop the output kept for a process that ended unlisted.
+    pub fn clear_background_output(&self, id: &str) {
+        self.processes.clear_output(id);
+    }
+
+    /// Driver: resolves with each process the host asked to stop.
+    pub async fn background_stop_requested(&self) -> String {
+        self.processes.stop_requested().await
+    }
+
+    /// Host: the runtime's background processes as they change.
+    pub fn watch_background_processes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<zeron_proto::BackgroundTask>> {
+        self.processes.watch()
+    }
+
+    /// Host: ask the driver to stop one process. False when the runtime does
+    /// not list it (it ended meanwhile).
+    pub fn stop_background_process(&self, id: &str) -> bool {
+        self.processes.request_stop(id)
+    }
+
+    /// Host: the tail of a listed process's output; `None` when it is not
+    /// listed. May read a file: call it off the async runtime.
+    pub fn background_output(&self, id: &str) -> Option<zeron_proto::BackgroundTaskOutput> {
+        self.processes.output(id)
     }
 }
 
@@ -147,6 +194,9 @@ pub struct RunControls {
     /// Standalone callers without an update coordinator can leave it unset.
     pub execution_lease: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
     /// The run sends questions and awaits answers (blocks the agent, mirrors zeron).
+    /// No answers at all — an empty list, or a dropped sender — is a decline:
+    /// the person closed the questions, or the run stopped waiting. Drivers
+    /// answer it with their protocol's own decline where it has one.
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
     >,
@@ -237,6 +287,18 @@ pub trait Harness: Send + Sync {
             && live.reasoning == next.reasoning
             && same_model_options(&live.model_options, &next.model_options)
             && live.cwd == next.cwd
+            && live.access == next.access
+            && live.plan == next.plan
+    }
+    /// The [`AccessMode`]s this driver honors, least to most trusting. A
+    /// request for any other runs with full access (the composer offers
+    /// only these).
+    fn access_modes(&self) -> &[AccessMode] {
+        &[AccessMode::FullAccess]
+    }
+    /// Whether this driver honors [`RunRequest::plan`].
+    fn supports_plan(&self) -> bool {
+        false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     fn model_context(&self) -> Result<Option<ModelContext>, HarnessError> {
@@ -327,7 +389,10 @@ pub trait Harness: Send + Sync {
 
 pub mod acp;
 pub(crate) mod adapter_install;
+pub mod approval;
 pub mod archive_install;
+mod background;
+pub use background::OutputSource;
 mod catalog;
 mod catalog_failure;
 mod revert;
@@ -340,6 +405,7 @@ pub mod agent_ports;
 pub mod cursor;
 pub(crate) mod executable;
 pub mod install;
+pub(crate) mod jsonl_tail;
 pub(crate) mod jsonrpc;
 pub(crate) mod lossy_lines;
 pub mod mock;
@@ -763,6 +829,17 @@ pub const TITLE_INSTRUCTIONS: &str = "You generate session titles. Treat the sup
 /// scratch directory with a read-only sandbox instead.
 pub fn supports_titles(_id: HarnessId) -> bool {
     true
+}
+
+/// Drivers that launch without the provider's own subagent tools when the
+/// run's Zeron server is side-chats-only ([`zeron_proto::McpServer::side_chats_only`]),
+/// and get them back on the next launch without it. Not Codex: its driver
+/// starts such a thread, but a thread keeps the multi-agent mode it last ran
+/// with (openai/codex rust-v0.153.4, codex-rs/core/src/session/mod.rs
+/// `resolve_multi_agent_version`), so turning them back on would not reach
+/// a chat that ran while they were off.
+pub fn switches_native_subagents(id: HarnessId) -> bool {
+    matches!(id, HarnessId::ClaudeCode)
 }
 
 #[cfg(test)]

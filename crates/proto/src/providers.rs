@@ -33,6 +33,9 @@ pub fn signs_in(harness: HarnessId) -> bool {
 }
 
 pub fn provider_name(harness: HarnessId) -> &'static str {
+    if harness == HarnessId::Fx {
+        return "fx";
+    }
     PROVIDERS
         .iter()
         .find(|(provider, _, _)| *provider == harness)
@@ -42,7 +45,7 @@ pub fn provider_name(harness: HarnessId) -> &'static str {
 /// Whether the provider reports plan usage. One that doesn't shows no meters
 /// and no "usage unavailable" note — there is nothing missing. Pure.
 pub fn reports_usage(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Antigravity)
+    !matches!(harness, HarnessId::Antigravity | HarnessId::Fx)
 }
 
 /// Providers whose agent holds exactly ONE login (Antigravity): once it is
@@ -54,7 +57,7 @@ pub fn keeps_one_login(harness: HarnessId) -> bool {
 /// Whether zeron switches this agent's logins. Hermes rotates through its
 /// own credential pool (listed, never reordered); Antigravity keeps one.
 pub fn switches_accounts(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity)
+    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity | HarnessId::Fx)
 }
 
 /// A standing note under a provider's Accounts label, for an agent whose
@@ -159,12 +162,16 @@ mod tests {
 
     #[test]
     fn every_real_harness_has_one_provider_entry() {
-        assert_eq!(PROVIDERS.len(), HarnessId::ALL.len() - 1);
+        // fx keeps no account store of its own: it has no row here, and its
+        // name comes from the `provider_name` special case.
+        assert_eq!(PROVIDERS.len(), HarnessId::ALL.len() - 2);
         for harness in HarnessId::ALL {
+            let signs_in = !matches!(harness, HarnessId::Mock | HarnessId::Fx);
             assert_eq!(
                 PROVIDERS.iter().filter(|(id, _, _)| *id == harness).count(),
-                usize::from(harness != HarnessId::Mock),
+                usize::from(signs_in),
             );
+            assert_eq!(super::signs_in(harness), signs_in);
             assert_eq!(HarnessId::from_slug(harness.as_str()), Some(harness));
             assert_eq!(
                 serde_json::to_value(harness).unwrap(),

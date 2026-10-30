@@ -15,7 +15,7 @@ use std::time::Duration;
 use zeron_proto::kilo::strip_gateway_label;
 use zeron_proto::{HarnessId, Model, ReasoningLevel, SteeringMode};
 
-use super::{AcpAgentSpec, default_effort_values, identity_transform};
+use super::{AcpAgentSpec, FULL_ACCESS_ONLY, default_effort_values, identity_transform};
 
 /// Kilo's catalog comes from its gateway, which it fetches with a 10s HTTP
 /// timeout the first time `session/new` asks for providers. Matching that
@@ -92,6 +92,9 @@ pub(super) fn spec() -> AcpAgentSpec {
         skill_dirs,
         hidden_commands: &[],
         drops_unstarted_cancelled_prompt: false,
+        // Kilo's ACP server advertises no session mode, and nothing shows it
+        // asking before every command and edit.
+        access_modes: FULL_ACCESS_ONLY,
     }
 }
 

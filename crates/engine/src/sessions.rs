@@ -198,6 +198,12 @@ struct RunHandle {
     /// parked session whose CLI was since updated in place (by its own
     /// auto-updater or by hand) is replaced before its next turn.
     binary: Option<String>,
+    /// Launched without the provider's own subagents (Settings → Providers):
+    /// a parked session whose setting has since flipped is replaced before
+    /// its next turn. The run's intent: the restriction rides Zeron's MCP
+    /// server, so with no IPC port served ([`Inner::zeron_mcp`] returns
+    /// `None`) the provider keeps its subagents.
+    side_chats_only: bool,
 }
 
 /// Which CLI binary a run of `harness` launches now: its real path, size and
@@ -294,8 +300,8 @@ struct Inner {
     /// Per-chat revert generation: a cancel invalidates an in-flight preview.
     revert_generations: Mutex<HashMap<String, u64>>,
     /// Per chat: session ids the provider said it no longer has. Never
-    /// resumed again from any source â€” the per-provider record a switched
-    /// chat keeps would otherwise hand the dead id straight back â€” until a
+    /// resumed again from any source — the per-provider record a switched
+    /// chat keeps would otherwise hand the dead id straight back — until a
     /// new session replaces them (in memory only, like the tombstone).
     rejected_resumes: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Chats whose next run starts over after a rejected resume, owed a
@@ -495,6 +501,29 @@ impl SessionsEngine {
         lock(&self.inner.runs)
             .get(chat_id)
             .is_some_and(|h| h.turn.background_live())
+    }
+
+    /// Ask the chat's runtime to stop one of its background processes. False
+    /// when no live runtime lists it (it ended meanwhile).
+    pub fn stop_background_task(&self, chat_id: &str, task_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.turn.stop_background_process(task_id))
+    }
+
+    /// The tail of one background process's output; `None` when no live
+    /// runtime lists it.
+    pub async fn background_task_output(
+        &self,
+        chat_id: &str,
+        task_id: &str,
+    ) -> Option<zeron_proto::BackgroundTaskOutput> {
+        let turn = lock(&self.inner.runs).get(chat_id)?.turn.clone();
+        let task_id = task_id.to_owned();
+        tokio::task::spawn_blocking(move || turn.background_output(&task_id))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// How many chats have a turn in flight (the Cloud runner heartbeat's
@@ -1040,6 +1069,7 @@ impl SessionsEngine {
                 h.credential.clone(),
                 h.binary.clone(),
                 h.runtime_config.harness.clone(),
+                h.side_chats_only,
             )
         });
         if let Some((
@@ -1053,6 +1083,7 @@ impl SessionsEngine {
             credential,
             binary,
             live_harness,
+            side_chats_only,
         )) = routed
         {
             if idle {
@@ -1064,14 +1095,16 @@ impl SessionsEngine {
                     Err(EngineError::Other("incompatible live runtime".into()))
                 };
             }
-            // A parked session started with another account (Cloud), or from
-            // a CLI binary since updated: replace it.
+            // A parked session started with another account (Cloud), from a
+            // CLI binary since updated, or with native subagents since
+            // switched: replace it.
             let route = if self
                 .credential_changed(chat_id, harness_id, credential.as_deref())
                 .await
                 || self
                     .binary_changed(chat_id, harness_id, live_harness, binary.as_deref())
                     .await
+                || self.native_subagents_changed(chat_id, harness_id, side_chats_only)
             {
                 None
             } else {
@@ -1227,6 +1260,7 @@ impl SessionsEngine {
                 .ok()
                 .flatten()
         };
+        let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -1286,7 +1320,11 @@ impl SessionsEngine {
                         answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
                         _ = tx.closed() => {
                             lock(&pending).remove(&request_id);
-                            let _ = engine_tx.send(AgentEvent::InputResolved { request_id });
+                            // The run stopped waiting: closed unanswered.
+                            let _ = engine_tx.send(AgentEvent::InputResolved {
+                                request_id,
+                                answers: Some(Vec::new()),
+                            });
                         }
                     }
                 });
@@ -1369,6 +1407,7 @@ impl SessionsEngine {
                 shutdown_cut: std::sync::atomic::AtomicBool::new(false),
                 credential,
                 binary,
+                side_chats_only,
             },
         );
         drop(runs);
@@ -1419,6 +1458,7 @@ impl SessionsEngine {
                 started,
             },
             turn,
+            side_chats_only,
         ));
         Ok(run_id)
     }
@@ -1479,6 +1519,27 @@ impl SessionsEngine {
             }
             _ => false,
         }
+    }
+
+    /// Whether a session parked between turns launched with native subagents
+    /// otherwise than a run would launch now (Settings → Providers). Same
+    /// guards as [`Self::credential_changed`].
+    fn native_subagents_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        started_side_chats_only: bool,
+    ) -> bool {
+        let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
+        if started_side_chats_only == side_chats_only
+            || self.turn_in_flight(chat_id)
+            || self.holds_background_work(chat_id)
+        {
+            return false;
+        }
+        tracing::info!(chat = %chat_id, harness = ?harness_id,
+            "native subagents switched; replacing the parked session");
+        true
     }
 
     /// A warm send's prompt with the fork's copied history in front, when the
@@ -1755,22 +1816,24 @@ impl SessionsEngine {
         Ok(true)
     }
 
-    /// Fold an engine-made event (a `show_visual` page) into the chat's live
-    /// run, after whatever the harness streamed so far. Returns `false` when
-    /// the chat has no run on this device.
     /// Whether the chat has a run on this device (one `inject_event` can reach).
     pub fn has_run(&self, chat_id: &str) -> bool {
         lock(&self.inner.runs).contains_key(chat_id)
     }
 
+    /// Fold an engine-made event (a `show_visual` page, a `show_image` image)
+    /// into the chat's live run, after whatever the harness streamed so far.
+    /// Returns `false` when the chat has no run on this device.
     pub fn inject_event(&self, chat_id: &str, event: AgentEvent) -> bool {
         lock(&self.inner.runs)
             .get(chat_id)
             .is_some_and(|h| h.engine_tx.send(event).is_ok())
     }
 
-    /// Resolve a pending `request_input` question set. Returns `false` when no such
-    /// request is pending (unknown id, or the run already settled).
+    /// Resolve a pending `request_input` question set. Empty `answers` close
+    /// it unanswered — the harness answers with its own decline. Returns
+    /// `false` when no such request is pending (unknown id, or the run
+    /// already settled).
     pub fn respond_input(
         &self,
         chat_id: &str,
@@ -1786,9 +1849,10 @@ impl SessionsEngine {
         let Some(resolver) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
+        let _ = resolver.send(answers.clone());
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
+            answers: Some(answers),
         });
         Ok(true)
     }
@@ -2052,6 +2116,8 @@ impl SessionsEngine {
                     cwd,
                     sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                     auto_approve: false,
+                    access: Default::default(),
+                    plan: false,
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
@@ -2309,6 +2375,33 @@ impl Inner {
         }
     }
 
+    /// Publish the background processes `chat_id`'s runtime runs, mirrored
+    /// like [`Self::set_running_subagents`]. The live heartbeat keeps the row
+    /// fresh while they run; an engine that stops beating took them with it.
+    fn set_background_tasks(&self, chat_id: &str, tasks: Vec<zeron_proto::BackgroundTask>) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.background_tasks == tasks {
+                return;
+            }
+            entry.background_tasks = tasks;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if self.activity_tx.get().is_none()
+            && let Some(ws) = self.workspace()
+        {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -2341,6 +2434,7 @@ impl Inner {
                     last_turn_outcome: None,
                     terminal_activity: None,
                     running_subagents: 0,
+                    background_tasks: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -2409,6 +2503,23 @@ impl Inner {
             .is_some_and(|handle| handle.continues_with_sent_message())
     }
 
+    /// Whether a run of `chat_id` launches without its provider's own
+    /// subagents (Settings → Providers), delegating through side chats
+    /// instead. Never for a chat that has a parent: delegation is one level
+    /// deep, so a side chat can't create chats and keeps its provider's own.
+    /// Nor while its parent is unknown here (its run outran its row).
+    fn side_chats_only(&self, chat_id: &str, harness_id: HarnessId) -> bool {
+        !self.registry.native_subagents(harness_id)
+            && self.workspace().is_none_or(|ws| {
+                !ws.parent_unknown(chat_id)
+                    && !ws
+                        .chat(chat_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|chat| chat.parent_chat_id.is_some())
+            })
+    }
+
     /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
     /// mcp` subcommand, dialing the engine's IPC port and stamped with the
     /// originating chat + device so the agent's side chats link back here.
@@ -2418,7 +2529,10 @@ impl Inner {
     /// `ZERON_IPC_TOKEN`: some harnesses hand this env to their CLI on the
     /// command line (Claude's inline `--mcp-config`), where any local user can
     /// read it with `ps`. The file is owner-only and always current.
-    fn zeron_mcp(&self, chat_id: &str) -> Option<zeron_proto::McpServer> {
+    ///
+    /// `side_chats_only`: the run's provider launches without its own
+    /// subagents, so all delegation goes through this server.
+    fn zeron_mcp(&self, chat_id: &str, side_chats_only: bool) -> Option<zeron_proto::McpServer> {
         let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
         if port == 0 {
             return None;
@@ -2431,6 +2545,12 @@ impl Inner {
         ]
         .into_iter()
         .collect();
+        if side_chats_only {
+            env.insert(
+                zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV.to_owned(),
+                "1".to_owned(),
+            );
+        }
         if let Some(path) = lock(&self.ipc_token_file)
             .as_ref()
             .and_then(|path| path.to_str())
@@ -3157,7 +3277,7 @@ fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail
             AgentEvent::Done { .. } if ix == 0 && closed => continue,
             AgentEvent::Done { .. } => break,
             AgentEvent::Subagent { .. } => continue,
-            AgentEvent::InputResolved { request_id } => {
+            AgentEvent::InputResolved { request_id, .. } => {
                 answered.insert(request_id);
             }
             AgentEvent::InputRequested { request_id, .. } => {
@@ -3320,6 +3440,19 @@ pub(crate) fn subagent_doc_id(chat_id: &str, tool_use_id: &str) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     format!("{chat_id}--sub--{hex}")
+}
+
+/// Spawn gate: whether tagged traffic for `id` gets a subagent doc, and with
+/// it a unit on the badge. Only a spawn chip of THIS chat does, one this run
+/// folded or one already in the doc: those are the rows the lanes card lists.
+/// Claude also tags the agents a subagent starts with their own call ids,
+/// chips of that subagent's doc; sinks for them badged chats over an empty
+/// card (#999). Traffic for any other id stays in the run journal.
+fn is_chat_spawn(id: &str, folded: &[MessagePart], doc: &SessionDoc) -> bool {
+    folded.iter().any(|p| {
+        matches!(p, MessagePart::Tool { id: part, call, .. }
+            if part == id && call.is_subagent_spawn())
+    }) || doc.has_subagent_spawn(id)
 }
 
 /// Test-only instrumentation: how often `drive_run`'s coalesced commit branch
@@ -3663,6 +3796,7 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
     turn: TurnControl,
+    side_chats_only: bool,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
@@ -3673,18 +3807,19 @@ async fn drive_run(
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
-    // The host stamps its own MCP server onto every run it drives, so the
-    // agent can spawn and talk to side chats through the engine it runs in.
-    if request.mcp.is_none() {
-        request.mcp = inner.zeron_mcp(&chat_id);
-    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
-    // the event loop) can take ownership.
+    // the event loop) can take ownership. Taken before the MCP stamp, which
+    // the retry's own dispatch redoes with the settings of its time.
     let mut retry_request = Some(RunRequest {
         resume: None,
         ..request.clone()
     });
+    // The host stamps its own MCP server onto every run it drives, so the
+    // agent can spawn and talk to side chats through the engine it runs in.
+    if request.mcp.is_none() {
+        request.mcp = inner.zeron_mcp(&chat_id, side_chats_only);
+    }
     // A revived turn the resumed session already holds: the provider gets
     // the continuation, while the transcript, preview and title keep the
     // user's own message (and the retries carry the revival on).
@@ -4070,6 +4205,8 @@ async fn drive_run(
     // so the gate still catches real crashes. touch_session throttles at 10s.
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The runtime's background processes, published on the session row.
+    let mut background_processes = turn.watch_background_processes();
     // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
@@ -4169,6 +4306,9 @@ async fn drive_run(
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
     let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Tagged ids that failed the spawn gate ([`is_chat_spawn`]): not looked
+    // up again until a call with that id folds.
+    let mut foreign_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -4203,6 +4343,11 @@ async fn drive_run(
                 },
                 _ = live_heartbeat.tick() => {
                     inner.touch_session(&chat_id);
+                    continue;
+                }
+                Ok(()) = background_processes.changed() => {
+                    let tasks = background_processes.borrow_and_update().clone();
+                    inner.set_background_tasks(&chat_id, tasks);
                     continue;
                 }
                 // A hang-up restarts the idle window, however long the call.
@@ -4283,7 +4428,12 @@ async fn drive_run(
                     }
                     break SessionStatus::Idle;
                 }
-                Some(event) = engine_rx.recv() => event,
+                // Engine-made events are final: a `show_image` image is
+                // already in uploads, outside the generated-image intake root.
+                Some(event) = engine_rx.recv() => {
+                    prepared_events.push_back(event);
+                    continue;
+                }
                 next = stream.next() => match next {
                     Some(Ok(event)) => event,
                     // A stream error while PARKED is a post-turn child death —
@@ -4462,6 +4612,14 @@ async fn drive_run(
             // would link the chip to that never-created doc (an empty tab
             // on click).
             let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            let opens_sink =
+                !sink_known && !done_only && !foreign_subagents.contains(parent_tool_use_id) && {
+                    let spawn = is_chat_spawn(parent_tool_use_id, &folded, doc_ref);
+                    if !spawn {
+                        foreign_subagents.insert(parent_tool_use_id.clone());
+                    }
+                    spawn
+                };
             if chip_streaming {
                 if !sink_known && !done_only {
                     for p in folded.iter_mut() {
@@ -4490,7 +4648,7 @@ async fn drive_run(
                 }
             }
             // Open the sink lazily; an open failure degrades to chip-only.
-            if !sink_known && !done_only {
+            if opens_sink {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.writer()),
                     Err(err) => {
@@ -4760,6 +4918,8 @@ async fn drive_run(
                     continue;
                 }
                 seen_tools.insert(id.clone());
+                // This call may be (or become) a spawn: look again.
+                foreign_subagents.remove(id);
             }
             AgentEvent::ToolResult { id, .. }
                 if !in_segment(&folded, id) && seen_tools.contains(id) =>
@@ -5009,7 +5169,14 @@ async fn drive_run(
             // unresolved question must not outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
             for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
+                if let MessagePart::Input {
+                    resolved, answers, ..
+                } = part
+                {
+                    if !*resolved {
+                        // Never answered: it closed with the run.
+                        *answers = Some(Vec::new());
+                    }
                     *resolved = true;
                 }
             }
@@ -5141,6 +5308,8 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, 0);
+    // The runtime is gone, and its background processes with it.
+    inner.set_background_tasks(&chat_id, Vec::new());
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
@@ -5535,6 +5704,8 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            access: Default::default(),
+            plan: false,
             resume: None,
             attachments: Vec::new(),
             worktree: None,
@@ -5908,33 +6079,151 @@ mod tests {
             assistant_message_id: "a1".into(),
         })
         .unwrap();
-        feed.send(AgentEvent::Subagent {
-            parent_tool_use_id: "tool-1".into(),
-            event: Box::new(AgentEvent::ReasoningDelta {
-                text: String::new(),
-            }),
+        // A background subagent's shape: its spawn's turn ends, and it speaks
+        // after the parent's last commit window, so its sink wakes with the
+        // parent clean, parked and past its deadline.
+        feed.send(AgentEvent::ToolCall {
+            id: "tool-1".into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: "Agent: probe".into(),
+                input: None,
+            },
         })
         .unwrap();
+        feed.send(done(DoneStatus::Completed)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3 * STREAM_COMMIT_MS)).await;
+        // Empty events trickling in inside one window: the first must arm it
+        // rather than commit, and no later one commits on its own.
+        for _ in 0..12 {
+            feed.send(AgentEvent::Subagent {
+                parent_tool_use_id: "tool-1".into(),
+                event: Box::new(AgentEvent::ReasoningDelta {
+                    text: String::new(),
+                }),
+            })
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         // Well past several commit windows with the stream still open: the
         // loop must idle between commits, not spin on a past deadline.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let ticks = FLUSH_TICKS.with(|t| t.get());
         assert!(
             (1..=8).contains(&ticks),
-            "commit branch fired {ticks} times in 1s for one empty subagent event"
+            "commit branch fired {ticks} times in 1s for 12 empty subagent events"
         );
         assert_eq!(
-            core.sessions.session_status(chat).map(|s| s.status),
-            Some(SessionStatus::Working),
-            "stream still open, turn still running"
+            core.sessions
+                .session_status(chat)
+                .map(|s| (s.status, s.running_subagents)),
+            Some((SessionStatus::Idle, 1)),
+            "parked, with the subagent's sink open"
         );
-        feed.send(AgentEvent::Done {
-            status: DoneStatus::Completed,
-            result: None,
-            error: None,
-            session_id: None,
-        })
-        .unwrap();
+        core.sessions.shutdown().await;
+    }
+
+    /// The badge counts what the lanes card lists: this chat's spawn chips.
+    /// In the live claude 2.1.310 shape a forked skill streams under its
+    /// Skill call, and each agent it spawns under that agent's own call, a
+    /// chip of the skill's doc (#999: a chat badged "3" over an empty card).
+    #[tokio::test]
+    async fn running_subagents_count_only_this_chats_spawn_chips() {
+        use super::*;
+        let (feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            feed: Mutex::new(Some(rx)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let chat = "chat-lanes";
+        core.sessions
+            .dispatch(chat, HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        let call = |id: &str, name: &str| AgentEvent::ToolCall {
+            id: id.into(),
+            call: zeron_proto::ToolCall::Unknown {
+                name: name.into(),
+                input: None,
+            },
+        };
+        let tagged = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        };
+        for event in [
+            started(),
+            // The Skill call, then its task start re-decoding it. A frame
+            // tagged before the re-decode stays foreign until the spawn
+            // folds, and the sink opens for the frames after it.
+            call("skill-1", "Skill"),
+            tagged("skill-1", text("early")),
+            call("skill-1", "Agent: /fanout"),
+            tagged(
+                "skill-1",
+                AgentEvent::UserMessage {
+                    text: "Fan out two agents.".into(),
+                },
+            ),
+            tagged("skill-1", call("nested-1", "Agent: alpha")),
+            tagged("skill-1", call("nested-2", "Agent: bravo")),
+            tagged("nested-1", text("sleeping")),
+            tagged("nested-2", text("sleeping")),
+            // A `forked-command-*` id no chip carries (a typed fork's, after its turn).
+            tagged("forked-command-fanout", text("the fork, replayed")),
+            text("fanned out"),
+        ] {
+            feed.send(event).unwrap();
+        }
+        let parts_of = |doc_id: &str| -> Vec<MessagePart> {
+            core.doc_host
+                .open(doc_id)
+                .ok()
+                .and_then(|h| h.doc().read_entries().ok())
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|e| e.parts)
+                .collect()
+        };
+        let skill_doc = subagent_doc_id(chat, "skill-1");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // The closing text commits after everything before it was routed, and
+        // the skill's doc holds the agents it spawned, as chips.
+        while !parts_of(chat)
+            .iter()
+            .any(|p| matches!(p, MessagePart::Text { text, .. } if text == "fanned out"))
+            || parts_of(&skill_doc)
+                .iter()
+                .filter(|p| matches!(p, MessagePart::Tool { call, .. } if call.is_subagent_spawn()))
+                .count()
+                < 2
+        {
+            assert!(tokio::time::Instant::now() < deadline, "the script routed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let listed: Vec<String> = parts_of(chat)
+            .into_iter()
+            .filter_map(|p| match p {
+                MessagePart::Tool {
+                    call,
+                    subagent_ref: Some(doc),
+                    ..
+                } if call.is_subagent_spawn() => Some(doc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, [skill_doc]);
+        assert_eq!(
+            core.sessions
+                .session_status(chat)
+                .map(|s| s.running_subagents),
+            Some(1),
+            "the badge counts what the lanes card lists"
+        );
+        feed.send(done(DoneStatus::Completed)).unwrap();
         core.sessions.shutdown().await;
     }
 
@@ -6015,6 +6304,7 @@ mod tests {
         };
         let answered = |id: &str| AgentEvent::InputResolved {
             request_id: id.into(),
+            answers: None,
         };
         assert!(tail_of(vec![started(), asked("q1")], false).awaiting_input);
         assert!(

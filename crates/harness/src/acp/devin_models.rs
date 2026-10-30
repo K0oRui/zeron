@@ -41,6 +41,7 @@ pub(super) async fn wait_for_model(
     response: &mut serde_json::Value,
     model: &str,
     members: &[String],
+    access: zeron_proto::AccessMode,
 ) -> Result<String, HarnessError> {
     let wait = async {
         loop {
@@ -63,7 +64,7 @@ pub(super) async fn wait_for_model(
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
-                    super::handle_server_request(client, id, &method, &params);
+                    super::handle_server_request_unattended(client, id, &method, &params, access);
                 }
                 Some(_) => {}
                 None => {

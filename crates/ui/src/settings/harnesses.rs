@@ -36,12 +36,16 @@ use crate::motion;
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::accounts::{self, AccountsPage};
+use crate::settings::search::{SearchAnchor, SettingId, Target};
 use crate::settings::widgets;
+use crate::shell::SettingsSection;
 use crate::state::AppState;
 use crate::theme::Theme;
 
 #[path = "completion.rs"]
 mod completion;
+#[path = "delegation.rs"]
+mod delegation;
 
 /// Left inset of an expanded provider's details: the header trigger's
 /// padding, brand tile and gap, so the details start on the title's edge.
@@ -121,6 +125,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Devin => "devin",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
+        HarnessId::Fx => "fx",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Kilo => "kilo",
@@ -141,6 +146,7 @@ fn headroom_provider_labels(providers: &[HarnessId]) -> String {
             HarnessId::Devin => "Devin",
             HarnessId::Grok => "Grok",
             HarnessId::Hermes => "Hermes",
+            HarnessId::Fx => "fx",
             HarnessId::Pi => "Pi",
             HarnessId::Opencode => "OpenCode",
             HarnessId::Kilo => "Kilo",
@@ -317,6 +323,13 @@ pub struct HarnessesPage {
     /// The device switcher moved on and its rows are on the way: the old
     /// rows stay, dimmed and inert, so the block never blanks out.
     switching: bool,
+    /// The target device's native subagent preferences; an error (an engine
+    /// predating them, say) is what the Delegation section shows instead.
+    native_subagents: Loadable<zeron_engine::registry::NativeSubagentSettings>,
+    native_subagents_task: Option<Task<()>>,
+    native_subagents_toggle: Option<Task<()>>,
+    /// A switch is on its way to the device: further flips wait for it.
+    native_subagents_saving: bool,
 }
 
 impl HarnessesPage {
@@ -352,6 +365,10 @@ impl HarnessesPage {
             checking_updates: false,
             embedded: false,
             switching: false,
+            native_subagents: Loadable::Idle,
+            native_subagents_task: None,
+            native_subagents_toggle: None,
+            native_subagents_saving: false,
         };
         page.load(cx);
         page
@@ -419,6 +436,7 @@ impl HarnessesPage {
             .tab_index(0)
             .role(gpui::Role::Button)
             .aria_label("Check for agents and updates")
+            .tooltip(widgets::text_tooltip("Check for agents and updates"))
             .focus_visible(|s| s.border_2().border_color(theme.accent))
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::ink(0.05)))
@@ -525,6 +543,7 @@ impl HarnessesPage {
             .flex_col()
             .gap(px(20.0))
             .child(self.render_completion_for(harness, theme, cx))
+            .children(self.render_native_subagents_for(harness, theme, cx))
             .children(self.render_updates_for(harness, theme, cx))
             .when_some(accounts, |details, accounts| details.child(accounts));
         if motion::reduced_motion(cx) {
@@ -594,7 +613,7 @@ impl HarnessesPage {
                 .flex()
                 .flex_col()
                 .child(widgets::details_label(theme, "Updates"))
-                .child(row)
+                .child(row.search_anchor(SettingId::UpdatePolicy))
                 .into_any_element(),
         )
     }
@@ -605,6 +624,43 @@ impl HarnessesPage {
             object.insert("targetDeviceId".into(), serde_json::json!(target));
         }
         value
+    }
+
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self, cx: &gpui::App) -> bool {
+        self.expanded_harness.is_some()
+            && self
+                .accounts_page
+                .as_ref()
+                .is_some_and(|accounts| accounts.read(cx).has_escape_surface())
+    }
+
+    /// `harness` as the only provider, expanded, with every section its
+    /// details can show loaded: what the settings search must find there.
+    #[cfg(test)]
+    pub(crate) fn show_provider_details(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.harnesses = Loadable::Ready(vec![HarnessDescriptor {
+            id: harness,
+            name: format!("{harness:?}"),
+            supports_steering: false,
+            steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
+        }]);
+        self.updates = Loadable::Ready(vec![
+            serde_json::from_value(serde_json::json!({ "harness": harness, "phase": "current" }))
+                .unwrap(),
+        ]);
+        self.native_subagents = Loadable::Ready(zeron_engine::registry::NativeSubagentSettings {
+            switchable: vec![harness],
+            off: Vec::new(),
+        });
+        self.expanded_harness = None;
+        self.toggle_agent_details(harness, cx);
     }
 
     /// Escape that reached Settings unclaimed goes to the expanded provider's
@@ -675,6 +731,9 @@ impl HarnessesPage {
         self.headroom_install_task = None;
         self.pending_headroom_toggle = None;
         self.installing_headroom = false;
+        self.native_subagents = Loadable::Idle;
+        self.native_subagents_toggle = None;
+        self.native_subagents_saving = false;
         self.load(cx);
         if let Some(painted) = painted.filter(|_| matches!(self.harnesses, Loadable::Loading)) {
             self.harnesses = painted;
@@ -696,6 +755,7 @@ impl HarnessesPage {
         let params = self.with_target(serde_json::json!({}));
         let update_params = params.clone();
         let supports_updates = self.supports_updates(cx);
+        self.request_native_subagents(None, cx);
 
         self.harnesses = Loadable::Loading;
         self.updates = if supports_updates {
@@ -1490,6 +1550,14 @@ impl HarnessesPage {
                             .into_any_element(),
                     );
                 }
+                if installed && harness == HarnessId::Fx {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted)
+                            .child("Configure your model provider with fx login or fx setup.")
+                            .into_any_element(),
+                    );
+                }
                 // Not installed: the hint above says all there is.
                 if let Some(status) = update.filter(|_| installed) {
                     let (text, color) = harness_update_label(status, &theme);
@@ -1845,6 +1913,11 @@ impl Render for HarnessesPage {
                     .into_any_element()
             }
         };
+        // A provider's own rows show once it is expanded: until then, a hit
+        // on one lands on the list, to pick the provider.
+        let body = body
+            .search_anchor(Target::Page(SettingsSection::Harnesses))
+            .block();
         crate::toast::take_error(&mut self.error, cx);
         if embedded {
             let scrollbar = popover::rail(self, "harnesses-embedded-scrollbar", &theme, cx);
@@ -1928,6 +2001,7 @@ impl Render for HarnessesPage {
                 )
                 .fade_overflow_y(&self.scroll.scroll),
             )
+            .child(widgets::page_reveal(&self.scroll.scroll))
             .children(scrollbar)
             .into_any_element()
     }
@@ -1965,6 +2039,8 @@ mod tests {
                         installed: true,
                         can_install: false,
                         enabled: Some(true),
+                        access_modes: Vec::new(),
+                        supports_plan: false,
                     }]);
                 page.run_pending_sign_in(cx);
                 assert_eq!(page.expanded_harness, Some(zeron_proto::HarnessId::Codex));
@@ -2003,6 +2079,8 @@ mod tests {
             installed: true,
             can_install: false,
             enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
         };
         window
             .update(cx, |page, _, cx| {
@@ -2100,6 +2178,8 @@ mod tests {
             installed: true,
             can_install: true,
             enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
         };
         window
             .update(cx, |page, _, cx| {

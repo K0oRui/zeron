@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessId, ReasoningLevel, SandboxLevel};
+use crate::{AccessMode, HarnessId, ReasoningLevel, SandboxLevel};
 
 /// Admission limit for new pins. Concurrent offline additions may exceed it;
 /// existing pins remain visible, reorderable and removable without truncation.
@@ -175,6 +175,12 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// The chat's access mode; absent on chats created before modes, which
+    /// ran with full access.
+    #[serde(default, skip_serializing_if = "AccessMode::is_full_access")]
+    pub access: AccessMode,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 }
 
 /// Immutable-at-run-start repository context owned by one conversation.
@@ -392,6 +398,40 @@ pub struct Session {
     /// has not opened; read it through `view::running_subagents`.
     #[serde(default)]
     pub running_subagents: u32,
+    /// Processes the chat's agent started in the background that still run
+    /// (Claude's `run_in_background` shells, Codex commands that outlived
+    /// their turn). The runtime's own authoritative set, oldest first; read it
+    /// through `view::background_tasks`. Missing on older peers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<BackgroundTask>,
+}
+
+/// One background process of a chat's agent, as its runtime reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTask {
+    /// The runtime's id for it: what `StopBackgroundTask` and
+    /// `ReadBackgroundTaskOutput` address.
+    pub id: String,
+    /// The command line, or the agent's description of it when the runtime
+    /// never said what it runs.
+    pub command: String,
+    /// The agent's one-line description, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// When the host first saw it running.
+    pub started_at: DateTime<Utc>,
+}
+
+/// The tail of a background process's output (`ReadBackgroundTaskOutput`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskOutput {
+    /// Plain text (terminal escapes stripped), ending with the latest line.
+    pub text: String,
+    /// Earlier output was cut off.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl Session {

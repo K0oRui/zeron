@@ -26,6 +26,13 @@ export interface Env {
    * routes (code exchange, refresh, orgs). Unset ⇒ those routes answer 501,
    * matching the old apps/server dev-mode behavior. */
   WORKOS_API_KEY?: string;
+  /** Signing secret of the WorkOS webhook endpoint `https://<edge>/workos/webhook`
+   * (wrangler secret), subscribed to created/updated/deleted of user,
+   * organization and organization_membership. Unset ⇒ that route answers 503
+   * and WorkOS retries. */
+  WORKOS_WEBHOOK_SECRET?: string;
+  /** Every WorkOS user and organization, with members (`users1`; user-directory.ts). */
+  USER_DIRECTORY?: DurableObjectNamespace<import("./user-directory").UserDirectory>;
   /** APNs auth key (contents of AuthKey_XXXX.p8, wrangler secret) and its
    * key id. Unset ⇒ session notifications are decided and logged, not sent. */
   APNS_KEY_P8?: string;

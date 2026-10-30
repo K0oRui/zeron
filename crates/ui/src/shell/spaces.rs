@@ -1415,6 +1415,136 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn no_project_group_plus_opens_a_projectless_chat_on_its_device(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        struct SidebarHost(Entity<Shell>);
+        impl Render for SidebarHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(280.0))
+                        .h(px(800.0))
+                        .child(shell.render_chat_sidebar(&Theme::default(), cx))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            SidebarHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.reduced_motion = true;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.spaces = vec![serde_json::from_value(serde_json::json!({
+                        "id": "repo", "deviceId": "local", "path": "/repo", "createdAt": Utc::now(),
+                    }))
+                    .unwrap()];
+                    state.devices = [
+                        ("local", "This Mac", "macos", None),
+                        ("remote", "Build server", "linux", None),
+                        (
+                            "cloud-machine",
+                            "cloud-machine",
+                            "cloud",
+                            Some("cloud-session"),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, platform, capability)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "name": name, "platform": platform,
+                            "capabilities": capability.into_iter().collect::<Vec<_>>(),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                    state.chats = [
+                        ("in-repo", Some("repo"), "local"),
+                        ("mine", None, "local"),
+                        ("theirs", None, "remote"),
+                        ("cloudy", None, "cloud-machine"),
+                        ("orphan", None, "removed"),
+                    ]
+                    .into_iter()
+                    .map(|(id, space, device)| {
+                        let mut chat = pin_test_chat(id);
+                        chat.space_id = space.map(Into::into);
+                        chat.device_id = device.into();
+                        chat
+                    })
+                    .collect();
+                });
+                shell
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        // One "No project" group per device; a Cloud session's machine and a
+        // device gone from the registry are not targets.
+        for (group, offered) in [
+            ("sidebar-group-new-chat-project:repo", true),
+            ("sidebar-group-new-chat-project:home:local", true),
+            ("sidebar-group-new-chat-project:home:cloud-machine", false),
+            ("sidebar-group-new-chat-project:home:removed", false),
+        ] {
+            assert_eq!(cx.debug_bounds(group).is_some(), offered, "{group}");
+        }
+        let plus = cx
+            .debug_bounds("sidebar-group-new-chat-project:home:remote")
+            .expect("the No project group offers a new chat");
+        cx.simulate_click(plus.center(), gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            let state = shell.state.read(cx);
+            assert!(state.selected_chat.is_none());
+            assert!(state.no_project);
+            assert!(state.selected_space.is_none());
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            // The `+` keeps the click: its group header did not collapse.
+            assert!(shell.settings.sidebar_collapsed_groups.is_empty());
+        });
+
+        // The project's `+` still homes the canvas on the project.
+        let plus = cx
+            .debug_bounds("sidebar-group-new-chat-project:repo")
+            .expect("the project group offers a new chat");
+        cx.simulate_click(plus.center(), gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            let state = shell.state.read(cx);
+            assert!(!state.no_project);
+            assert_eq!(state.selected_space.as_deref(), Some("repo"));
+            assert!(shell.settings.sidebar_collapsed_groups.is_empty());
+        });
+    }
+
+    #[gpui::test]
     fn sidebar_remote_pins_ignore_old_local_preferences(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
@@ -1620,6 +1750,8 @@ mod pinned_session_tests {
             reasoning: None,
             model_options: Default::default(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
         });
 
         window
@@ -2859,6 +2991,9 @@ struct ActiveChatRow {
     id: String,
     /// The host device, for the row's remote/cloud glyph and PR badge.
     device_id: String,
+    /// The project the chat belongs to; absent for a project-less chat, which
+    /// the ByProject view groups per device as "No project".
+    space_id: Option<String>,
     title: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     last_message_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -6505,6 +6640,7 @@ impl Shell {
             status,
             id: chat.id.clone(),
             device_id: chat.device_id.clone(),
+            space_id: chat.space_id.clone(),
             title: chat.title.clone(),
             created_at: chat.created_at,
             last_message_at: chat.last_message_at,
@@ -6973,6 +7109,13 @@ impl Shell {
             let header_icon_chat = (project_group && self.settings.sidebar_show_project_icon)
                 .then(|| indexes.first().map(|index| rows[*index].id.clone()))
                 .flatten();
+            // A project-less row means the "No project" group: one device's
+            // chats outside any project.
+            let projectless_device = indexes
+                .first()
+                .map(|index| &rows[*index])
+                .filter(|row| project_group && row.space_id.is_none())
+                .map(|row| row.device_id.clone());
             let mut rendered_rows = Vec::with_capacity(indexes.len());
             // A custom section's placed projects render as nested groups ahead
             // of its loose sessions.
@@ -7316,23 +7459,50 @@ impl Shell {
             // (the project picker's local-first order), never silently on a
             // possibly offline machine just because it cloned first. The
             // device chip still switches among the repository's checkouts.
+            // A "No project" group's `+` opens a project-less chat on its
+            // device, so the first send lands back in that group.
             let group_name = SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
-            let group_space = (self.settings.sidebar_organization
+            let group_target = (self.settings.sidebar_organization
                 == SidebarOrganization::ByProject)
                 .then(|| {
                     let state = self.state.read(cx);
-                    state
-                        .spaces
-                        .iter()
-                        .find(|space| zeron_proto::view::project_key(space) == key)
-                        .and_then(|space| state.project_members(space).first().map(|m| m.id.clone()))
+                    match projectless_device {
+                        // Only a device the composer's picker offers without a
+                        // project: not Cloud (a session's machine or the
+                        // logical device), nor one gone from the registry.
+                        Some(device) => state
+                            .listed_devices()
+                            .any(|d| d.id == device && !crate::cloud::is_cloud(d))
+                            .then_some(NewSessionTarget::NoProject(device)),
+                        None => state
+                            .spaces
+                            .iter()
+                            .find(|space| zeron_proto::view::project_key(space) == key)
+                            .and_then(|space| {
+                                state.project_members(space).first().map(|m| m.id.clone())
+                            })
+                            .map(NewSessionTarget::Project),
+                    }
                 })
                 .flatten();
-            let new_chat_button = group_space.map(|project| {
+            let new_chat_button = group_target.map(|target| {
+                // Every device's group reads "No project": name the device.
+                let label: SharedString = match &target {
+                    NewSessionTarget::Project(_) => "New chat in project".into(),
+                    NewSessionTarget::NoProject(device) => format!(
+                        "New chat on {}",
+                        self.state.read(cx).device_name(device).unwrap_or(device)
+                    )
+                    .into(),
+                };
                 div()
                     .id(SharedString::from(format!(
                         "sidebar-group-new-chat-{collapse_key}"
                     )))
+                    .debug_selector({
+                        let key = collapse_key.clone();
+                        move || format!("sidebar-group-new-chat-{key}")
+                    })
                     .size(px(20.0))
                     .flex_none()
                     .flex()
@@ -7341,17 +7511,15 @@ impl Shell {
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .role(gpui::Role::Button)
-                    .aria_label("New chat in project")
+                    .aria_label(label.clone())
                     .opacity(0.0)
                     .group_hover(group_name.clone(), |style| style.opacity(1.0))
                     .hover(|el| el.bg(theme.glass_hover()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.open_new_session(Some(project.clone()), cx);
+                        this.open_new_session(Some(target.clone()), cx);
                     }))
-                    .tooltip(crate::settings::widgets::text_tooltip_above(
-                        "New chat in project",
-                    ))
+                    .tooltip(crate::settings::widgets::text_tooltip_above(label))
                     .child(
                         icon(icons::PLUS)
                             .size(px(14.0))
@@ -9832,8 +10000,12 @@ impl Shell {
                     )
                 })
                 .child(div().max_w(px(180.0)).truncate().child(spec.name.clone()))
-                .when(long, |el| {
-                    el.tooltip(crate::settings::widgets::text_tooltip(spec.name.clone()))
+                .when(more || long, |el| {
+                    el.tooltip(crate::settings::widgets::text_tooltip(if more {
+                        SharedString::from("Show hidden folders")
+                    } else {
+                        spec.name.clone()
+                    }))
                 });
             // The open crumb is where you already are: no hover, no click.
             if !spec.current {

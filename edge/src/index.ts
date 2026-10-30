@@ -45,7 +45,15 @@
  *   GET  /admin/cloud/usage             — ADMIN_TOKEN (operator export)
  *   POST /admin/cloud/credits           — ADMIN_TOKEN (grant a user credits)
  *   POST /admin/cloud/machine           — ADMIN_TOKEN (a user's machine size)
+ *   POST /admin/cloud/limits            — ADMIN_TOKEN (a user's awake/chat caps)
  *   POST /stripe/webhook | GET /billing/done — pre-bearer billing (Stripe-signed / static page)
+ *
+ * User directory (user-directory.ts):
+ *   POST /workos/webhook                — pre-bearer, WorkOS-signed user, org and membership events
+ *   GET  /admin/users[?format=csv]      — ADMIN_TOKEN (every user's profile + join date)
+ *   GET  /admin/organizations[?format=csv] — ADMIN_TOKEN (every org with its members)
+ *   GET|POST /admin/badges              — ADMIN_TOKEN (list / define badges)
+ *   POST /admin/badges/{grant|revoke}   — ADMIN_TOKEN (give or take a badge from users)
  */
 import { authenticate } from "./auth";
 import { chatRoute } from "./chat-route";
@@ -74,9 +82,10 @@ import { FakeProvider } from "./cloud/providers/fake";
 import { runnerChatGate, runnerDeviceGate } from "./runner-access";
 import { runnerRefusal } from "./runner-policy";
 import { handleVaultRoute } from "./vault-routes";
+import { handleUserDirectoryRoute, UserDirectory } from "./user-directory";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom, CloudAccount, CloudIndex };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom, CloudAccount, CloudIndex, UserDirectory };
 export { ProvisionWorkflow, WakeWorkflow, SleepWorkflow, DeleteWorkflow };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -136,6 +145,8 @@ export default {
     if (billingRouted) return billingRouted;
     const runnerRouted = await handleRunnerPublicRoute(request, env, url);
     if (runnerRouted) return runnerRouted;
+    const usersRouted = await handleUserDirectoryRoute(request, env, url);
+    if (usersRouted) return usersRouted;
 
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);

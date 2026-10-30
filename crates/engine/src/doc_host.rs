@@ -5651,6 +5651,8 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        access: request.access,
+                        plan: request.plan,
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -5775,6 +5777,15 @@ impl DocHost {
                         Some("no pending input request".into()),
                     ));
                 };
+                // Closed without an answer: there is nothing to deliver, and
+                // a resumed turn would only say so. Record it and stop.
+                if answers.is_empty() {
+                    handle.doc.resolve_input(request_id, answers)?;
+                    return Ok((
+                        SessionCommandStatus::Applied,
+                        Some("closed unanswered".into()),
+                    ));
+                }
                 // The run died under the question (engine restart, crash).
                 // The question is still open in the doc and the command is
                 // durable, so honor it anyway — stamp the part resolved and
@@ -5794,7 +5805,7 @@ impl DocHost {
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                if let Err(err) = handle.doc.resolve_input(request_id) {
+                if let Err(err) = handle.doc.resolve_input(request_id, answers) {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
@@ -6148,6 +6159,8 @@ impl DocHost {
                 .map(|c| c.sandbox)
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
+            access: config.as_ref().map(|c| c.access).unwrap_or_default(),
+            plan: config.as_ref().is_some_and(|c| c.plan),
             attachments: Vec::new(),
             resume: None,
             worktree: None,

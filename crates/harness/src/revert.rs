@@ -162,6 +162,7 @@ pub fn session_file_in(
             let roots = [home().join(".muse"), home().join(".local/share/muse")];
             find_named(&roots, id, 4)
         }
+        HarnessId::Fx => None,
     }
 }
 
