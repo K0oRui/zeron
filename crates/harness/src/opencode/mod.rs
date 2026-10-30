@@ -1011,7 +1011,11 @@ impl Server {
         cmd.env("OPENCODE_PASSWORD", &password)
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_SERVER_USERNAME", "opencode")
-            .env("OPENCODE_CLIENT", "zeron");
+            // Leave OPENCODE_CLIENT unset like the official CLI does: the
+            // server then reports its own build artifact ("cli"/"cli-node")
+            // in x-opencode-client and the provider User-Agent. Naming
+            // ourselves there marks the session as third-party traffic.
+            .env_remove("OPENCODE_CLIENT");
         // Probes have no project: run them from home, where the global
         // config lives, never the engine's own working directory (which for
         // a GUI or service launch can be System32 or the install folder).
@@ -6098,6 +6102,7 @@ if (process.argv.includes('--version')) {{
   const auth = {{
     password: process.env.OPENCODE_PASSWORD,
     legacy: process.env.OPENCODE_SERVER_PASSWORD,
+    client: process.env.OPENCODE_CLIENT ?? null,
   }};
   const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
   http.createServer((req, res) => {{
@@ -6134,6 +6139,8 @@ if (process.argv.includes('--version')) {{
             // 2.x reads OPENCODE_PASSWORD first: both must carry ours.
             assert!(probe["auth"]["password"].is_string());
             assert_eq!(probe["auth"]["password"], probe["auth"]["legacy"]);
+            // The server must fall back to its own artifact, not "zeron".
+            assert_eq!(probe["auth"]["client"], Value::Null);
         }
     }
 
