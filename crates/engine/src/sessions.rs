@@ -556,6 +556,55 @@ impl SessionsEngine {
         self.inner.note_provider_switch(chat_id, harness_id, doc);
     }
 
+    /// Abandon the chat's harness-native session: the next turn starts a new
+    /// provider session (new id, affinity, prompt cache) while the Zeron chat
+    /// keeps its transcript, which is replayed into that session once.
+    ///
+    /// Refused while a turn is in flight or background work is live: tearing
+    /// the runtime down under either would kill work the user did not stop.
+    pub async fn reset_harness_session(&self, chat_id: &str) -> Result<(), EngineError> {
+        if self.turn_in_flight(chat_id) || self.holds_background_work(chat_id) {
+            return Err(EngineError::Other(
+                "Wait for the current turn to finish before starting a new agent session".into(),
+            ));
+        }
+        let handle = self.doc_handle(chat_id)?;
+        let owner = self
+            .inner
+            .owned_session(chat_id)
+            .and_then(|known| known.harness)
+            .or_else(|| self.last_request(chat_id).and_then(|request| request.harness));
+        // A parked runtime would take the next prompt through its mailbox,
+        // still in the old session.
+        self.terminate(chat_id).await?;
+        if self.has_run(chat_id) {
+            return Err(EngineError::Other(
+                "The agent session is still stopping; try again".into(),
+            ));
+        }
+        // The empty row id is the explicit "do not resume" tombstone, and
+        // removing the live cache keeps it from answering first.
+        lock(&self.inner.harness_sessions).remove(chat_id);
+        if let Some(ws) = self.inner.workspace() {
+            ws.set_chat_harness_session(chat_id, "", "", None);
+        }
+        // A revert or retry replays the last request; it must not carry the
+        // abandoned resume id back in.
+        if let Some(request) = lock(&self.inner.last_requests).get_mut(chat_id) {
+            request.resume = None;
+        }
+        let doc = handle.doc();
+        let marked = doc
+            .mark_provider_switched()
+            .and_then(|()| match owner {
+                Some(harness) => doc.mark_session_reset(harness.as_str()),
+                None => Ok(()),
+            })
+            .and_then(|()| doc.clear_provider_sessions());
+        marked.map_err(|error| EngineError::Other(error.to_string()))?;
+        Ok(())
+    }
+
     /// Whether an accepted agent update gates the chat's live run, so a new
     /// prompt waits in the queue rather than joining that run's transcript.
     pub fn live_run_update_pending(&self, chat_id: &str) -> bool {
@@ -2924,6 +2973,9 @@ impl Inner {
             .and_then(|ws| ws.chat(chat_id).ok().flatten())
             .is_some_and(|chat| chat.parent_chat_id.is_some());
         let switched = doc.provider_switched();
+        let reset = doc
+            .session_reset()
+            .is_some_and(|harness| harness == harness_id.as_str());
         if native_command(prompt, harness_id) || !(side_chat || switched) {
             return None;
         }
@@ -3008,7 +3060,9 @@ impl Inner {
             return None;
         }
         let intro = if watermark.is_some() {
-            "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider — do not assume their state is still live."
+            "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider - do not assume their state is still live."
+        } else if reset {
+            "This conversation continues in a new session. The earlier messages are below as context; answer the final request as the continuation of that conversation. Tool calls listed below ran in the previous session - do not assume their state is still live."
         } else if switched {
             "This conversation was started with a different AI provider and you are now taking over. The earlier messages are below as context; answer the final request as the continuation of that conversation. Tool calls listed below ran on the previous provider — do not assume their state is still live."
         } else {

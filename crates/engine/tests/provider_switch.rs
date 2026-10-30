@@ -754,3 +754,91 @@ async fn a_switched_side_chat_counts_only_its_own_seams() {
     rig.turn(CODEX, "over to you", "u2").await;
     assert_eq!(rig.seams().len(), 2, "the side chat's own switch is marked");
 }
+
+#[tokio::test]
+async fn a_new_agent_session_starts_fresh_and_replays_the_transcript_once() {
+    let rig = rig(None);
+    rig.turn(CLAUDE, "Remember PINEAPPLE", "u1").await;
+    let resumed = rig.turn(CLAUDE, "and MANGO", "u2").await;
+    assert_eq!(resumed.resume.as_deref(), Some("claude-session"));
+
+    rig.core
+        .sessions
+        .reset_harness_session("main")
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.row().harness_session_id.as_deref(),
+        Some(""),
+        "the row carries the explicit do-not-resume tombstone"
+    );
+    assert!(rig.seams().is_empty(), "a reset is not a provider switch");
+
+    let fresh = rig.turn(CLAUDE, "What fruit did I mention?", "u3").await;
+    assert_eq!(fresh.resume, None, "the abandoned session is not resumed");
+    for needle in [
+        "PINEAPPLE",
+        "MANGO",
+        "Claude answer",
+        "continues in a new session",
+        "What fruit did I mention?",
+    ] {
+        assert!(
+            fresh.prompt.contains(needle),
+            "replay is missing {needle:?}: {}",
+            fresh.prompt
+        );
+    }
+    assert!(
+        !fresh.prompt.contains("different AI provider"),
+        "a reset uses the continuation intro, not the provider handoff: {}",
+        fresh.prompt
+    );
+    assert!(rig.seams().is_empty(), "the reset writes no seam");
+
+    // The new session now holds the replayed history: later turns resume it
+    // and are unwrapped.
+    let settled = rig.turn(CLAUDE, "thanks", "u4").await;
+    assert_eq!(settled.resume.as_deref(), Some("claude-session"));
+    assert_eq!(settled.prompt, "thanks");
+    assert!(rig.seams().is_empty());
+}
+
+#[tokio::test]
+async fn a_new_agent_session_is_refused_while_a_turn_is_running() {
+    let rig = rig(Some(CLAUDE));
+    rig.core
+        .sessions
+        .dispatch(
+            "main",
+            CLAUDE,
+            run_request(CLAUDE, "long task"),
+            Some("u1".into()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !rig.core.sessions.turn_in_flight("main") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let error = rig
+        .core
+        .sessions
+        .reset_harness_session("main")
+        .await
+        .expect_err("resetting mid-turn would kill work the user did not stop")
+        .to_string();
+    assert!(error.contains("finish"), "{error}");
+
+    rig.gate.notify_one();
+    rig.wait_idle(1).await;
+    rig.core
+        .sessions
+        .reset_harness_session("main")
+        .await
+        .unwrap();
+}

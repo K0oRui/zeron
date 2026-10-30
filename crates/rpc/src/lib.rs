@@ -86,6 +86,10 @@ pub mod methods {
     pub const REVERT_COMMIT: &str = "RevertCommit";
     /// Abandon a pending preview. `{ chatId }` → `{ ok }`.
     pub const REVERT_CANCEL: &str = "RevertCancel";
+    /// Abandon the chat's harness-native session: the next turn starts a new
+    /// provider session while the transcript is replayed into it.
+    /// `{ chatId }` → `{ ok }`.
+    pub const RESET_HARNESS_SESSION: &str = "ResetHarnessSession";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.

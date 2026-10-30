@@ -400,17 +400,31 @@ impl Shell {
         // header over the empty canvas was noise); the bar keeps its height,
         // drag region, and buttons. Where a session runs, and its side-chat
         // and project actions, live in the session card.
-        let (title, harness, on_canvas): (SharedString, Option<zeron_proto::HarnessId>, bool) = {
+        let (title, harness, on_canvas, reset_target): (
+            SharedString,
+            Option<zeron_proto::HarnessId>,
+            bool,
+            Option<(String, bool)>,
+        ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
-                Some(chat) => (
-                    SharedString::from(transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )),
-                    chat.config.as_ref().map(|c| c.harness),
-                    false,
-                ),
-                None => (SharedString::from(""), None, true),
+                Some(chat) => {
+                    let has_session = chat
+                        .harness_session_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty());
+                    let working =
+                        state.display_status_for(chat, Utc::now()) == zeron_proto::ChatIndicator::Working;
+                    (
+                        SharedString::from(transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )),
+                        chat.config.as_ref().map(|c| c.harness),
+                        false,
+                        has_session.then(|| (chat.id.clone(), working)),
+                    )
+                }
+                None => (SharedString::from(""), None, true, None),
             }
         };
 
@@ -617,6 +631,30 @@ impl Shell {
                 crate::running_pill::mark_titlebar_button(button, running_lanes, &theme)
             })
         });
+        // Abandon this chat's harness-native session: the next turn starts a
+        // new provider session and carries the transcript over, so the agent
+        // keeps the context but gets a fresh identity (session id, affinity,
+        // prompt cache). Only offered once a session exists to abandon.
+        let reset_session = reset_target.map(|(chat_id, working)| {
+            let label = if working {
+                "Wait for the current turn to finish"
+            } else {
+                "New agent session"
+            };
+            header_icon_button(
+                "reset-harness-session",
+                icons::REFRESH,
+                label,
+                &theme,
+                cx.listener(move |this, _, _, cx| {
+                    this.reset_chat_harness_session(chat_id.clone(), cx)
+                }),
+            )
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .flex_none()
+            .when(working, |button| button.opacity(0.45))
+        });
         let inner = div()
             .size_full()
             .flex()
@@ -664,6 +702,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(reset_session)
             .children(session_info_toggle)
             .children(trailing);
 

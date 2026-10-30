@@ -2342,6 +2342,8 @@ pub struct Shell {
     chat_revert: Option<ChatRevertFlow>,
     chat_revert_task: Option<Task<()>>,
     chat_revert_seq: u64,
+    /// In-flight "new agent session" (identity reset) RPC.
+    reset_session_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -2910,6 +2912,7 @@ impl Shell {
             chat_revert: None,
             chat_revert_task: None,
             chat_revert_seq: 0,
+            reset_session_task: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             sidebar_section_migration: None,
@@ -4847,6 +4850,60 @@ impl Shell {
                 .await;
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Abandon the chat's harness-native session. The Zeron chat keeps its
+    /// transcript; the next turn starts a fresh provider session and replays
+    /// that transcript into it, so the agent keeps the context but not the
+    /// session identity (id, affinity, prompt cache).
+    fn reset_chat_harness_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self.reset_session_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_notice(
+                crate::toast::ToastKind::Error,
+                "Engine is not connected.",
+                cx,
+            );
+            return;
+        };
+        let target = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone())
+            .filter(|id| !id.is_empty());
+        self.reset_session_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "chatId": chat_id });
+            if let Some(target) = target {
+                params["targetDeviceId"] = serde_json::Value::String(target);
+            }
+            let result = engine
+                .client()
+                .call_as::<serde_json::Value>(methods::RESET_HARNESS_SESSION, params)
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.reset_session_task = None;
+                match result {
+                    Ok(_) => shell.show_notice(
+                        crate::toast::ToastKind::Success,
+                        "New agent session: the next message starts fresh and carries this conversation as context.",
+                        cx,
+                    ),
+                    Err(error) => shell.show_notice(
+                        crate::toast::ToastKind::Error,
+                        format!("Could not start a new agent session: {error}"),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 

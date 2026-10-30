@@ -481,6 +481,26 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// The harness whose session an explicit "new agent session" abandoned.
+    /// The next fresh session for that harness gets the transcript with a
+    /// continuation intro, not the provider-handoff one.
+    pub fn session_reset(&self) -> Option<String> {
+        match self.doc.get_map("meta").get("sessionReset") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn mark_session_reset(&self, harness: &str) -> Result<(), DocError> {
+        if self.session_reset().as_deref() != Some(harness) {
+            self.doc
+                .get_map("meta")
+                .insert("sessionReset", harness)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
     /// Each provider's own session in a chat that changed provider, keyed by
     /// harness slug. Switching back resumes that session and hands it only
     /// the turns after its `seen` entry, so its native history (and the
@@ -512,6 +532,15 @@ impl SessionDoc {
         self.doc
             .get_map("meta")
             .insert("providerSessions", serde_json::to_string(&marks)?)?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Forget every provider's stored session. An explicit identity reset
+    /// abandons them all, so the switch-back lookup cannot hand an old id
+    /// back to the next run.
+    pub fn clear_provider_sessions(&self) -> Result<(), DocError> {
+        self.doc.get_map("meta").delete("providerSessions")?;
         self.doc.commit();
         Ok(())
     }

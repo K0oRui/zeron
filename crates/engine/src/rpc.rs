@@ -2067,6 +2067,7 @@ fn forwardable(method: &str) -> bool {
             | methods::REVERT_PREVIEW
             | methods::REVERT_COMMIT
             | methods::REVERT_CANCEL
+            | methods::RESET_HARNESS_SESSION
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -2919,6 +2920,14 @@ impl RpcService for EngineRpc {
                 let p: ChatParams = parse_params(params)?;
                 self.sessions
                     .revert_cancel(&p.chat_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::RESET_HARNESS_SESSION => {
+                let p: ChatParams = parse_params(params)?;
+                self.sessions
+                    .reset_harness_session(&p.chat_id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
