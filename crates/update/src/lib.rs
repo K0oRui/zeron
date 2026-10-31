@@ -3,11 +3,16 @@
 //! (its own report-only checker, the "Check for Updates…" menu item, the
 //! sidebar update strip, and the desktop install paths).
 //!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! Release layout (see `.github/workflows/release.yml`): the feed is this
+//! project's own GitHub Releases. `https://api.github.com/repos/<repo>/releases/latest`
+//! names the newest version and lists its assets; the assets themselves are
+//! downloaded from their browser URLs under
+//! `https://github.com/<repo>/releases/download/<tag>/<file>`, so no CDN, no
+//! edge release proxy, and no host of our own sits in the update path. The
+//! workflow also attaches a `manifest.json` (version + sha256 per artifact) to
+//! each release; the updater uses it when present for checksum-pinned
+//! downloads and otherwise falls back to the API's asset list. `ZERON_RELEASES_URL`
+//! still overrides the whole base (mirrors, forks, air-gapped networks).
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
@@ -82,14 +87,22 @@ const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// `{edge}/releases/manifest.json` — written by the release workflow.
+/// What the updater needs to know about the newest release: its version, where
+/// its assets live, and (when the release carries one) a sha256 per artifact.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    /// Artifact file name → metadata. Empty when the release has no
+    /// `manifest.json` asset — downloads then come straight from the release's
+    /// asset list and skip checksum verification (with a log).
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
+    /// Base URL the artifacts are fetched from, without a trailing slash:
+    /// the release's own `manifest.json` for a mirrored/custom feed, or
+    /// `https://github.com/<repo>/releases/download/<tag>` for a GitHub
+    /// release. Not part of the wire format — [`fetch_latest`] fills it in.
+    #[serde(skip)]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -156,7 +169,7 @@ fn parse_version(v: &str) -> Option<Vec<u64>> {
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a garbage `latest.txt` must not
+/// Unparseable versions never count as newer — a malformed release tag must not
 /// trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     match (parse_version(latest), parse_version(current)) {
@@ -165,25 +178,53 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
-pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
-    let base = release_base(edge_url)?;
+/// Fetch the newest release's metadata: the version, where its artifacts live,
+/// and its per-artifact sha256 when the release published a `manifest.json`.
+///
+/// Two feeds, in this order:
+/// 1. A base URL, when one is configured (the `ZERON_RELEASES_URL` override or
+///    the Windows package's `zeron-update.json`): `{base}/manifest.json`, then
+///    `{base}/latest.txt` for releases that predate the manifest. Artifacts
+///    come from the same base.
+/// 2. Otherwise this project's own GitHub Releases:
+///    `https://api.github.com/repos/<repo>/releases/latest` names the version
+///    and lists the assets, which are fetched from their
+///    `https://github.com/<repo>/releases/download/<tag>/<file>` URLs. A
+///    `manifest.json` asset, when the workflow attached one, supplies checksums.
+pub async fn fetch_latest() -> anyhow::Result<Manifest> {
+    fetch_latest_from(None).await
+}
+
+/// [`fetch_latest`] with the feed base supplied instead of resolved from the
+/// environment — what the checker's own tests drive.
+async fn fetch_latest_from(base: Option<String>) -> anyhow::Result<Manifest> {
+    let resolved = match base {
+        Some(base) => Some(validate_release_override(&base)?),
+        None => release_base()?,
+    };
+    let Some(base) = resolved else {
+        return fetch_github_latest().await;
+    };
     let client = http_client()?;
     let manifest_url = format!("{base}/manifest.json");
     match fetch_release_metadata(&client, &manifest_url).await {
         Ok(response) if response.status.is_success() => {
-            let manifest: Manifest =
-                serde_json::from_slice(&response.body).context("parsing manifest.json")?;
+            let mut manifest: Manifest = serde_json::from_slice(&response.body)
+                .with_context(|| format!("parsing {manifest_url}"))?;
             if manifest.version.trim().is_empty() {
-                bail!("manifest.json has an empty version");
+                bail!("{manifest_url} has an empty version");
             }
+            manifest.base = Some(base.clone());
             return Ok(manifest);
         }
-        Ok(response) => {
-            tracing::debug!(status = %response.status, "manifest.json unavailable; trying latest.txt")
-        }
-        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
+        Ok(response) => tracing::debug!(
+            status = %response.status,
+            "release manifest unavailable; trying latest.txt"
+        ),
+        Err(err) => tracing::debug!(
+            error = %err,
+            "release manifest fetch failed; trying latest.txt"
+        ),
     }
     let latest_url = format!("{base}/latest.txt");
     let response = fetch_release_metadata(&client, &latest_url)
@@ -204,7 +245,184 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
     Ok(Manifest {
         version,
         files: BTreeMap::new(),
+        base: Some(base),
     })
+}
+
+/// The GitHub REST view of a release — only the fields the updater reads.
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// Newest release from this project's GitHub Releases — the repository's own
+/// release page, nothing else.
+async fn fetch_github_latest() -> anyhow::Result<Manifest> {
+    let client = http_client()?;
+    let api = GITHUB_RELEASES_API;
+    let response = fetch_release_metadata(&client, api)
+        .await
+        .with_context(|| format!("fetching {api}"))?;
+    anyhow::ensure!(
+        response.status.is_success(),
+        "fetching {api}: HTTP {} (publish a release on GitHub first)",
+        response.status
+    );
+    let release: GithubRelease =
+        serde_json::from_slice(&response.body).with_context(|| format!("parsing {api}"))?;
+
+    // The workflow attaches `manifest.json` (version + sha256 per artifact) to
+    // every release; read it first so the downloads below are checksum-pinned.
+    let mut checksums = None;
+    if let Some(asset) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "manifest.json")
+    {
+        match fetch_release_checksums(&client, &asset.browser_download_url).await {
+            Ok(manifest) => checksums = Some(manifest),
+            Err(err) => tracing::warn!(
+                error = %err,
+                version = %release.tag_name,
+                "release manifest unavailable; using GitHub's asset digests instead"
+            ),
+        }
+    }
+    manifest_from_release(&release, checksums.as_ref())
+}
+
+/// The `manifest.json` a release publishes, if it has one.
+async fn fetch_release_checksums(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<Manifest> {
+    let mut request = client.get(url);
+    // Public releases need no credentials; a private mirror's assets do, and
+    // `GITHUB_TOKEN` covers that case.
+    if let Some(token) = github_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching {url}"))?;
+    response
+        .json::<Manifest>()
+        .await
+        .with_context(|| format!("parsing {url}"))
+}
+
+/// Turn the API's view of a release into a [`Manifest`]: the tag names the
+/// version, the assets name the files, and their URLs say where they live.
+///
+/// Checksums, in order of preference: the release's own `manifest.json`
+/// (written by the release workflow, sha256 for every artifact), then each
+/// asset's own `digest` from the API (`sha256:…`), and only then none — a
+/// release with neither still updates, with a warning, because a broken
+/// checksum must not brick the update path.
+fn manifest_from_release(
+    release: &GithubRelease,
+    checksums: Option<&Manifest>,
+) -> anyhow::Result<Manifest> {
+    let version = release
+        .tag_name
+        .trim()
+        .trim_start_matches('v')
+        .to_owned();
+    anyhow::ensure!(!version.is_empty(), "the latest GitHub release has no tag");
+    let artifacts: Vec<&GithubAsset> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name != "manifest.json")
+        .collect();
+    // Everything under one release tag shares a directory; take it from the
+    // first artifact so downloads skip the API's redirect hop.
+    let base = artifacts
+        .first()
+        .map(|asset| asset_url_base(&asset.browser_download_url))
+        .filter(|base| !base.is_empty());
+
+    let mut files: BTreeMap<String, FileMeta> = BTreeMap::new();
+    if let Some(manifest) = checksums {
+        // A manifest from another release is worse than no manifest: it would
+        // pin every download to the wrong sha256.
+        if manifest.version.trim().is_empty()
+            || parse_version(&manifest.version) == parse_version(&version)
+        {
+            files = manifest.files.clone();
+        } else {
+            tracing::warn!(
+                manifest_version = %manifest.version,
+                release_version = %version,
+                "release manifest names a different version; ignoring its checksums"
+            );
+        }
+    }
+    let mut unverified = Vec::new();
+    for asset in artifacts {
+        let digest = asset
+            .digest
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .filter(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned);
+        match files.entry(asset.name.clone()) {
+            // The release's own manifest wins over the API's digest.
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get().sha256.is_none() {
+                    unverified.push(entry.key().clone());
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if digest.is_none() {
+                    unverified.push(entry.key().clone());
+                }
+                entry.insert(FileMeta { sha256: digest });
+            }
+        }
+    }
+    if !unverified.is_empty() {
+        tracing::warn!(
+            version,
+            artifacts = unverified.join(", "),
+            "release artifacts without a sha256; downloading them unverified"
+        );
+    }
+    Ok(Manifest {
+        version,
+        files,
+        base,
+    })
+}
+
+/// `https://github.com/<repo>/releases/download/<tag>/<file>` → its directory.
+fn asset_url_base(url: &str) -> String {
+    url.rsplit_once('/')
+        .map(|(base, _)| base.to_owned())
+        .unwrap_or_default()
+}
+
+fn github_token() -> Option<String> {
+    for key in ["ZERON_GITHUB_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(key)
+            && !token.trim().is_empty()
+        {
+            return Some(token.trim().to_owned());
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -235,9 +453,9 @@ async fn fetch_release_metadata_with_limits(
     let request = async {
         let response = client
             .get(url)
-            // Intermediaries must revalidate: the edge already bounds its own
-            // cache to a minute, and a proxy holding an old manifest for
-            // longer is exactly the "prompt appears late" failure.
+            // Intermediaries must revalidate: GitHub serves the release API
+            // through a short-lived cache, and a proxy holding an old answer
+            // for longer is exactly the "prompt appears late" failure.
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send()
             .await
@@ -300,10 +518,24 @@ fn http_client_with_timeouts(connect: Duration, read: Duration) -> anyhow::Resul
 
 fn validate_release_override(value: &str) -> anyhow::Result<String> {
     let url = reqwest::Url::parse(value.trim()).context("invalid update feed URL")?;
+    // HTTPS everywhere, except a loopback feed: that traffic never leaves the
+    // machine, so TLS there buys nothing and would only block local mirrors
+    // and the tests that serve a release from 127.0.0.1.
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
     anyhow::ensure!(
-        url.scheme() == "https" && url.host_str().is_some(),
-        "update feed must use HTTPS"
+        url.host_str().is_some() && (url.scheme() == "https" || (url.scheme() == "http" && loopback)),
+        "update feed must use HTTPS (plain HTTP only for a loopback mirror)"
     );
+    // Artifact URLs are built by appending to `url.path()`. `Url::parse`
+    // already resolves dot segments (`..`, including percent-encoded forms),
+    // so a parsed base cannot climb out of its own path.
     anyhow::ensure!(
         url.username().is_empty()
             && url.password().is_none()
@@ -323,17 +555,28 @@ pub const RELEASES_PAGE: &str = "https://github.com/K0oRui/zeron/releases";
 /// installation cannot replace itself.
 pub const LATEST_RELEASE_PAGE: &str = "https://github.com/K0oRui/zeron/releases/latest";
 
-fn release_base(edge_url: &str) -> anyhow::Result<String> {
-    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+/// The release feed: this project's GitHub Releases API. Every check is one
+/// anonymous GET of `releases/latest`; nothing of ours is in the path.
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/K0oRui/zeron/releases/latest";
+
+/// A configured release feed — the whole tree under it (`manifest.json`,
+/// `latest.txt`, the artifacts). `None` = the GitHub Releases feed.
+fn release_base() -> anyhow::Result<Option<String>> {
+    release_base_from(std::env::var("ZERON_RELEASES_URL").ok().as_deref())
+}
+
+/// [`release_base`] with the `ZERON_RELEASES_URL` override supplied (or not).
+fn release_base_from(override_url: Option<&str>) -> anyhow::Result<Option<String>> {
+    if let Some(url) = override_url
         && !url.trim().is_empty()
     {
-        return validate_release_override(&url);
+        return validate_release_override(url).map(Some);
     }
     #[cfg(windows)]
     if let Some(url) = windows::release_url()? {
-        return Ok(url.trim_end_matches('/').to_owned());
+        return Ok(Some(url.trim_end_matches('/').to_owned()));
     }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -418,19 +661,16 @@ impl InstallKind {
 
     pub async fn stage_desktop(
         &self,
-        edge_url: &str,
         manifest: &Manifest,
         data_dir: &Path,
     ) -> anyhow::Result<PathBuf> {
         match self {
-            Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
+            Self::MacApp { .. } => stage_mac_app(manifest, data_dir).await,
             Self::Managed { app_root } if self.supports_desktop_update() => {
-                stage_headless(edge_url, manifest, app_root).await
+                stage_headless(manifest, app_root).await
             }
             #[cfg(windows)]
-            Self::WindowsPortable { directory } => {
-                windows::stage(edge_url, manifest, directory).await
-            }
+            Self::WindowsPortable { directory } => windows::stage(manifest, directory).await,
             _ => bail!("this installation does not support desktop updates"),
         }
     }
@@ -598,16 +838,27 @@ fn bundle_short_version(plist: &str) -> Option<String> {
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
+/// Where one artifact of `manifest` is downloaded from: the feed resolved by
+/// [`fetch_latest`] (a configured base, or the GitHub release's asset
+/// directory) when it carries one, else the configured feed.
+fn artifact_url(manifest: &Manifest, file: &str) -> anyhow::Result<String> {
+    let base = match &manifest.base {
+        Some(base) => base.trim_end_matches('/').to_owned(),
+        None => release_base()?
+            .context("release metadata did not say where its artifacts live")?,
+    };
+    Ok(format!("{base}/{file}"))
+}
+
+/// Stream one release artifact to `dest`, verifying the manifest sha256 when
 /// present. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
-    edge_url: &str,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/{file}", release_base(edge_url)?);
+    let url = artifact_url(manifest, file)?;
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(
@@ -694,11 +945,7 @@ async fn verify_staged_binary(binary: &Path, version: &str) -> anyhow::Result<()
 
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
-pub async fn stage_headless(
-    edge_url: &str,
-    manifest: &Manifest,
-    app_root: &Path,
-) -> anyhow::Result<PathBuf> {
+pub async fn stage_headless(manifest: &Manifest, app_root: &Path) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_managed_update_platform()?;
     let version = &manifest.version;
@@ -716,7 +963,7 @@ pub async fn stage_headless(
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(edge_url, manifest, &file, &tarball).await?;
+        download_release_file(manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
         // Tarball root is the versioned stage dir (see scripts/package/package-linux.sh);
@@ -857,11 +1104,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 /// (idempotent). The bundle is unpacked beside its final name and renamed in
 /// only after its binary answers with the expected version, so an interrupted
 /// unpack can never be mistaken for a staged update. Returns the staged bundle.
-pub async fn stage_mac_app(
-    edge_url: &str,
-    manifest: &Manifest,
-    data_dir: &Path,
-) -> anyhow::Result<PathBuf> {
+pub async fn stage_mac_app(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_mac_app_update_platform()?;
     let version = &manifest.version;
@@ -881,7 +1124,7 @@ pub async fn stage_mac_app(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
-    download_release_file(edge_url, manifest, &file, &tarball).await?;
+    download_release_file(manifest, &file, &tarball).await?;
     let unpack = dir.join(".unpack");
     std::fs::create_dir_all(&unpack)?;
     let unpacked = run(
@@ -1054,7 +1297,7 @@ enum Role {
     Desktop,
 }
 
-/// Background release checker: polls `{edge}/releases` hourly on a wall-clock
+/// Background release checker: polls GitHub Releases hourly on a wall-clock
 /// schedule (so sleep/wake cannot stretch it), backs off on failure, and
 /// publishes [`UpdateStatus`] over a watch channel. In the engine, managed
 /// installs with `ZERON_AUTO_UPDATE` set stage + apply + service restart on
@@ -1062,8 +1305,10 @@ enum Role {
 /// the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
-    edge_url: String,
     role: Arc<Role>,
+    /// Explicit feed base; `None` = resolve `ZERON_RELEASES_URL` / the Windows
+    /// package's config / GitHub Releases at check time. Only tests set it.
+    feed: Option<String>,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     /// Wakes the loop; `forced` says whether the wake demands a check or only
     /// a fresh look at the wall clock.
@@ -1080,17 +1325,24 @@ pub struct Updater {
 
 impl Updater {
     /// Spawn the engine's check loop (must run on a tokio runtime).
-    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
-        Self::spawn_role(edge_url, Role::Engine { quiescent })
+    pub fn spawn(quiescent: Option<QuiescentCheck>) -> Self {
+        Self::spawn_role(Role::Engine { quiescent }, None)
     }
 
     /// Spawn the desktop app's report-only check loop (must run on a tokio
     /// runtime).
-    pub fn spawn_desktop(edge_url: String) -> Self {
-        Self::spawn_role(edge_url, Role::Desktop)
+    pub fn spawn_desktop() -> Self {
+        Self::spawn_role(Role::Desktop, None)
     }
 
-    fn spawn_role(edge_url: String, role: Role) -> Self {
+    /// A desktop checker pinned to a feed: the crate's own tests serve a
+    /// release locally instead of publishing one.
+    #[cfg(test)]
+    fn spawn_desktop_with_feed(feed: String) -> Self {
+        Self::spawn_role(Role::Desktop, Some(feed))
+    }
+
+    fn spawn_role(role: Role, feed: Option<String>) -> Self {
         let initial_delay = match role {
             Role::Engine { .. } => ENGINE_INITIAL_DELAY,
             Role::Desktop => DESKTOP_INITIAL_DELAY,
@@ -1099,8 +1351,8 @@ impl Updater {
         let (wake_tx, _) = watch::channel(0);
         let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
-            edge_url,
             role: Arc::new(role),
+            feed,
             status_tx: Arc::new(status_tx),
             wake_tx: Arc::new(wake_tx),
             forced: Arc::new(AtomicBool::new(false)),
@@ -1119,7 +1371,7 @@ impl Updater {
     }
 
     /// Stop the check loop and wait for it to exit — a replaced runtime must
-    /// not keep polling `{edge}/releases` (or auto-applying) in the background.
+    /// not keep polling the release feed (or auto-applying) in the background.
     /// Idempotent, and callable from any clone.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -1167,7 +1419,7 @@ impl Updater {
     /// One user-requested check, awaited: publishes the result like a
     /// scheduled check and returns it.
     pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
-        match fetch_latest(&self.edge_url).await {
+        match fetch_latest_from(self.feed.clone()).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 Ok(self.status_tx.borrow().clone())
@@ -1235,9 +1487,9 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest(&self.edge_url).await {
+            match fetch_latest_from(self.feed.clone()).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
+                    if let Err(err) = stage_headless(&manifest, &app_root).await {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
                     }
@@ -1302,7 +1554,7 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        match fetch_latest(&self.edge_url).await {
+        match fetch_latest_from(self.feed.clone()).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 true
@@ -1335,11 +1587,11 @@ impl Updater {
                  source builds update via git"
             );
         };
-        let manifest = fetch_latest(&self.edge_url).await?;
+        let manifest = fetch_latest_from(self.feed.clone()).await?;
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
-        stage_headless(&self.edge_url, &manifest, &app_root).await?;
+        stage_headless(&manifest, &app_root).await?;
         if require_quiescent && !self.quiescent_now() {
             return Ok(None);
         }
@@ -1644,8 +1896,15 @@ mod tests {
             validate_release_override(" https://example.com/releases/ ").unwrap(),
             "https://example.com/releases"
         );
+        // Loopback mirrors may use plain HTTP (a LAN-less local feed).
+        for local in ["http://127.0.0.1:8080", "http://localhost:8080/x", "http://[::1]:8080"] {
+            assert!(validate_release_override(local).is_ok(), "rejected {local}");
+        }
+        // Off-machine feeds must be HTTPS, and none may smuggle credentials,
+        // a query, or a fragment into the artifact URLs.
         for url in [
             "http://example.com/releases",
+            "http://127.0.0.1.example.com/releases",
             "file:///tmp/update",
             "https://user:password@example.com",
             "https://example.com?feed=x",
@@ -1742,19 +2001,16 @@ mod tests {
         let manifest = Manifest {
             version: "9.9.9".into(),
             files: BTreeMap::new(),
+            base: Some("http://127.0.0.1:1".into()),
         };
         let app_root = tmp.path().join("app");
         let data_dir = tmp.path().join("data");
 
-        let managed_err = stage_headless("http://127.0.0.1:1", &manifest, &app_root)
-            .await
-            .unwrap_err();
+        let managed_err = stage_headless(&manifest, &app_root).await.unwrap_err();
         assert!(managed_err.to_string().contains("not supported on windows"));
         assert!(!app_root.exists(), "managed staging must not touch disk");
 
-        let mac_err = stage_mac_app("http://127.0.0.1:1", &manifest, &data_dir)
-            .await
-            .unwrap_err();
+        let mac_err = stage_mac_app(&manifest, &data_dir).await.unwrap_err();
         assert!(mac_err.to_string().contains("not supported on windows"));
         assert!(!data_dir.exists(), "macOS staging must not touch disk");
 
@@ -1966,6 +2222,212 @@ mod tests {
         assert!(!dir_writable(&tmp.path().join("missing")));
     }
 
+    /// A served release: `manifest.json` (version + the sha256 of `body`) for
+    /// `{base}/manifest.json`, and `body` itself for any other path, e.g. the
+    /// `{base}/artifact` the manifest names.
+    async fn serve_release(
+        version: &str,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // `Manifest` skips `base` on the wire: `fetch_latest` fills it in from
+        // the feed it resolved, so the document only needs version + files.
+        let manifest = format!(
+            r#"{{"version":"{version}","files":{{"artifact":{{"sha256":"{:x}"}}}}}}"#,
+            Sha256::digest(&body)
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (manifest, body) = (manifest.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]).to_string();
+                    let (body, kind) = if request.contains("manifest.json") {
+                        (manifest.into_bytes(), "application/json")
+                    } else {
+                        (body, "application/octet-stream")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (base, server)
+    }
+
+    fn github_release(assets: &[(&str, &str, Option<&str>)]) -> GithubRelease {
+        GithubRelease {
+            tag_name: "v0.3.0".into(),
+            assets: assets
+                .iter()
+                .map(|(name, url, digest)| GithubAsset {
+                    name: (*name).to_owned(),
+                    browser_download_url: (*url).to_owned(),
+                    digest: digest.map(str::to_owned),
+                })
+                .collect(),
+        }
+    }
+
+    const GITHUB_ASSET_BASE: &str =
+        "https://github.com/K0oRui/zeron/releases/download/v0.3.0";
+
+    #[test]
+    fn github_release_tag_names_the_version_and_assets_name_the_files() {
+        let release = github_release(&[
+            (
+                "zeron-0.3.0-linux-x86_64.tar.gz",
+                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-x86_64.tar.gz",
+                Some("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+            ),
+            (
+                "manifest.json",
+                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/manifest.json",
+                None,
+            ),
+        ]);
+        let manifest = manifest_from_release(&release, None).unwrap();
+        assert_eq!(manifest.version, "0.3.0");
+        assert_eq!(manifest.base.as_deref(), Some(GITHUB_ASSET_BASE));
+        // The checksum file is metadata, not an artifact, and the asset's own
+        // digest stands in for it.
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(
+            manifest.files["zeron-0.3.0-linux-x86_64.tar.gz"]
+                .sha256
+                .as_deref(),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            artifact_url(&manifest, "zeron-0.3.0-linux-x86_64.tar.gz").unwrap(),
+            format!("{GITHUB_ASSET_BASE}/zeron-0.3.0-linux-x86_64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn release_manifest_checksums_win_and_stray_versions_are_ignored() {
+        let release = github_release(&[(
+            "zeron-0.3.0-macos-arm64-app.tar.gz",
+            "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-macos-arm64-app.tar.gz",
+            None,
+        )]);
+        let file = |sha: &str| Manifest {
+            version: "0.3.0".into(),
+            files: [(
+                "zeron-0.3.0-macos-arm64-app.tar.gz".to_owned(),
+                FileMeta {
+                    sha256: Some(sha.to_owned()),
+                },
+            )]
+            .into(),
+            base: None,
+        };
+        let checksums = file("2222222222222222222222222222222222222222222222222222222222222222");
+        let manifest = manifest_from_release(&release, Some(&checksums)).unwrap();
+        assert_eq!(
+            manifest.files["zeron-0.3.0-macos-arm64-app.tar.gz"]
+                .sha256
+                .as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+
+        // A manifest published with a different release must not pin this one.
+        let stale = Manifest {
+            version: "0.2.0".into(),
+            ..checksums.clone()
+        };
+        let manifest = manifest_from_release(&release, Some(&stale)).unwrap();
+        assert_eq!(
+            manifest.files["zeron-0.3.0-macos-arm64-app.tar.gz"].sha256,
+            None
+        );
+
+        // An asset the manifest does not list still appears, carrying the
+        // API's digest, so the feed never loses a file.
+        let listed = Manifest {
+            version: "0.3.0".into(),
+            files: BTreeMap::new(),
+            base: None,
+        };
+        let release = github_release(&[
+            (
+                "zeron-0.3.0-linux-aarch64.tar.gz",
+                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-aarch64.tar.gz",
+                Some("sha256:3333333333333333333333333333333333333333333333333333333333333333"),
+            ),
+            (
+                "zeron-0.3.0-linux-x86_64.tar.gz",
+                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-x86_64.tar.gz",
+                None,
+            ),
+        ]);
+        let manifest = manifest_from_release(&release, Some(&listed)).unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert_eq!(
+            manifest.files["zeron-0.3.0-linux-aarch64.tar.gz"]
+                .sha256
+                .as_deref(),
+            Some("3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        assert_eq!(
+            manifest.files["zeron-0.3.0-linux-x86_64.tar.gz"].sha256,
+            None
+        );
+    }
+
+    #[test]
+    fn release_without_any_checksums_still_yields_a_usable_feed() {
+        let release = github_release(&[(
+            "zeron-0.3.0-windows-x86_64.exe",
+            "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-windows-x86_64.exe",
+            None,
+        )]);
+        let manifest = manifest_from_release(&release, None).unwrap();
+        assert_eq!(manifest.version, "0.3.0");
+        assert!(manifest.files.contains_key("zeron-0.3.0-windows-x86_64.exe"));
+        assert!(
+            artifact_url(&manifest, "zeron-0.3.0-windows-x86_64.exe")
+                .unwrap()
+                .starts_with(GITHUB_ASSET_BASE)
+        );
+    }
+
+    /// An override becomes the feed base (trailing slash dropped); with no
+    /// override the updater uses GitHub Releases, i.e. no base at all.
+    #[test]
+    fn release_feed_resolves_an_override_and_defaults_to_github() {
+        assert_eq!(
+            release_base_from(Some("https://mirror.example.com/zeron/"))
+                .unwrap()
+                .as_deref(),
+            Some("https://mirror.example.com/zeron")
+        );
+        // A blank override is "not configured", not an error.
+        assert_eq!(release_base_from(Some("   ")).unwrap(), None);
+        #[cfg(not(windows))]
+        assert_eq!(release_base_from(None).unwrap(), None);
+        // An override that cannot be a safe artifact base is rejected before
+        // any request is made.
+        assert!(release_base_from(Some("http://example.com/feed")).is_err());
+        // And the same base is what a check would fetch from.
+        assert_eq!(
+            validate_release_override("https://mirror.example.com/zeron").unwrap(),
+            "https://mirror.example.com/zeron"
+        );
+    }
+
     /// Serves `body` for every request until aborted.
     async fn serve_forever(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1992,10 +2454,13 @@ mod tests {
         (base, server)
     }
 
+    /// The configured-feed path: `{base}/manifest.json` names the release.
+    /// The feed is injected, so this touches no process state and needs no
+    /// serialisation.
     #[tokio::test]
     async fn desktop_checker_reports_a_newer_release_on_demand() {
-        let (base, server) = serve_forever(br#"{"version":"999.0.0","files":{}}"#.to_vec()).await;
-        let updater = Updater::spawn_desktop(base);
+        let (base, server) = serve_release("999.0.0", Vec::new()).await;
+        let updater = Updater::spawn_desktop_with_feed(base);
         let status = updater.check().await.unwrap();
         assert!(status.update_available);
         assert_eq!(status.latest_version.as_deref(), Some("999.0.0"));
@@ -2036,7 +2501,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         std::fs::create_dir_all(&app_root).unwrap();
-        let manifest = |bytes: &[u8]| Manifest {
+        // One manifest per served tarball: the checksum pins which bytes the
+        // staged binary must come from.
+        let manifest = |base: &str, bytes: &[u8]| Manifest {
             version: "9.9.9".into(),
             files: [(
                 headless_artifact("9.9.9"),
@@ -2045,14 +2512,15 @@ mod tests {
                 },
             )]
             .into(),
+            base: Some(base.to_owned()),
         };
 
         let wrong = fake_headless_tarball(&tmp.path().join("wrong"), "1.0.0");
-        let (base, server) = serve_forever(wrong.clone()).await;
-        let error = stage_headless(&base, &manifest(&wrong), &app_root)
+        let (wrong_base, wrong_server) = serve_forever(wrong.clone()).await;
+        let error = stage_headless(&manifest(&wrong_base, &wrong), &app_root)
             .await
             .unwrap_err();
-        server.abort();
+        wrong_server.abort();
         assert!(
             format!("{error:#}").contains("expected \"zeron 9.9.9\""),
             "unexpected error: {error:#}"
@@ -2061,11 +2529,11 @@ mod tests {
         assert_eq!(std::fs::read_dir(&app_root).unwrap().count(), 0);
 
         let right = fake_headless_tarball(&tmp.path().join("right"), "9.9.9");
-        let (base, server) = serve_forever(right.clone()).await;
-        let staged = stage_headless(&base, &manifest(&right), &app_root)
+        let (right_base, right_server) = serve_forever(right.clone()).await;
+        let staged = stage_headless(&manifest(&right_base, &right), &app_root)
             .await
             .unwrap();
-        server.abort();
+        right_server.abort();
         assert_eq!(staged, app_root.join("9.9.9"));
         assert!(staged.join("zeron").is_file());
     }

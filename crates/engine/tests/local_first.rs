@@ -334,23 +334,29 @@ async fn local_runtime_checks_public_releases_without_starting_edge_links() {
         .core()
         .updater()
         .expect("local runtime starts the public release checker");
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
 
-    updater.check_now();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while requests.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("release checker requested manifest.json and latest.txt");
+    // The release feed lives on GitHub, not on the edge: a check must produce
+    // no edge traffic at all (and none of it requires a workspace sync). It
+    // either answers or fails on a machine without network access — both are
+    // fine here, the invariant under test is the edge silence.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        updater.check(),
+    )
+    .await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "the release checker must not touch the edge"
+    );
     assert!(runtime.core().links().is_none());
 
     runtime.shutdown().await;
-    let stopped_at = requests.load(Ordering::SeqCst);
+    let status = updater.watch().borrow().clone();
     updater.check_now();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(requests.load(Ordering::SeqCst), stopped_at);
+    assert_eq!(*updater.watch().borrow(), status, "the checker kept running");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
     edge_task.abort();
 }
 
@@ -665,8 +671,8 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
 }
 
 /// Replacing a synced/online runtime must be a real ownership boundary: after
-/// `shutdown()` returns, no worker may send another Edge request (updater,
-/// room joins), and dropping the runtime must actually free
+/// `shutdown()` returns, no worker may send another Edge request (app-sign-in
+/// probes, room joins), and dropping the runtime must actually free
 /// the engine graph — the sessions ⇄ doc-host cycle and the strong-`self`
 /// worker loops previously kept a replaced runtime alive and polling forever.
 #[tokio::test]
@@ -685,8 +691,9 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
         .unwrap();
     let retired = runtime.core().doc_host.retirement_probe();
 
-    // Live traffic proof: the woken release checker (and the room joins) must
-    // be hitting the counting edge before the boundary is exercised.
+    // Live traffic proof: the room joins must be hitting the counting edge
+    // before the boundary is exercised. (The release checker is not part of
+    // this: it reads GitHub Releases, never the edge.)
     if let Some(updater) = runtime.core().updater() {
         updater.check_now();
     }
