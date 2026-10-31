@@ -28,7 +28,17 @@ for t in session_publication restart_resume side_chats codex_subagents claude_su
   tests+=(--test "$t")
 done
 
-exec cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast \
+set +e
+cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast \
   -p zeron-harness -p zeron-engine -p zeron-sync -p zeron-update -p zeron-doc -p zeron-preview \
   --features zeron-harness/native-fixture \
   --lib --bins "${tests[@]}" "$@"
+status=$?
+# TEMP-DIAGNOSTIC: surface failing tests as annotations.
+if [ "$status" -ne 0 ]; then
+  out="$(find target/nextest -name '*.stdout' -o -name '*.stderr' 2>/dev/null | head -5)"
+  for f in $out; do
+    echo "::error file=scripts/ci/test-core.sh::DIAG ${f}: $(grep -a -m 3 -E 'panicked|assertion|Error|error\[|FAILED|thread' "$f" | tr '\n' ' ' | head -c 1200)"
+  done
+fi
+exit "$status"
