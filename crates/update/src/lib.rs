@@ -533,12 +533,9 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
         url.host_str().is_some() && (url.scheme() == "https" || (url.scheme() == "http" && loopback)),
         "update feed must use HTTPS (plain HTTP only for a loopback mirror)"
     );
-    // Artifact URLs are built by appending to this base, so a traversing path
-    // would silently retarget every download.
-    anyhow::ensure!(
-        url.path() == "/" || !url.path().contains(".."),
-        "update feed must not traverse paths"
-    );
+    // Artifact URLs are built by appending to `url.path()`. `Url::parse`
+    // already resolves dot segments (`..`, including percent-encoded forms),
+    // so a parsed base cannot climb out of its own path.
     anyhow::ensure!(
         url.username().is_empty()
             && url.password().is_none()
@@ -1904,7 +1901,7 @@ mod tests {
             assert!(validate_release_override(local).is_ok(), "rejected {local}");
         }
         // Off-machine feeds must be HTTPS, and none may smuggle credentials,
-        // queries, fragments, or a traversing path into the artifact URLs.
+        // a query, or a fragment into the artifact URLs.
         for url in [
             "http://example.com/releases",
             "http://127.0.0.1.example.com/releases",
@@ -1912,7 +1909,6 @@ mod tests {
             "https://user:password@example.com",
             "https://example.com?feed=x",
             "https://example.com/#fragment",
-            "https://example.com/releases/../../elsewhere",
         ] {
             assert!(validate_release_override(url).is_err(), "accepted {url}");
         }

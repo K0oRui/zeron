@@ -28,14 +28,7 @@ for t in session_publication restart_resume side_chats codex_subagents claude_su
   tests+=(--test "$t")
 done
 
-set +e
-cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast \
+exec cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast \
   -p zeron-harness -p zeron-engine -p zeron-sync -p zeron-update -p zeron-doc -p zeron-preview \
   --features zeron-harness/native-fixture \
-  --lib --bins "${tests[@]}" "$@" 2>&1 | tee /tmp/nextest.log
-status=${PIPESTATUS[0]}
-# TEMP-DIAGNOSTIC: surface failing test names as annotations.
-grep -a -E 'FAIL \[' /tmp/nextest.log | head -5 | while IFS= read -r line; do
-  echo "::error file=scripts/ci/test-core.sh::DIAG ${line}"
-done
-exit "$status"
+  --lib --bins "${tests[@]}" "$@"
