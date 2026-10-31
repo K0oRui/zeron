@@ -453,9 +453,9 @@ async fn fetch_release_metadata_with_limits(
     let request = async {
         let response = client
             .get(url)
-            // Intermediaries must revalidate: the edge already bounds its own
-            // cache to a minute, and a proxy holding an old manifest for
-            // longer is exactly the "prompt appears late" failure.
+            // Intermediaries must revalidate: GitHub serves the release API
+            // through a short-lived cache, and a proxy holding an old answer
+            // for longer is exactly the "prompt appears late" failure.
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send()
             .await
@@ -2463,7 +2463,7 @@ mod tests {
     /// serialisation.
     #[tokio::test]
     async fn desktop_checker_reports_a_newer_release_on_demand() {
-        let (base, server) = serve_release("999.0.0", &[]).await;
+        let (base, server) = serve_release("999.0.0", Vec::new()).await;
         let updater = Updater::spawn_desktop_with_feed(base);
         let status = updater.check().await.unwrap();
         assert!(status.update_available);
