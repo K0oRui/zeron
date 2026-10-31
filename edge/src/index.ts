@@ -54,7 +54,7 @@
  *   GET  /admin/organizations[?format=csv] — ADMIN_TOKEN (every org with its members)
  *   GET|POST /admin/badges              — ADMIN_TOKEN (list / define badges)
  *   POST /admin/badges/{grant|revoke}   — ADMIN_TOKEN (give or take a badge from users)
- *   POST /admin/usernames/{set|clear}   — ADMIN_TOKEN (give or take a username)
+ *   POST /admin/usernames/{set|clear|face} — ADMIN_TOKEN (give or take a username; pick a card's scene and foil)
  *
  * Member cards (card-routes.ts):
  *   GET  /cards/:username               — pre-bearer, a card as JSON

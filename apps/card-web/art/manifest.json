@@ -450,5 +450,105 @@
         "depth": 2
       }
     ]
+  },
+  {
+    "slug": "ruins",
+    "number": 22,
+    "title": "LOST COURT",
+    "finish": "MOSS REMEMBRANCE",
+    "layers": [
+      {
+        "file": "ruins/back.webp",
+        "depth": 0
+      },
+      {
+        "file": "ruins/far.webp",
+        "depth": 1
+      },
+      {
+        "file": "ruins/near.webp",
+        "depth": 2
+      }
+    ]
+  },
+  {
+    "slug": "tram",
+    "number": 23,
+    "title": "SUMMER TRAM",
+    "finish": "SUMMER CURRENT",
+    "layers": [
+      {
+        "file": "tram/back.webp",
+        "depth": 0
+      },
+      {
+        "file": "tram/far.webp",
+        "depth": 1
+      },
+      {
+        "file": "tram/near.webp",
+        "depth": 2
+      }
+    ]
+  },
+  {
+    "slug": "rooftops",
+    "number": 24,
+    "title": "ROOFTOPS",
+    "finish": "TERRACOTTA HUSH",
+    "layers": [
+      {
+        "file": "rooftops/back.webp",
+        "depth": 0
+      },
+      {
+        "file": "rooftops/far.webp",
+        "depth": 1
+      },
+      {
+        "file": "rooftops/near.webp",
+        "depth": 2
+      }
+    ]
+  },
+  {
+    "slug": "aqueduct",
+    "number": 25,
+    "title": "STONE SPAN",
+    "finish": "PEARL PASSAGE",
+    "layers": [
+      {
+        "file": "aqueduct/back.webp",
+        "depth": 0
+      },
+      {
+        "file": "aqueduct/far.webp",
+        "depth": 1
+      },
+      {
+        "file": "aqueduct/near.webp",
+        "depth": 2
+      }
+    ]
+  },
+  {
+    "slug": "station",
+    "number": 26,
+    "title": "LAST STATION",
+    "finish": "LANTERN INTERLUDE",
+    "layers": [
+      {
+        "file": "station/back.webp",
+        "depth": 0
+      },
+      {
+        "file": "station/far.webp",
+        "depth": 1
+      },
+      {
+        "file": "station/near.webp",
+        "depth": 2
+      }
+    ]
   }
 ]

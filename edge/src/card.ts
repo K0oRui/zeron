@@ -16,7 +16,7 @@
 
 /** How many scenes a new card can draw from. Scenes are only ever appended;
  * bump this with the manifest. */
-export const CARD_SCENES = 21;
+export const CARD_SCENES = 26;
 
 export const HOLOS = ["aurora", "reverse", "secret", "starlight", "glyph"] as const;
 

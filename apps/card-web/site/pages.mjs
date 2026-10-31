@@ -21,13 +21,6 @@ export const escapeHtml = (s) =>
 
 /** The public card's keys, in the order the edge serves them; a page embeds
  * these and only these. */
-// "004·182", as the card prints it.
-const serial = (n) => {
-  const v = Math.max(0, Math.trunc(Number(n) || 0));
-  const pad = (x) => String(x % 1000).padStart(3, "0");
-  return `${pad(Math.trunc(v / 1000))}·${pad(v)}`;
-};
-
 export const PUBLIC_KEYS = ["username", "firstName", "userNumber", "joinedOn", "badges", "scene", "holo", "sky"];
 
 /** Exactly the public card: the known keys in their order, badges reduced
@@ -111,17 +104,15 @@ ${options.site ? `<meta name="twitter:site" content="${escapeHtml(options.site)}
 <meta property="og:image:alt" content="${escapeHtml(alt)}" />
 <link rel="canonical" href="${urls.page}" />
 <style>
-  main { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-rows: 1fr auto; }
-  .stage { height: min(100vh, 100dvh); min-height: 560px; }
-  footer { display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: center; align-items: baseline; padding: 0 16px 32px; color: var(--muted); font-size: 13px; }
-  footer b { color: var(--ink); font-weight: 600; }
-  footer a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--faint); }
+  /* The card alone, filling the window, nothing to scroll to. */
+  html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+  main { height: 100vh; height: 100dvh; }
+  .stage { height: 100%; }
 </style>`;
   return `${head(title, description, urls, meta)}
 <body>
 <main>
   <div class="stage" id="stage" data-mode="share"><img class="fallback" alt="${escapeHtml(alt)}" data-src="${urls.image}" /></div>
-  <footer><b>${escapeHtml(name)}</b><span>@${escapeHtml(card.username)}</span><span>${serial(card.userNumber)}</span><span>joined ${escapeHtml(card.joinedOn)}</span><a href="https://zeron.sh">zeron.sh</a></footer>
 </main>
 ${dataBlock(card)}
 <script type="module" src="${urls.page_script}"></script>

@@ -36,13 +36,13 @@
  * deleted user's URL. The scene count a card derives from (card.ts) is stored
  * on the user at their first name, not with the name: a rename or a new claim
  * after an operator's clear keeps the card. Operators set or clear names at
- * `POST /admin/usernames/{set|clear}`.
+ * `POST /admin/usernames/{set|clear|face}`.
  *
  * Writes are one row per sign-up or profile change, so a single instance is
  * not a hotspot.
  */
 import { DurableObject } from "cloudflare:workers";
-import { CARD_SCENES, cardFirstName, deriveCard, type CardFace } from "./card";
+import { CARD_SCENES, HOLOS, cardFirstName, deriveCard, type CardFace, type Holo } from "./card";
 import { forgetCard } from "./card-cache";
 import type { Env } from "./env";
 import { json, jsonError } from "./http";
@@ -208,6 +208,9 @@ export class UserDirectory extends DurableObject<Env> {
     this.ctx.storage.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_by_number ON users (user_number)");
     this.numberUsers();
     if (!columns.includes("card_scenes")) this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN card_scenes INTEGER");
+    // An operator's choice of scene and foil for a card (null: the seed's).
+    if (!columns.includes("card_scene")) this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN card_scene INTEGER");
+    if (!columns.includes("card_holo")) this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN card_holo TEXT");
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS usernames (
       username TEXT PRIMARY KEY, user_id TEXT NOT NULL, claimed_at INTEGER NOT NULL, retired_at INTEGER,
       CHECK (length(username) BETWEEN 3 AND 20 AND username GLOB '[a-z0-9]*' AND username NOT GLOB '*[^a-z0-9_-]*'))`);
@@ -461,6 +464,15 @@ export class UserDirectory extends DurableObject<Env> {
     });
   }
 
+  /** An operator picks a card's scene and foil, over what its seed gives
+   * (null puts that one back to the seed's). Answers the user's name, or
+   * undefined if the user isn't a live directory user. */
+  setCardFace(userId: string, scene: number | null, holo: Holo | null): string | null | undefined {
+    if (this.userRefusal(userId)) return undefined;
+    this.ctx.storage.sql.exec("UPDATE users SET card_scene = ?, card_holo = ? WHERE user_id = ?", scene, holo, userId);
+    return this.username(userId);
+  }
+
   /** An operator takes a user's name away. It stays retired unless `release`
    * frees it for someone else. Answers the name, or null if they held none. */
   clearUsername(userId: string, release: boolean): string | null {
@@ -475,7 +487,7 @@ export class UserDirectory extends DurableObject<Env> {
   card(username: string): PublicCard | undefined {
     const [row] = this.ctx.storage.sql
       .exec(
-        `SELECT u.user_id, u.user_number, u.first_name, u.created_at, u.card_scenes
+        `SELECT u.user_id, u.user_number, u.first_name, u.created_at, u.card_scenes, u.card_scene, u.card_holo
          FROM usernames n JOIN users u ON u.user_id = n.user_id
          WHERE n.username = ? AND n.retired_at IS NULL AND u.deleted_at IS NULL`,
         username
@@ -490,7 +502,10 @@ export class UserDirectory extends DurableObject<Env> {
       )
       .toArray();
     // Field by field, never spread from a row: a new column must not go public.
-    const { scene, holo, sky } = deriveCard(row.user_id as string, row.card_scenes as number);
+    const seeded = deriveCard(row.user_id as string, row.card_scenes as number);
+    const scene = row.card_scene === null ? seeded.scene : (row.card_scene as number);
+    const holo = row.card_holo === null ? seeded.holo : (row.card_holo as Holo);
+    const sky = seeded.sky;
     return {
       username,
       firstName: cardFirstName(row.first_name as string | null, username),
@@ -867,17 +882,33 @@ const handleBadgeRoute = async (
  *                                     allowed here, retired ones are not
  *   POST /clear {userId, release?}  — answers {cleared}, the name taken away.
  *                                     It stays retired unless `release` frees it.
+ *   POST /face  {userId, scene, holo} — an operator's pick of the card's scene
+ *                                     (0-based) and foil over the seed's; null
+ *                                     puts either back. Answers the card.
  */
 const handleUsernameAdminRoute = async (
   request: Request,
   directory: DurableObjectStub<UserDirectory>,
   action: string
 ): Promise<Response> => {
-  if (action !== "set" && action !== "clear") return jsonError(404, "not_found", "Not found.");
+  if (action !== "set" && action !== "clear" && action !== "face") return jsonError(404, "not_found", "Not found.");
   if (request.method !== "POST") return jsonError(405, "method_not_allowed", "POST only.");
   const body = await readJson(request);
   const userId = body?.userId;
   if (typeof userId !== "string" || !USER_ID_RE.test(userId)) return jsonError(400, "bad_request", "Expected {userId, …}.");
+  if (action === "face") {
+    const scene: unknown = body?.scene ?? null;
+    const holo: unknown = body?.holo ?? null;
+    if (scene !== null && !(typeof scene === "number" && Number.isInteger(scene) && scene >= 0 && scene < CARD_SCENES))
+      return jsonError(400, "bad_request", `Expected scene: null or 0–${CARD_SCENES - 1}.`);
+    if (holo !== null && !(HOLOS as readonly unknown[]).includes(holo))
+      return jsonError(400, "bad_request", `Expected holo: null or one of ${HOLOS.join(", ")}.`);
+    const username = await directory.setCardFace(userId, scene as number | null, holo as Holo | null);
+    if (username === undefined) return jsonError(404, "unknown_user", "That user isn't in the directory.");
+    if (!username) return json({ username: null });
+    await forgetCard(username);
+    return json(await directory.card(username));
+  }
   if (action === "clear") {
     const cleared = await directory.clearUsername(userId, body?.release === true);
     if (cleared) await forgetCard(cleared);
@@ -896,7 +927,7 @@ const handleUsernameAdminRoute = async (
 /**
  * `POST /workos/webhook` (WorkOS-signed, no bearer), `GET /admin/users`,
  * `GET /admin/organizations`, `/admin/badges[/grant|/revoke]` and
- * `/admin/usernames/{set|clear}` (ADMIN_TOKEN) — routed BEFORE the bearer gate. Events other than the created, updated and
+ * `/admin/usernames/{set|clear|face}` (ADMIN_TOKEN) — routed BEFORE the bearer gate. Events other than the created, updated and
  * deleted of users, organizations and memberships are acknowledged so WorkOS
  * stops retrying.
  */
