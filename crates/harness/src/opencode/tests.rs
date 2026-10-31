@@ -1220,7 +1220,7 @@ fn reasoning_ahead_of_its_message_role_is_held_and_replayed() {
     assert_eq!(feed.pending_parts.len(), 1);
     // The role lands; replay drains the held part.
     feed.assistant_messages.insert("msg_a".into(), true);
-    let mut turn = TurnState::begin(None, false);
+    let mut turn = TurnState::begin(None, None, false);
     let events = replay_pending(&mut feed, "msg_a", true, &mut turn);
     assert!(matches!(
         events.as_slice(),
@@ -1589,7 +1589,41 @@ fn canonical_command_removed_after_discovery_is_not_downgraded_to_prompt_text() 
 fn stall_env_and_startup_env_parse() {
     // Defaults (no env in test runner): bounded stall, 300s startup.
     assert_eq!(stall_bound(), Some(DEFAULT_STALL_BOUND));
+    assert_eq!(turn_stall_bound(), Some(DEFAULT_TURN_STALL_BOUND));
     assert_eq!(startup_timeout(), DEFAULT_STARTUP_TIMEOUT);
+}
+
+/// The two clocks are separate on purpose: the short one only covers a run
+/// that never starts, the long one only covers a turn that went quiet after
+/// it did. A single clock would either kill long silent tool runs or leave a
+/// wedged session (opencode #53747) spinning forever.
+#[tokio::test]
+async fn the_silence_ceiling_rearms_on_every_event() {
+    let short = Duration::from_secs(60);
+    let long = Duration::from_secs(900);
+    let mut turn = TurnState::begin(Some(short), Some(long), false);
+    assert!(turn.stall_deadline.is_some(), "first-event clock starts armed");
+    assert!(
+        turn.silence_deadline.is_none(),
+        "the mid-turn clock waits for activity"
+    );
+
+    turn.note_activity();
+    let first = turn.silence_deadline.expect("activity arms the ceiling");
+    assert!(turn.stall_deadline.is_none(), "first-event clock disarms");
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    turn.note_activity();
+    let second = turn.silence_deadline.expect("still armed");
+    assert!(second > first, "every event must push the ceiling out");
+}
+
+#[tokio::test]
+async fn a_disabled_silence_ceiling_leaves_the_turn_open() {
+    let mut turn = TurnState::begin(None, None, false);
+    turn.note_activity();
+    assert!(turn.stall_deadline.is_none());
+    assert!(turn.silence_deadline.is_none());
 }
 
 #[test]

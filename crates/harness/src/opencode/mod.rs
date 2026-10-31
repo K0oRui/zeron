@@ -59,8 +59,12 @@
 //! Attempt ≥ [`RETRY_REPORT_ATTEMPT`] surfaces an error chip; attempt ≥
 //! [`RETRY_ABORT_ATTEMPT`] aborts the turn instead of retrying forever.
 //! A prompt that produces NO session-scoped event within
-//! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) of the
-//! server accepting it errors out instead of spinning "Working" forever.
+//! [`stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) of the
+//! server accepting it errors out instead of spinning "Working" forever, and
+//! a turn that started and then went quiet past [`DEFAULT_TURN_STALL_BOUND`]
+//! (`ZERON_OPENCODE_TURN_STALL_MS`, 0 disables) ends the same way: opencode
+//! can lose a provider stream and leave the session `busy` with no terminal
+//! event at all (its #53747, #51291, #59559).
 //! Both wires report busy within milliseconds of accepting a prompt, before
 //! any provider bootstrap, so a slow first turn never trips it (verified
 //! live, 1.18.31 and 2.1.2). A server process that dies is noticed within
@@ -179,10 +183,25 @@ const RETRY_ABORT_ATTEMPT: u64 = 8;
 const DEFAULT_STALL_BOUND: Duration = Duration::from_secs(60);
 const STALL_ENV: &str = "ZERON_OPENCODE_STALL_MS";
 
+/// Ceiling on silence *inside* a live turn, re-armed by every event. The
+/// first-event bound above only covers a run that never starts; this one
+/// covers the turn that dies after its stream began and never sends a
+/// terminal frame, leaving the session `busy` forever (opencode #53747,
+/// #51291, #59559). Long enough that an ordinary silent tool run, such as a
+/// full build, does not trip it.
+const DEFAULT_TURN_STALL_BOUND: Duration = Duration::from_secs(15 * 60);
+const TURN_STALL_ENV: &str = "ZERON_OPENCODE_TURN_STALL_MS";
+
 /// What a wedged/silent run usually means for opencode.
 const STALL_HINT: &str = "The model provider is likely unreachable or rejecting requests. \
      Check the model/provider setup (`opencode auth list`, opencode.json) or the opencode \
      log (~/.local/share/opencode/log).";
+
+/// A turn that stopped emitting mid-stream is an opencode failure, not a
+/// provider one, so it gets its own advice.
+const TURN_STALL_HINT: &str = "opencode can leave a session busy with no terminal event when \
+     its provider stream dies, so the turn was ended here instead of spinning forever. Send the \
+     prompt again, or raise the ceiling with ZERON_OPENCODE_TURN_STALL_MS (0 disables it).";
 
 fn startup_timeout() -> Duration {
     std::env::var(STARTUP_TIMEOUT_ENV)
@@ -193,15 +212,23 @@ fn startup_timeout() -> Duration {
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
 }
 
-fn stall_bound() -> Option<Duration> {
-    match std::env::var(STALL_ENV) {
+fn env_bound(name: &str, default: Duration) -> Option<Duration> {
+    match std::env::var(name) {
         Ok(v) => match v.parse::<u64>() {
             Ok(0) => None,
             Ok(ms) => Some(Duration::from_millis(ms)),
-            Err(_) => Some(DEFAULT_STALL_BOUND),
+            Err(_) => Some(default),
         },
-        Err(_) => Some(DEFAULT_STALL_BOUND),
+        Err(_) => Some(default),
     }
+}
+
+fn stall_bound() -> Option<Duration> {
+    env_bound(STALL_ENV, DEFAULT_STALL_BOUND)
+}
+
+fn turn_stall_bound() -> Option<Duration> {
+    env_bound(TURN_STALL_ENV, DEFAULT_TURN_STALL_BOUND)
 }
 
 fn opencode_install_paths() -> Vec<PathBuf> {
@@ -2173,6 +2200,10 @@ struct TurnState {
     aborted_for_retry: bool,
     /// Deadline for the first session-scoped event after the prompt.
     stall_deadline: Option<tokio::time::Instant>,
+    /// Ceiling for silence inside a live turn. Every event re-arms it, so it
+    /// only fires when the turn went quiet and never came back.
+    silence_bound: Option<Duration>,
+    silence_deadline: Option<tokio::time::Instant>,
     /// The prompt POST has not been answered yet. The stall clock waits for
     /// it: a server slow to admit a prompt (a contended database on Windows)
     /// has not yet had the chance to make progress, and the POST is bounded
@@ -2235,7 +2266,7 @@ fn selected_native_command(prompt: &str, harness: HarnessId) -> bool {
 impl TurnState {
     /// `prompt_in_flight`: [`post_prompt`] posted a prompt whose acceptance
     /// will be reported (a native command reports only failure).
-    fn begin(stall: Option<Duration>, prompt_in_flight: bool) -> Self {
+    fn begin(stall: Option<Duration>, silence: Option<Duration>, prompt_in_flight: bool) -> Self {
         Self {
             prompt_in_flight,
             active: true,
@@ -2249,6 +2280,8 @@ impl TurnState {
             retry_reported: false,
             aborted_for_retry: false,
             stall_deadline: stall.map(|d| tokio::time::Instant::now() + d),
+            silence_bound: silence,
+            silence_deadline: None,
             open_tools: Default::default(),
             preempted: false,
         }
@@ -2257,6 +2290,9 @@ impl TurnState {
     fn note_activity(&mut self) {
         self.saw_activity = true;
         self.stall_deadline = None;
+        self.silence_deadline = self
+            .silence_bound
+            .map(|bound| tokio::time::Instant::now() + bound);
     }
 }
 
@@ -2486,6 +2522,7 @@ async fn run_session(session: Session) {
         );
     }
     let stall = stall_bound();
+    let silence = turn_stall_bound();
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<TurnUpdate>();
     let mut turn_generation = 0_u64;
     // The live prompt's delivery: a stop or interrupt cancels it, so a
@@ -2535,7 +2572,7 @@ async fn run_session(session: Session) {
             return;
         }
     };
-    let mut turn = TurnState::begin(stall, awaiting_ack);
+    let mut turn = TurnState::begin(stall, silence, awaiting_ack);
     let mut server_poll = tokio::time::interval(SERVER_POLL);
     server_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Permission and question ids already handled: a reconnect's sweep
@@ -2664,7 +2701,7 @@ async fn run_session(session: Session) {
                 };
                 match sent {
                     Ok(awaiting_ack) => {
-                        turn = TurnState::begin(stall, awaiting_ack);
+                        turn = TurnState::begin(stall, silence, awaiting_ack);
                         continue $label;
                     }
                     Err(e) => {
@@ -2840,13 +2877,18 @@ async fn run_session(session: Session) {
     }
 
     'main: loop {
-        // The stall watchdog only arms while a turn awaits its first sign of
-        // life; a running tool's silence never trips it (events already
-        // proved the turn alive and disarmed it). Computed by value each
-        // iteration so the future doesn't hold a borrow of `turn`.
+        // Two clocks, one timer. Before the first sign of life the short
+        // stall bound decides a run that never started; after it, the long
+        // silence ceiling decides a turn that stopped mid-stream and never
+        // reported a result. Computed by value each iteration so the future
+        // doesn't hold a borrow of `turn`.
         let deadline = abort_deadline.or_else(|| {
-            (turn.active && !turn.saw_activity && !turn.prompt_in_flight)
-                .then_some(turn.stall_deadline)
+            (turn.active && !turn.prompt_in_flight)
+                .then_some(if turn.saw_activity {
+                    turn.silence_deadline
+                } else {
+                    turn.stall_deadline
+                })
                 .flatten()
         });
         let stall_sleep = async {
@@ -3073,7 +3115,7 @@ async fn run_session(session: Session) {
                                 Err(e) => Err(e),
                             };
                             match sent {
-                                Ok(awaiting_ack) => turn = TurnState::begin(stall, awaiting_ack),
+                                Ok(awaiting_ack) => turn = TurnState::begin(stall, silence, awaiting_ack),
                                 Err(error) => {
                                     let message = error.to_string();
                                     let _ = send(
@@ -3129,10 +3171,40 @@ async fn run_session(session: Session) {
                     done_sent = true;
                     break 'main;
                 }
-                let message = format!(
-                    "opencode made no progress for {}s after the prompt. {STALL_HINT}",
-                    stall.unwrap_or(DEFAULT_STALL_BOUND).as_secs()
-                );
+                // Silence can be legitimate: a question panel, or a
+                // permission the mode puts to the person, holds the turn open
+                // while they decide. Re-arm instead of ending a run somebody
+                // is still looking at.
+                if turn.saw_activity {
+                    let sessions: Vec<String> = std::iter::once(session_id.clone())
+                        .chain(children.keys().cloned())
+                        .chain(unbound_children.keys().cloned())
+                        .collect();
+                    let waiting = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        server.pending_requests(&sessions, dir),
+                    )
+                    .await
+                    .map(|pending| !pending.is_empty())
+                    .unwrap_or(false);
+                    if waiting {
+                        turn.silence_deadline =
+                            silence.map(|bound| tokio::time::Instant::now() + bound);
+                        continue 'main;
+                    }
+                }
+                let message = if turn.saw_activity {
+                    format!(
+                        "opencode went silent for {}s mid-turn and never reported a result. \
+                         {TURN_STALL_HINT}",
+                        silence.unwrap_or(DEFAULT_TURN_STALL_BOUND).as_secs()
+                    )
+                } else {
+                    format!(
+                        "opencode made no progress for {}s after the prompt. {STALL_HINT}",
+                        stall.unwrap_or(DEFAULT_STALL_BOUND).as_secs()
+                    )
+                };
                 let _ = send(&event_tx, AgentEvent::Error { message: message.clone() }).await;
                 let _ = tokio::time::timeout(
                     Duration::from_secs(5),
