@@ -590,10 +590,7 @@ impl Pump {
     async fn run(mut self, mut source: Source) {
         loop {
             let ended = match source {
-                Source::Direct(link) => {
-                    self.path.send_replace(TerminalPath::Direct);
-                    self.pump_direct(link).await
-                }
+                Source::Direct(link) => self.pump_direct(link).await,
                 Source::Relay(stream) => {
                     self.path.send_replace(TerminalPath::Relay);
                     self.pump_relay(stream).await
@@ -654,6 +651,10 @@ impl Pump {
             mut acks,
         } = link;
         self.hub.attach_writer(&self.key, self.id, outgoing);
+        // Only now does the path say Direct: a write racing this switch still
+        // has to fall back to the relay, so publishing earlier would report a
+        // link that cannot yet take keystrokes.
+        self.path.send_replace(TerminalPath::Direct);
         let ended = loop {
             tokio::select! {
                 event = events.recv() => {
