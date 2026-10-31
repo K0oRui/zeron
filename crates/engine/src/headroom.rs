@@ -50,9 +50,10 @@ pub const PROVIDERS: [HarnessId; 6] = [
 /// it whatever the preference says. Settings names them instead of letting
 /// the routed list imply full coverage (`Mock` is test-only and stays out of
 /// both lists).
-pub const UNROUTED: [HarnessId; 5] = [
+pub const UNROUTED: [HarnessId; 6] = [
     HarnessId::Devin,
     HarnessId::Hermes,
+    HarnessId::Fx,
     HarnessId::Pi,
     HarnessId::Kilo,
     HarnessId::Muse,
