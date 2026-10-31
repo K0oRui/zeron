@@ -192,7 +192,17 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 ///    `https://github.com/<repo>/releases/download/<tag>/<file>` URLs. A
 ///    `manifest.json` asset, when the workflow attached one, supplies checksums.
 pub async fn fetch_latest() -> anyhow::Result<Manifest> {
-    let Some(base) = release_base()? else {
+    fetch_latest_from(None).await
+}
+
+/// [`fetch_latest`] with the feed base supplied instead of resolved from the
+/// environment — what the checker's own tests drive.
+async fn fetch_latest_from(base: Option<String>) -> anyhow::Result<Manifest> {
+    let resolved = match base {
+        Some(base) => Some(validate_release_override(&base)?),
+        None => release_base()?,
+    };
+    let Some(base) = resolved else {
         return fetch_github_latest().await;
     };
     let client = http_client()?;
@@ -555,10 +565,15 @@ const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/K0oRui/zeron/rel
 /// A configured release feed — the whole tree under it (`manifest.json`,
 /// `latest.txt`, the artifacts). `None` = the GitHub Releases feed.
 fn release_base() -> anyhow::Result<Option<String>> {
-    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+    release_base_from(std::env::var("ZERON_RELEASES_URL").ok().as_deref())
+}
+
+/// [`release_base`] with the `ZERON_RELEASES_URL` override supplied (or not).
+fn release_base_from(override_url: Option<&str>) -> anyhow::Result<Option<String>> {
+    if let Some(url) = override_url
         && !url.trim().is_empty()
     {
-        return validate_release_override(&url).map(Some);
+        return validate_release_override(url).map(Some);
     }
     #[cfg(windows)]
     if let Some(url) = windows::release_url()? {
@@ -1294,6 +1309,9 @@ enum Role {
 #[derive(Clone)]
 pub struct Updater {
     role: Arc<Role>,
+    /// Explicit feed base; `None` = resolve `ZERON_RELEASES_URL` / the Windows
+    /// package's config / GitHub Releases at check time. Only tests set it.
+    feed: Option<String>,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     /// Wakes the loop; `forced` says whether the wake demands a check or only
     /// a fresh look at the wall clock.
@@ -1311,16 +1329,23 @@ pub struct Updater {
 impl Updater {
     /// Spawn the engine's check loop (must run on a tokio runtime).
     pub fn spawn(quiescent: Option<QuiescentCheck>) -> Self {
-        Self::spawn_role(Role::Engine { quiescent })
+        Self::spawn_role(Role::Engine { quiescent }, None)
     }
 
     /// Spawn the desktop app's report-only check loop (must run on a tokio
     /// runtime).
     pub fn spawn_desktop() -> Self {
-        Self::spawn_role(Role::Desktop)
+        Self::spawn_role(Role::Desktop, None)
     }
 
-    fn spawn_role(role: Role) -> Self {
+    /// A desktop checker pinned to a feed: the crate's own tests serve a
+    /// release locally instead of publishing one.
+    #[cfg(test)]
+    fn spawn_desktop_with_feed(feed: String) -> Self {
+        Self::spawn_role(Role::Desktop, Some(feed))
+    }
+
+    fn spawn_role(role: Role, feed: Option<String>) -> Self {
         let initial_delay = match role {
             Role::Engine { .. } => ENGINE_INITIAL_DELAY,
             Role::Desktop => DESKTOP_INITIAL_DELAY,
@@ -1330,6 +1355,7 @@ impl Updater {
         let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
             role: Arc::new(role),
+            feed,
             status_tx: Arc::new(status_tx),
             wake_tx: Arc::new(wake_tx),
             forced: Arc::new(AtomicBool::new(false)),
@@ -1396,7 +1422,7 @@ impl Updater {
     /// One user-requested check, awaited: publishes the result like a
     /// scheduled check and returns it.
     pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
-        match fetch_latest().await {
+        match fetch_latest_from(self.feed.clone()).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 Ok(self.status_tx.borrow().clone())
@@ -1464,7 +1490,7 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest().await {
+            match fetch_latest_from(self.feed.clone()).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
                     if let Err(err) = stage_headless(&manifest, &app_root).await {
                         tracing::warn!(error = %err, "auto-update staging failed");
@@ -1531,7 +1557,7 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        match fetch_latest().await {
+        match fetch_latest_from(self.feed.clone()).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 true
@@ -1564,7 +1590,7 @@ impl Updater {
                  source builds update via git"
             );
         };
-        let manifest = fetch_latest().await?;
+        let manifest = fetch_latest_from(self.feed.clone()).await?;
         if !version_newer(&manifest.version, current_version()) {
             bail!("already up to date ({})", current_version());
         }
@@ -2200,10 +2226,9 @@ mod tests {
         assert!(!dir_writable(&tmp.path().join("missing")));
     }
 
-    /// A served release: `manifest.json` for `{base}` (which carries the
-    /// artifact `base` in its JSON, since the feed override can only hold an
-    /// HTTPS URL) and `body` at `{base}/artifact` — the file the manifest
-    /// claims a sha256 for.
+    /// A served release: `manifest.json` (version + the sha256 of `body`) for
+    /// `{base}/manifest.json`, and `body` itself for any other path, e.g. the
+    /// `{base}/artifact` the manifest names.
     async fn serve_release(
         version: &str,
         body: Vec<u8>,
@@ -2383,19 +2408,28 @@ mod tests {
         );
     }
 
-    /// A configured feed is parsed through the same HTTPS-only validation as
-    /// any other; with none configured the updater uses GitHub Releases.
+    /// An override becomes the feed base (trailing slash dropped); with no
+    /// override the updater uses GitHub Releases, i.e. no base at all.
     #[test]
-    fn release_feed_defaults_to_github_and_honours_an_override() {
+    fn release_feed_resolves_an_override_and_defaults_to_github() {
         assert_eq!(
-            validate_release_override("https://mirror.example.com/zeron/").unwrap(),
+            release_base_from(Some("https://mirror.example.com/zeron/"))
+                .unwrap()
+                .as_deref(),
+            Some("https://mirror.example.com/zeron")
+        );
+        // A blank override is "not configured", not an error.
+        assert_eq!(release_base_from(Some("   ")).unwrap(), None);
+        #[cfg(not(windows))]
+        assert_eq!(release_base_from(None).unwrap(), None);
+        // An override that cannot be a safe artifact base is rejected before
+        // any request is made.
+        assert!(release_base_from(Some("http://example.com/feed")).is_err());
+        // And the same base is what a check would fetch from.
+        assert_eq!(
+            validate_release_override("https://mirror.example.com/zeron").unwrap(),
             "https://mirror.example.com/zeron"
         );
-        // Unix binaries carry no feed of their own: absent an override the
-        // feed is GitHub Releases (`release_base()` reports "not configured").
-        // Windows reads `zeron-update.json`, which only a packaged install has.
-        #[cfg(not(windows))]
-        assert_eq!(release_base().unwrap(), None);
     }
 
     /// Serves `body` for every request until aborted.
@@ -2424,27 +2458,14 @@ mod tests {
         (base, server)
     }
 
-    /// The configured-feed path (`ZERON_RELEASES_URL` on Unix, the Windows
-    /// package's `zeron-update.json`): `{base}/manifest.json` names the release
-    /// and where its artifacts live. This is the one test that takes the
-    /// process-wide feed override.
-    #[cfg(not(windows))]
+    /// The configured-feed path: `{base}/manifest.json` names the release.
+    /// The feed is injected, so this touches no process state and needs no
+    /// serialisation.
     #[tokio::test]
     async fn desktop_checker_reports_a_newer_release_on_demand() {
         let (base, server) = serve_release("999.0.0", &[]).await;
-        let previous = std::env::var_os("ZERON_RELEASES_URL");
-        // SAFETY: single-threaded setup/teardown around the check below, and
-        // no other test in this crate sets this variable.
-        unsafe { std::env::set_var("ZERON_RELEASES_URL", &base) };
-        let updater = Updater::spawn_desktop();
-        let status = updater.check().await;
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ZERON_RELEASES_URL", value),
-                None => std::env::remove_var("ZERON_RELEASES_URL"),
-            }
-        }
-        let status = status.unwrap();
+        let updater = Updater::spawn_desktop_with_feed(base);
+        let status = updater.check().await.unwrap();
         assert!(status.update_available);
         assert_eq!(status.latest_version.as_deref(), Some("999.0.0"));
         assert_eq!(status.current_version, current_version());
