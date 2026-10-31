@@ -21,7 +21,9 @@ No necesitas cuenta ni conexión a internet; las sesiones se quedan en tu dispos
 Para servidores y otras máquinas sin pantalla, como un VPS que mantiene los agentes en ejecución después de cerrar tu portátil. Solo Linux:
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+# download zeron-<version>-linux-<arch>.tar.gz from GitHub Releases, then:
+tar -xzf zeron-<version>-linux-<arch>.tar.gz
+./zeron-<version>-linux-<arch>/install.sh
 zeron status
 ```
 

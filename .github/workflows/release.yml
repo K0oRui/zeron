@@ -1,17 +1,18 @@
 name: release
 
-# Build release artifacts and publish them:
+# Build release artifacts and publish them to this repository's GitHub Release:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package/package-macos.sh
 #   - Windows per-user installer, portable zip, and updater exe (x86_64) via
 #     scripts/package/package-windows.ps1
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
-# `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
+# The release is the only release feed: the in-app updater reads
+# api.github.com/repos/<repo>/releases/latest and downloads the assets through
+# their github.com release URLs, and manifest.json below supplies the sha256 it
+# verifies them against. Nothing is mirrored to R2 or zeron.sh any more.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+# workflow_dispatch (builds + uploads artifacts, no release publish).
 
 on:
   push:
@@ -47,7 +48,9 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: package
-        run: scripts/package/package-linux.sh
+        # `bash <script>`, never the bare path: the checkout's exec bit is not
+        # something a release can depend on.
+        run: bash scripts/package/package-linux.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ runner.arch }}
@@ -106,7 +109,8 @@ jobs:
             echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
           } >>"$GITHUB_ENV"
       - name: package dmg
-        run: scripts/package/package-macos.sh
+        # See the Linux job: run the script through bash, not its exec bit.
+        run: bash scripts/package/package-macos.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ runner.arch }}
@@ -168,14 +172,19 @@ jobs:
           done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: updater manifest
+        # manifest.json is the updater's checksum source: the in-app update
+        # checks (crates/update) read it from this release and verify every
+        # artifact against its sha256 before installing.
         run: |
           manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
           for f in dist/*; do
+            [ -f "$f" ] || continue
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
-          printf '%s' "$manifest" > manifest.json
+          printf '%s\n' "$manifest" > manifest.json
+          cat manifest.json
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
