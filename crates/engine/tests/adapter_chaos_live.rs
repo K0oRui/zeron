@@ -18,6 +18,9 @@
 //! `ZERON_TEST_HARNESS`: claude | codex | cursor | opencode | grok | devin |
 //! pi | hermes | antigravity. `restart_durability` covers quitting and
 //! force-killing the app mid-turn (same environment variables).
+
+#![cfg(unix)]
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
