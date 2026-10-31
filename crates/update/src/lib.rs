@@ -508,9 +508,20 @@ fn http_client_with_timeouts(connect: Duration, read: Duration) -> anyhow::Resul
 
 fn validate_release_override(value: &str) -> anyhow::Result<String> {
     let url = reqwest::Url::parse(value.trim()).context("invalid update feed URL")?;
+    // HTTPS everywhere, except a loopback feed: that traffic never leaves the
+    // machine, so TLS there buys nothing and would only block local mirrors
+    // and the tests that serve a release from 127.0.0.1.
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
     anyhow::ensure!(
-        url.scheme() == "https" && url.host_str().is_some(),
-        "update feed must use HTTPS"
+        url.host_str().is_some() && (url.scheme() == "https" || (url.scheme() == "http" && loopback)),
+        "update feed must use HTTPS (plain HTTP only for a loopback mirror)"
     );
     // Artifact URLs are built by appending to this base, so a traversing path
     // would silently retarget every download.
@@ -1862,12 +1873,20 @@ mod tests {
             validate_release_override(" https://example.com/releases/ ").unwrap(),
             "https://example.com/releases"
         );
+        // Loopback mirrors may use plain HTTP (a LAN-less local feed).
+        for local in ["http://127.0.0.1:8080", "http://localhost:8080/x", "http://[::1]:8080"] {
+            assert!(validate_release_override(local).is_ok(), "rejected {local}");
+        }
+        // Off-machine feeds must be HTTPS, and none may smuggle credentials,
+        // queries, fragments, or a traversing path into the artifact URLs.
         for url in [
             "http://example.com/releases",
+            "http://127.0.0.1.example.com/releases",
             "file:///tmp/update",
             "https://user:password@example.com",
             "https://example.com?feed=x",
             "https://example.com/#fragment",
+            "https://example.com/releases/../../elsewhere",
         ] {
             assert!(validate_release_override(url).is_err(), "accepted {url}");
         }
@@ -2181,33 +2200,50 @@ mod tests {
         assert!(!dir_writable(&tmp.path().join("missing")));
     }
 
-    /// Points the release feed at a local server for the test's lifetime:
-    /// the override is process-wide, so tests holding one are serialised.
-    struct FeedOverride {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl FeedOverride {
-        fn set(base: &str) -> Self {
-            static FEED: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let guard = FEED.lock().unwrap_or_else(|err| err.into_inner());
-            let previous = std::env::var_os("ZERON_RELEASES_URL");
-            unsafe { std::env::set_var("ZERON_RELEASES_URL", base) };
-            Self {
-                _guard: guard,
-                previous,
+    /// A served release: `manifest.json` for `{base}` (which carries the
+    /// artifact `base` in its JSON, since the feed override can only hold an
+    /// HTTPS URL) and `body` at `{base}/artifact` — the file the manifest
+    /// claims a sha256 for.
+    async fn serve_release(
+        version: &str,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // `Manifest` skips `base` on the wire: `fetch_latest` fills it in from
+        // the feed it resolved, so the document only needs version + files.
+        let manifest = format!(
+            r#"{{"version":"{version}","files":{{"artifact":{{"sha256":"{:x}"}}}}}}"#,
+            Sha256::digest(&body)
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (manifest, body) = (manifest.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]).to_string();
+                    let (body, kind) = if request.contains("manifest.json") {
+                        (manifest.into_bytes(), "application/json")
+                    } else {
+                        (body, "application/octet-stream")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
             }
-        }
-    }
-
-    impl Drop for FeedOverride {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("ZERON_RELEASES_URL", value) },
-                None => unsafe { std::env::remove_var("ZERON_RELEASES_URL") },
-            }
-        }
+        });
+        (base, server)
     }
 
     fn github_release(assets: &[(&str, &str, Option<&str>)]) -> GithubRelease {
@@ -2347,18 +2383,17 @@ mod tests {
         );
     }
 
-    /// No configured feed means GitHub is the feed; an override replaces it.
+    /// A configured feed is parsed through the same HTTPS-only validation as
+    /// any other; with none configured the updater uses GitHub Releases.
     #[test]
     fn release_feed_defaults_to_github_and_honours_an_override() {
-        let feed = FeedOverride::set("https://mirror.example.com/zeron/");
         assert_eq!(
-            release_base().unwrap().as_deref(),
-            Some("https://mirror.example.com/zeron")
+            validate_release_override("https://mirror.example.com/zeron/").unwrap(),
+            "https://mirror.example.com/zeron"
         );
-        drop(feed);
-        // Unix binaries carry no feed override of their own, so the default
-        // (GitHub Releases) applies. Windows reads `zeron-update.json`, which
-        // only exists in a packaged install.
+        // Unix binaries carry no feed of their own: absent an override the
+        // feed is GitHub Releases (`release_base()` reports "not configured").
+        // Windows reads `zeron-update.json`, which only a packaged install has.
         #[cfg(not(windows))]
         assert_eq!(release_base().unwrap(), None);
     }
@@ -2389,15 +2424,27 @@ mod tests {
         (base, server)
     }
 
-    /// The configured-feed path (`ZERON_RELEASES_URL`): `{base}/manifest.json`
-    /// names the release and its artifact directory. Serialised because the
-    /// feed override is process-wide state.
+    /// The configured-feed path (`ZERON_RELEASES_URL` on Unix, the Windows
+    /// package's `zeron-update.json`): `{base}/manifest.json` names the release
+    /// and where its artifacts live. This is the one test that takes the
+    /// process-wide feed override.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn desktop_checker_reports_a_newer_release_on_demand() {
-        let (base, server) = serve_forever(br#"{"version":"999.0.0","files":{}}"#.to_vec()).await;
-        let _feed = FeedOverride::set(&base);
+        let (base, server) = serve_release("999.0.0", &[]).await;
+        let previous = std::env::var_os("ZERON_RELEASES_URL");
+        // SAFETY: single-threaded setup/teardown around the check below, and
+        // no other test in this crate sets this variable.
+        unsafe { std::env::set_var("ZERON_RELEASES_URL", &base) };
         let updater = Updater::spawn_desktop();
-        let status = updater.check().await.unwrap();
+        let status = updater.check().await;
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ZERON_RELEASES_URL", value),
+                None => std::env::remove_var("ZERON_RELEASES_URL"),
+            }
+        }
+        let status = status.unwrap();
         assert!(status.update_available);
         assert_eq!(status.latest_version.as_deref(), Some("999.0.0"));
         assert_eq!(status.current_version, current_version());
