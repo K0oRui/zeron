@@ -397,6 +397,7 @@ async fn questions_closed_unanswered_deny_the_tool() {
             rx
         }),
         steering: steer_rx,
+        user_message_id: None,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
     };
