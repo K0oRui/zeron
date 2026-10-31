@@ -5020,8 +5020,13 @@ impl Shell {
             .find(|chat| chat.id == chat_id)
             .map(|chat| chat.device_id.clone())
             .filter(|id| !id.is_empty());
+        self.state.update(cx, |state, cx| {
+            state.set_session_reset_in_flight(&chat_id, true);
+            cx.notify();
+        });
+        let reset_chat = chat_id.clone();
         self.reset_session_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "chatId": chat_id });
+            let mut params = serde_json::json!({ "chatId": reset_chat });
             if let Some(target) = target {
                 params["targetDeviceId"] = serde_json::Value::String(target);
             }
@@ -5031,6 +5036,10 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.reset_session_task = None;
+                shell.state.update(cx, |state, cx| {
+                    state.set_session_reset_in_flight(&chat_id, false);
+                    cx.notify();
+                });
                 match result {
                     Ok(_) => shell.show_notice(
                         crate::toast::ToastKind::Success,

@@ -9114,6 +9114,15 @@ impl Composer {
         if state.review_comment_flush_pending(&self.current_key) {
             return true;
         }
+        // "New agent session" is still running: a prompt now would start a
+        // turn in the session that is being abandoned.
+        if state
+            .selected_chat
+            .as_deref()
+            .is_some_and(|chat| state.session_reset_in_flight(chat))
+        {
+            return true;
+        }
         if state.selected_chat.is_some() {
             return false;
         }
@@ -9255,6 +9264,17 @@ impl Composer {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        // The engine is abandoning this chat's harness session; its answer
+        // has not arrived yet, so the prompt would start in the old one.
+        // `send_blocked` keeps Enter and the button inert; this also covers
+        // the queue-activation path.
+        if self.state.read(cx).session_reset_in_flight(&chat_id) {
+            self.failure =
+                Some("Starting a new agent session. Send the message once it finishes.".into());
+            self.failure_key = Some(chat_id.clone());
+            cx.notify();
+            return;
+        }
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -11175,12 +11195,21 @@ impl Composer {
                 let blocked = self.send_blocked(cx);
                 // Dimmed when out of Cloud credits, but a click still says why.
                 let explains = self.out_of_cloud_credits(cx);
+                let resetting = {
+                    let state = self.state.read(cx);
+                    state
+                        .selected_chat
+                        .as_deref()
+                        .is_some_and(|chat| state.session_reset_in_flight(chat))
+                };
                 send_circle("composer-send", blocked, theme)
                     .when(!blocked || explains, |el| {
                         el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        if self.out_of_cloud_credits(cx) {
+                        if resetting {
+                            "Starting a new agent session..."
+                        } else if self.out_of_cloud_credits(cx) {
                             "Out of Cloud credits"
                         } else if mode == SendButtonMode::Queue {
                             "Queue message"

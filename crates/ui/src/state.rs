@@ -1029,6 +1029,10 @@ pub struct AppState {
     /// revision that has not reached disk yet. A chat remains blocked until
     /// every surface waiting on a workspace write has finished or cancelled.
     review_comment_flushes: HashMap<String, HashSet<u64>>,
+    /// Chats whose harness session is being abandoned by "New agent session".
+    /// Their composer stays blocked until the engine answers: a prompt sent
+    /// in that window would land in the session on its way out.
+    session_resets: HashSet<String>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -1187,6 +1191,7 @@ impl AppState {
             transfers: HashMap::new(),
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
+            session_resets: HashSet::new(),
             local_device_id: None,
             harness_updates: Vec::new(),
             cloud_status: None,
@@ -1385,6 +1390,21 @@ impl AppState {
 
     pub fn review_comment_flush_pending(&self, key: &str) -> bool {
         self.review_comment_flushes.contains_key(key)
+    }
+
+    /// Whether "New agent session" is still happening for this chat. The
+    /// composer blocks sends until the engine has answered, so a prompt
+    /// cannot start a turn in the session that is being abandoned.
+    pub fn session_reset_in_flight(&self, chat_id: &str) -> bool {
+        self.session_resets.contains(chat_id)
+    }
+
+    pub fn set_session_reset_in_flight(&mut self, chat_id: &str, in_flight: bool) {
+        if in_flight {
+            self.session_resets.insert(chat_id.to_owned());
+        } else {
+            self.session_resets.remove(chat_id);
+        }
     }
 
     // ---- reducers (pure) ----

@@ -423,7 +423,7 @@ impl Shell {
             SharedString,
             Option<zeron_proto::HarnessId>,
             bool,
-            Option<(String, bool)>,
+            Option<(String, bool, bool)>,
         ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
@@ -434,13 +434,14 @@ impl Shell {
                         .is_some_and(|id| !id.trim().is_empty());
                     let working =
                         state.display_status_for(chat, Utc::now()) == zeron_proto::ChatIndicator::Working;
+                    let resetting = state.session_reset_in_flight(&chat.id);
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
-                        has_session.then(|| (chat.id.clone(), working)),
+                        has_session.then(|| (chat.id.clone(), working, resetting)),
                     )
                 }
                 None => (SharedString::from(""), None, true, None),
@@ -654,8 +655,11 @@ impl Shell {
         // new provider session and carries the transcript over, so the agent
         // keeps the context but gets a fresh identity (session id, affinity,
         // prompt cache). Only offered once a session exists to abandon.
-        let reset_session = reset_target.map(|(chat_id, working)| {
-            let label = if working {
+        let reset_session = reset_target.map(|(chat_id, working, resetting)| {
+            let busy = working || resetting;
+            let label = if resetting {
+                "Starting a new agent session..."
+            } else if working {
                 "Wait for the current turn to finish"
             } else {
                 "New agent session"
@@ -672,7 +676,7 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(label)
             .flex_none()
-            .when(working, |button| button.opacity(0.45))
+            .when(busy, |button| button.opacity(0.45))
         });
         let inner = div()
             .size_full()
