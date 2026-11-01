@@ -10,23 +10,144 @@ name: release
 # their github.com release URLs, and manifest.json below supplies the sha256 it
 # verifies them against. Nothing is mirrored to R2 or zeron.sh any more.
 #
-# Trigger: push a tag `v<version>` matching the workspace version in
-# Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release publish).
+# Trigger / publish rule (no manual tagging):
+#   push to main        → publish iff the workspace version in Cargo.toml is
+#                         STRICTLY NEWER than the latest published release tag;
+#                         otherwise the run stops after the `version` job (~5s,
+#                         no builds) and logs "already published: vX".
+#   push of tag `v*`    → always publish (deliberate republish / force escape
+#                         hatch, see the `version` job for details).
+#   workflow_dispatch   → same version rule as a push to main, i.e. it publishes
+#                         when the Cargo.toml version is not published yet.
+# The release tag is always `v<Cargo.toml version>`, which is what the updater's
+# releases/latest lookup expects; softprops/action-gh-release creates that tag
+# at the built commit if it does not exist yet.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# Serialise overlapping pushes (two merges in quick succession) instead of
+# letting them race on the same release. Runs that queue up usually become
+# no-ops once the first one publishes the version (their `version` job then
+# reports publish=false) — that is the intended behaviour, not a bug.
+# There is no trigger loop to worry about: creating a release does not emit a
+# push event, and this workflow only runs on push/workflow_dispatch.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Decides whether this run publishes at all. Cheap on purpose: an unchanged
+  # version must cost one short job and no builds.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: resolve Cargo.toml version and publish decision
+        id: version
+        env:
+          # Needed by `gh release view`; the workflow-level `contents: write`
+          # permission covers the read.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The workspace version is the first `^version = "` line of Cargo.toml,
+          # i.e. [workspace.package] version.
+          # (`|| true`: without it, `set -e`/pipefail would abort on a missing
+          # line before the explicit, loud failure below.)
+          version="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/' || true)"
+          if [ -z "${version:-}" ]; then
+            echo "::error::Cargo.toml has no parseable 'version = \"x.y.z\"' line"
+            exit 1
+          fi
+          if ! printf '%s' "$version" |
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$'; then
+            echo "::error::Cargo.toml version '$version' is not x.y.z"
+            exit 1
+          fi
+          echo "workspace version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          publish=false
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            # A tag push bypasses the "newer than latest" check entirely: it is
+            # the deliberate escape hatch, so re-pushing an existing tag
+            # republishes that version (and can even publish a version that is
+            # older than, or equal to, the latest release).
+            echo "tag push ${GITHUB_REF} → publish=true"
+            publish=true
+          else
+            latest=""
+            err="$(mktemp)"
+            if latest="$(gh release view --repo "$GITHUB_REPOSITORY" \
+              --json tagName --jq .tagName 2>"$err")"; then
+              :
+            else
+              rc=$?
+              # `gh release view` exits non-zero with "release not found"
+              # (HTTP 404) when the repository has no releases yet — the one
+              # failure tolerated here. Anything else is a real error and must
+              # fail the job rather than quietly skip publishing.
+              if grep -qi 'release not found' "$err"; then
+                echo "no releases yet"
+                latest=""
+              else
+                echo "::error::gh release view failed (exit $rc): $(tr '\n' ' ' <"$err")"
+                exit 1
+              fi
+            fi
+            latest="${latest#v}"
+            echo "latest published: ${latest:-<none>}"
+
+            if [ -z "$latest" ]; then
+              # Nothing published yet: whatever Cargo.toml says becomes the
+              # first release.
+              publish=true
+            elif [ "$version" = "$latest" ]; then
+              publish=false
+            elif [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n1)" = "$version" ]; then
+              # Strictly newer, compared version-wise (`sort -V`, not string
+              # compare: 0.2.100 is newer than 0.2.99).
+              publish=true
+            else
+              publish=false
+            fi
+
+            if [ "$publish" = "false" ]; then
+              # A version equal to or older than the latest release never
+              # publishes on its own. Forcing it requires a manual tag push of
+              # v$version (which takes the bypass above) or deleting the
+              # existing release.
+              echo "already published: v$latest (Cargo.toml has $version) — skipping builds"
+            fi
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "### release: $([ "$publish" = "true" ] && echo publishing || echo skipping) v$version"
+            echo ""
+            echo "- workspace version: \`$version\`"
+            echo "- publish: \`$publish\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   cursor-compatibility:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     uses: ./.github/workflows/cursor-compatibility.yml
 
   linux:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +188,8 @@ jobs:
   #     key (raw .p8 contents), for notarytool. All three present → the package
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     runs-on: macos-latest # Apple silicon
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -120,6 +243,8 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
     defaults:
@@ -147,8 +272,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [cursor-compatibility, linux, macos, windows]
+    # Cannot run when the `version` job decided not to publish (unchanged or
+    # older version, no tag push).
+    needs: [version, cursor-compatibility, linux, macos, windows]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -160,15 +287,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: version guard (tag == artifact version)
+      - name: version guard (artifacts match the Cargo.toml version)
+        env:
+          # The single source of truth: the `version` job's output (never
+          # derived from the ref here).
+          VERSION_RESOLVED: ${{ needs.version.outputs.version }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
+          ver="$VERSION_RESOLVED"
+          [ -n "$ver" ] || { echo "no version output from the version job"; exit 1; }
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe windows-x86_64-setup.exe; do
             test -f "dist/zeron-$ver-$platform" \
-              || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
+              || { echo "missing artifact for v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
           done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: updater manifest
@@ -185,9 +317,14 @@ jobs:
           done
           printf '%s\n' "$manifest" > manifest.json
           cat manifest.json
+      # Creates tag v<version> at this commit when it does not exist yet, which
+      # is what removes the manual tagging step from the release flow.
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
           files: |
             dist/*
             manifest.json
           generate_release_notes: true
+          make_latest: true
