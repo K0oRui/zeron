@@ -21,7 +21,9 @@
 サーバーなど、ディスプレイのないマシン向けです。たとえば、ノートパソコンを閉じたあともエージェントを動かし続ける VPS に使えます。Linux のみ対応しています。
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+# download zeron-<version>-linux-<arch>.tar.gz from GitHub Releases, then:
+tar -xzf zeron-<version>-linux-<arch>.tar.gz
+./zeron-<version>-linux-<arch>/install.sh
 zeron status
 ```
 

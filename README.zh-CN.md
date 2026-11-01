@@ -21,7 +21,9 @@
 适用于服务器等没有显示器的机器，比如在你合上笔记本之后继续跑 agent 的 VPS。仅支持 Linux：
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+# download zeron-<version>-linux-<arch>.tar.gz from GitHub Releases, then:
+tar -xzf zeron-<version>-linux-<arch>.tar.gz
+./zeron-<version>-linux-<arch>/install.sh
 zeron status
 ```
 

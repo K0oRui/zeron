@@ -1026,12 +1026,12 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Release checker: polls {edge}/releases hourly (wall clock); headless
+        // Release checker: polls GitHub Releases hourly (wall clock); headless
         // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.
         // Spawned for every install: application updates must not depend on
-        // workspace sync being enabled — the feed is the public release feed
-        // (served without authentication), not an edge feature.
+        // workspace sync being enabled — the feed is the project's own public
+        // GitHub Releases, not an edge feature.
         let quiescent: zeron_update::QuiescentCheck = {
             let sessions = core.sessions.clone();
             let terminals = core.terminals.clone();
@@ -1041,7 +1041,7 @@ impl Engine {
             "{}/releases/harness-compatibility.json",
             config.edge_url.trim_end_matches('/')
         ));
-        let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+        let updater = zeron_update::Updater::spawn(Some(quiescent));
         if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
             let updater_for_tokens = updater.clone();
             let wake = tokio::spawn(async move {

@@ -68,7 +68,6 @@ pub struct AppUpdate {
     blocker: Option<UpdateBlocker>,
     /// Background download + install on quit (`ZERON_AUTO_UPDATE` unset or on).
     automatic: bool,
-    edge_url: String,
     data_dir: PathBuf,
     checker: Updater,
     status: Option<UpdateStatus>,
@@ -89,8 +88,8 @@ impl Global for GlobalAppUpdate {}
 impl AppUpdate {
     /// Start the desktop checker. Call once at boot, after `gpui_tokio` is
     /// initialized.
-    pub fn init(edge_url: String, data_dir: PathBuf, cx: &mut App) {
-        let entity = cx.new(|cx| Self::new(edge_url, data_dir, cx));
+    pub fn init(data_dir: PathBuf, cx: &mut App) {
+        let entity = cx.new(|cx| Self::new(data_dir, cx));
         cx.set_global(GlobalAppUpdate(entity));
     }
 
@@ -99,7 +98,7 @@ impl AppUpdate {
             .map(|global| global.0.clone())
     }
 
-    fn new(edge_url: String, data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let install = zeron_update::detect_install();
         let blocker = install
             .supports_desktop_update()
@@ -107,7 +106,7 @@ impl AppUpdate {
             .flatten();
         let checker = {
             let _runtime = Tokio::handle(cx).enter();
-            Updater::spawn_desktop(edge_url.clone())
+            Updater::spawn_desktop()
         };
         let mut statuses = checker.watch();
         let status_watch = cx.spawn(async move |this, cx| {
@@ -126,7 +125,6 @@ impl AppUpdate {
             install,
             blocker,
             automatic: zeron_update::desktop_auto_update_enabled(),
-            edge_url,
             data_dir,
             checker,
             status: None,
@@ -210,7 +208,6 @@ impl AppUpdate {
         let Some(version) = self.available().map(str::to_owned) else {
             return;
         };
-        let edge_url = self.edge_url.clone();
         let data_dir = self.data_dir.clone();
         let install = self.install.clone();
         self.flow = Flow::Downloading {
@@ -219,14 +216,12 @@ impl AppUpdate {
         let stage = Tokio::spawn(cx, async move {
             // Re-read the manifest so a long-lived status still downloads the
             // newest release, with that release's checksums.
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
+            let manifest = zeron_update::fetch_latest().await?;
             anyhow::ensure!(
                 zeron_update::version_newer(&manifest.version, zeron_update::current_version()),
                 "the release feed no longer offers a newer version"
             );
-            let staged = install
-                .stage_desktop(&edge_url, &manifest, &data_dir)
-                .await?;
+            let staged = install.stage_desktop(&manifest, &data_dir).await?;
             anyhow::Ok((manifest.version, staged))
         });
         self.download = Some(cx.spawn(async move |this, cx| {

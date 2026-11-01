@@ -21,7 +21,9 @@ No account or network connection is needed; sessions stay on your device. The ap
 For servers and other machines without a display, such as a VPS that keeps agents running after you close your laptop. Linux only:
 
 ```bash
-curl -fsSL https://zeron.sh/install.sh | sh
+# download zeron-<version>-linux-<arch>.tar.gz from GitHub Releases, then:
+tar -xzf zeron-<version>-linux-<arch>.tar.gz
+./zeron-<version>-linux-<arch>/install.sh
 zeron status
 ```
 
