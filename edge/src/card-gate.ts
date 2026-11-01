@@ -12,7 +12,7 @@
 import type { Env } from "./env";
 
 /** Whether `pathname` is a public card route. */
-export const isPublicCardPath = (pathname: string): boolean => /^\/(?:@|%40|cards(?:\/|$))/i.test(pathname);
+export const isPublicCardPath = (pathname: string): boolean => /^\/(?:@|%40|c\/|cards(?:\/|$))/i.test(pathname);
 
 const plain = (status: number, error: string, extra: Record<string, string> = {}): Response =>
   new Response(JSON.stringify({ error }), {

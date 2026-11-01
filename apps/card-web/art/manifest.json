@@ -319,11 +319,11 @@
       },
       {
         "file": "salt-flats/far.webp",
-        "depth": 1
+        "depth": 0.35
       },
       {
         "file": "salt-flats/near.webp",
-        "depth": 2
+        "depth": 1
       }
     ]
   },

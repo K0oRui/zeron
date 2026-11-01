@@ -25,9 +25,9 @@ describe("card pages", () => {
 
   it("names the player, the picture and the assets from the site", () => {
     expect(urls).toEqual({
-      page: "https://zeron.sh/@ada",
-      player: "https://zeron.sh/@ada/player",
-      image: "https://zeron.sh/@ada/card.png",
+      page: "https://zeron.sh/c/ada",
+      player: "https://zeron.sh/c/ada/player",
+      image: "https://zeron.sh/c/ada/card.png",
       json: "https://zeron.sh/cards/ada",
       script: "https://zeron.sh/card/card.js",
       page_script: "https://zeron.sh/card/card-page.js",
@@ -58,13 +58,13 @@ describe("card pages", () => {
     const html = renderShare(card, urls);
     for (const tag of [
       '<meta name="twitter:card" content="player" />',
-      '<meta name="twitter:player" content="https://zeron.sh/@ada/player" />',
+      '<meta name="twitter:player" content="https://zeron.sh/c/ada/player" />',
       '<meta name="twitter:player:width" content="480" />',
       '<meta name="twitter:player:height" content="480" />',
-      '<meta name="twitter:image" content="https://zeron.sh/@ada/card.png" />',
-      '<meta property="og:image" content="https://zeron.sh/@ada/card.png" />',
-      '<meta property="og:url" content="https://zeron.sh/@ada" />',
-      '<link rel="canonical" href="https://zeron.sh/@ada" />',
+      '<meta name="twitter:image" content="https://zeron.sh/c/ada/card.png" />',
+      '<meta property="og:image" content="https://zeron.sh/c/ada/card.png" />',
+      '<meta property="og:url" content="https://zeron.sh/c/ada" />',
+      '<link rel="canonical" href="https://zeron.sh/c/ada" />',
       '<script type="module" src="https://zeron.sh/card/card-page.js"></script>'
     ]) {
       expect(html).toContain(tag);

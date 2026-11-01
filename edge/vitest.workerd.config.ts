@@ -4,6 +4,7 @@ import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { createBoatFake } from "./test/workerd/boat-fake.ts";
 import { createStripeFake } from "./test/workerd/stripe-fake.ts";
+import { createWorkOsFake } from "./test/workerd/workos-fake.ts";
 
 // Runtime-real test tier: runs inside actual workerd via
 // @cloudflare/vitest-pool-workers, against a real SQLite-backed Durable
@@ -24,12 +25,15 @@ import { createStripeFake } from "./test/workerd/stripe-fake.ts";
 // throwaway ES256 pair so runner JWTs are real.
 const runnerKeys = generateKeyPairSync("ec", { namedCurve: "P-256" });
 
-/** Boat and Stripe fakes behind Miniflare's one outbound service. */
+/** Boat, Stripe and WorkOS fakes behind Miniflare's one outbound service. */
 const outbound = () => {
   const boat = createBoatFake();
   const stripe = createStripeFake();
-  return (request: Parameters<typeof boat>[0]) =>
-    new URL(request.url).hostname === "stripe.test" ? stripe(request) : boat(request);
+  const workos = createWorkOsFake();
+  return (request: Parameters<typeof boat>[0]) => {
+    const host = new URL(request.url).hostname;
+    return host === "stripe.test" ? stripe(request) : host === "api.workos.com" ? workos(request) : boat(request);
+  };
 };
 
 export default defineConfig({

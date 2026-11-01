@@ -5,7 +5,8 @@
  *
  * Public, routed before the bearer gate (every route through card-gate.ts):
  *   GET /cards/:username          — a card as JSON, CORS-open
- *   GET /@:username               — a card's page (`zeron.sh/@*` routes here): the
+ *   GET /c/:username              — a card's page (`zeron.sh/c/*` and `/@*` route
+ *                                   here; `/@:username` is the same page): the
  *                                   card drawn by apps/card-web, with X's Player Card
  *                                   and Open Graph tags, so a post shows it
  *   GET /@:username/player        — the card alone, the iframe X shows in a post
@@ -30,9 +31,12 @@ import { userDirectoryStub, type PublicCard } from "./user-directory";
 
 const MAX_CLAIM_BODY = 1024;
 
-const PAGE_PATH = /^\/(?:@|%40)/i;
-/** `/@name`, `/@name/player` or `/@name/card.png`. */
-const PAGE_NAME = /^\/(?:@|%40)([^/]*)(?:\/(player|card\.png))?\/?$/i;
+// `/c/name` is the address a card goes by (c for card): an `@` at the start of
+// a pasted link reads as a mention in many apps, which then miss the rest of
+// it. `/@name` answers too.
+const PAGE_PATH = /^\/(?:@|%40|c\/)/i;
+/** `/c/name` or `/@name`, each with `/player` or `/card.png` after it. */
+const PAGE_NAME = /^\/(?:@|%40|c\/)([^/]*)(?:\/(player|card\.png))?\/?$/i;
 
 /** The X handle the share page names as the card's site. */
 const X_SITE = "@zeron";

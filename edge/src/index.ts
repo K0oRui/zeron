@@ -58,7 +58,7 @@
  *
  * Member cards (card-routes.ts):
  *   GET  /cards/:username               — pre-bearer, a card as JSON
- *   GET  /@:username                    — pre-bearer, a card's page (also routed from zeron.sh)
+ *   GET  /c/:username, /@:username      — pre-bearer, a card's page (also routed from zeron.sh)
  *     (every public card route goes through publicCardGate: per-IP limit, one plain 503)
  *   GET|POST /username, GET /username/check — user bearer (claim, availability)
  */

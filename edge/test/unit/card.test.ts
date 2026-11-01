@@ -77,10 +77,10 @@ describe("the public card gate", () => {
   const at = (path: string) => new URL(`https://edge.test${path}`);
 
   it("covers the page, anything under it, and the JSON", () => {
-    for (const p of ["/@wing", "/%40wing", "/@wing/player", "/@wing/card.png", "/cards/wing", "/cards", "/CARDS/wing"]) {
+    for (const p of ["/@wing", "/%40wing", "/@wing/player", "/@wing/card.png", "/c/wing", "/c/wing/player", "/cards/wing", "/cards", "/CARDS/wing"]) {
       expect(isPublicCardPath(p)).toBe(true);
     }
-    for (const p of ["/", "/cardsx", "/username", "/admin/usernames/set", "/wing@x"]) expect(isPublicCardPath(p)).toBe(false);
+    for (const p of ["/", "/cardsx", "/c", "/card/card.js", "/username", "/admin/usernames/set", "/wing@x"]) expect(isPublicCardPath(p)).toBe(false);
   });
 
   it("passes other routes by", async () => {

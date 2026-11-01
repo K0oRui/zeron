@@ -241,7 +241,7 @@ describe("admin usernames", () => {
     const listed = (await (await admin("/admin/users")).json()) as { users: { userId: string; username: string | null }[] };
     expect(listed.users.find((u) => u.userId === "user_house")?.username).toBe("zeron");
     const csv = await (await admin("/admin/users?format=csv")).text();
-    expect(csv).toMatch(/\n\d+,user_house,.*,zeron\n/);
+    expect(csv).toMatch(/\n\d+,user_house,.*,zeron,\n/);
   });
 
   it("won't take a name from someone holding it", async () => {
@@ -407,15 +407,27 @@ describe("the public card", () => {
 });
 
 describe("the card's page", () => {
-  it("serves /@username, the raw and the percent-encoded @", async () => {
+  it("serves /c/username and /@username, the raw and the percent-encoded @", async () => {
     await signUp("user_page");
     await claim("user_page", "pageholder");
-    for (const path of ["/@pageholder", "/%40pageholder", "/@PageHolder", "/@pageholder/"]) {
+    for (const path of ["/c/pageholder", "/c/PageHolder", "/@pageholder", "/%40pageholder", "/@PageHolder", "/@pageholder/"]) {
       const res = await SELF.fetch(`https://edge.test${path}`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
-      expect(await res.text()).toContain("@pageholder");
+      expect(await res.text()).toContain('"username":"pageholder"');
     }
+  });
+
+  it("names /c/username as the card's address, whichever way it was reached", async () => {
+    await signUp("user_c");
+    await claim("user_c", "caddress");
+    for (const path of ["/c/caddress", "/@caddress"]) {
+      const html = await (await SELF.fetch(`https://edge.test${path}`)).text();
+      expect(html).toContain('<link rel="canonical" href="https://edge.test/c/caddress" />');
+      expect(html).toContain('<meta name="twitter:player" content="https://edge.test/c/caddress/player" />');
+      expect(html).toContain('<meta name="twitter:image" content="https://edge.test/c/caddress/card.png" />');
+    }
+    expect((await SELF.fetch("https://edge.test/c/caddress/player")).status).toBe(200);
   });
 
   it("keeps the fields a card page reads in its data block, nothing more", async () => {
@@ -446,7 +458,7 @@ describe("the card's page", () => {
   });
 
   it("answers 404 for what isn't a card, without a bearer", async () => {
-    for (const path of ["/@", "/@nobodyatall", "/@no", "/@pageholder/extra", "/%40"]) {
+    for (const path of ["/@", "/@nobodyatall", "/@no", "/@pageholder/extra", "/%40", "/c/", "/c/nobodyatall", "/c/pageholder/extra"]) {
       expect((await SELF.fetch(`https://edge.test${path}`)).status).toBe(404);
     }
     expect((await SELF.fetch("https://edge.test/@whoever", { method: "POST" })).status).toBe(405);

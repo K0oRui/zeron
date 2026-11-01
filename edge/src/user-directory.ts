@@ -38,6 +38,14 @@
  * after an operator's clear keeps the card. Operators set or clear names at
  * `POST /admin/usernames/{set|clear|face}`.
  *
+ * Org creations: each user creates at most one org (`POST /auth/orgs`).
+ * `org_creations` holds one row per user: a claim taken before WorkOS is
+ * called, so concurrent requests can't both create, and then the org it made.
+ * A failed create gives its claim back; a claim older than
+ * `ORG_CLAIM_STALE_MS` that never got an org was left by a create that died
+ * mid-way, and the next request takes it over. The admin lists show who
+ * created which org.
+ *
  * Writes are one row per sign-up or profile change, so a single instance is
  * not a hotspot.
  */
@@ -54,6 +62,10 @@ export const USER_DIRECTORY_NAME = "users1";
 /** A new row's user number. Conflict updates never set `user_number`, so a
  * number is taken only on first insert. */
 const NEXT_USER_NUMBER = "(SELECT COALESCE(MAX(user_number), 0) + 1 FROM users)";
+
+/** How long an org-creation claim without an org holds before another
+ * request may take it over. */
+export const ORG_CLAIM_STALE_MS = 5 * 60_000;
 
 /** Availability checks and claims one user may make a minute. */
 const USERNAME_ATTEMPTS_PER_MINUTE = 60;
@@ -88,6 +100,8 @@ export interface DirectoryUser {
   readonly username: string | null;
   /** Badges held, oldest grant first. */
   readonly badges: readonly UserBadge[];
+  /** The org they created through `POST /auth/orgs`, if any. */
+  readonly createdOrgId: string | null;
 }
 
 /** Everything the public can read about a member, in this order. New fields
@@ -160,6 +174,10 @@ export interface WorkOsMembership {
   readonly updated_at: string;
 }
 
+/** `claimOrgCreation`: go ahead under `claimId`, or the user already created
+ * `organizationId` (null while their first create is still running). */
+export type OrgCreationClaim = { readonly claimId: string } | { readonly organizationId: string | null };
+
 export interface OrganizationMember {
   readonly membershipId: string;
   readonly userId: string;
@@ -183,6 +201,9 @@ export interface DirectoryOrganization {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly deletedAt: string | null;
+  /** Who created it through `POST /auth/orgs`; null for orgs made otherwise
+   * or before that was recorded. */
+  readonly createdBy: string | null;
   /** Active members; `members` also lists inactive and pending ones. */
   readonly memberCount: number;
   /** Oldest membership first. */
@@ -230,6 +251,8 @@ export class UserDirectory extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS organization_memberships (
       membership_id TEXT PRIMARY KEY, org_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT, status TEXT NOT NULL,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, recorded_at INTEGER NOT NULL)`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS org_creations (
+      user_id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, claimed_at INTEGER NOT NULL, org_id TEXT, created_at INTEGER)`);
   }
 
   /** Number every user still without one — the rows recorded before numbers
@@ -518,6 +541,42 @@ export class UserDirectory extends DurableObject<Env> {
     };
   }
 
+  /** Take the user's one org creation before calling WorkOS. */
+  claimOrgCreation(userId: string): OrgCreationClaim {
+    return this.ctx.storage.transactionSync((): OrgCreationClaim => {
+      const now = Date.now();
+      const [row] = this.ctx.storage.sql.exec("SELECT org_id, claimed_at FROM org_creations WHERE user_id = ?", userId).toArray();
+      if (row && (row.org_id !== null || now - (row.claimed_at as number) < ORG_CLAIM_STALE_MS)) {
+        return { organizationId: row.org_id as string | null };
+      }
+      const claimId = crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO org_creations (user_id, claim_id, claimed_at) VALUES (?, ?, ?)
+         ON CONFLICT (user_id) DO UPDATE SET claim_id = excluded.claim_id, claimed_at = excluded.claimed_at`,
+        userId,
+        claimId,
+        now
+      );
+      return { claimId };
+    });
+  }
+
+  /** Record the org a claim created. */
+  finishOrgCreation(userId: string, claimId: string, orgId: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE org_creations SET org_id = ?, created_at = ? WHERE user_id = ? AND claim_id = ? AND org_id IS NULL",
+      orgId,
+      Date.now(),
+      userId,
+      claimId
+    );
+  }
+
+  /** Give a claim back when its create didn't happen. */
+  releaseOrgCreation(userId: string, claimId: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM org_creations WHERE user_id = ? AND claim_id = ? AND org_id IS NULL", userId, claimId);
+  }
+
   list(): DirectoryUser[] {
     const badges = new Map<string, UserBadge[]>();
     for (const row of this.ctx.storage.sql.exec("SELECT * FROM user_badges ORDER BY granted_at, badge_id")) {
@@ -528,8 +587,9 @@ export class UserDirectory extends DurableObject<Env> {
     }
     return [
       ...this.ctx.storage.sql.exec(
-        `SELECT u.*, n.username FROM users u
+        `SELECT u.*, n.username, c.org_id AS created_org_id FROM users u
          LEFT JOIN usernames n ON n.user_id = u.user_id AND n.retired_at IS NULL
+         LEFT JOIN org_creations c ON c.user_id = u.user_id
          ORDER BY u.created_at`
       )
     ].map((row) => {
@@ -547,7 +607,8 @@ export class UserDirectory extends DurableObject<Env> {
         updatedAt: row.updated_at as string,
         deletedAt: row.deleted_at as string | null,
         username: row.username as string | null,
-        badges: badges.get(row.user_id as string) ?? []
+        badges: badges.get(row.user_id as string) ?? [],
+        createdOrgId: row.created_org_id as string | null
       };
     });
   }
@@ -654,7 +715,13 @@ export class UserDirectory extends DurableObject<Env> {
       });
       members.set(orgId, held);
     }
-    return [...this.ctx.storage.sql.exec("SELECT * FROM organizations ORDER BY created_at, org_id")].map((row) => {
+    return [
+      ...this.ctx.storage.sql.exec(
+        `SELECT o.*, c.user_id AS created_by FROM organizations o
+         LEFT JOIN org_creations c ON c.org_id = o.org_id
+         ORDER BY o.created_at, o.org_id`
+      )
+    ].map((row) => {
       const held = row.deleted_at === null ? (members.get(row.org_id as string) ?? []) : [];
       return {
         orgId: row.org_id as string,
@@ -664,6 +731,7 @@ export class UserDirectory extends DurableObject<Env> {
         createdAt: row.created_at as string,
         updatedAt: row.updated_at as string,
         deletedAt: row.deleted_at as string | null,
+        createdBy: row.created_by as string | null,
         memberCount: held.filter((m) => m.status === "active").length,
         members: held
       };
@@ -960,7 +1028,7 @@ export const handleUserDirectoryRoute = async (
       if (!csv) return json({ count: organizations.length, organizations });
       return csvResponse(
         "zeron-organizations.csv",
-        "org_id,name,external_id,domains,member_count,members,created_at,updated_at,deleted_at",
+        "org_id,name,external_id,domains,member_count,members,created_at,updated_at,deleted_at,created_by",
         organizations.map((o) => [
           o.orgId,
           o.name,
@@ -973,7 +1041,8 @@ export const handleUserDirectoryRoute = async (
             .join(";") || null,
           o.createdAt,
           o.updatedAt,
-          o.deletedAt
+          o.deletedAt,
+          o.createdBy
         ])
       );
     }
@@ -981,7 +1050,7 @@ export const handleUserDirectoryRoute = async (
     if (!csv) return json({ count: users.length, users });
     return csvResponse(
       "zeron-users.csv",
-      "user_number,user_id,email,name,first_name,last_name,profile_picture_url,joined_at,updated_at,deleted_at,badges,username",
+      "user_number,user_id,email,name,first_name,last_name,profile_picture_url,joined_at,updated_at,deleted_at,badges,username,created_org_id",
       users.map((u) => [
         String(u.userNumber),
         u.userId,
@@ -994,7 +1063,8 @@ export const handleUserDirectoryRoute = async (
         u.updatedAt,
         u.deletedAt,
         u.badges.map((b) => b.id).join(";") || null,
-        u.username
+        u.username,
+        u.createdOrgId
       ])
     );
   }

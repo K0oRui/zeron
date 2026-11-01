@@ -55,9 +55,9 @@ export const IMAGE = { width: 1200, height: 1200 };
 export function urlsFor(card, site, base = `${site}/card`) {
   const u = encodeURIComponent(String(card.username || ""));
   return {
-    page: `${site}/@${u}`,
-    player: `${site}/@${u}/player`,
-    image: `${site}/@${u}/card.png`,
+    page: `${site}/c/${u}`,
+    player: `${site}/c/${u}/player`,
+    image: `${site}/c/${u}/card.png`,
     json: `${site}/cards/${u}`,
     script: `${base}/card.js`,
     page_script: `${base}/card-page.js`,

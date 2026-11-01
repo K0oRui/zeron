@@ -76,9 +76,9 @@ describe("member card pages", () => {
     expect(page.headers.get("cache-control")).toBe("public, max-age=60");
     const html = await page.text();
     expect(html).toContain('<meta name="twitter:card" content="player" />');
-    expect(html).toContain('<meta name="twitter:player" content="https://edge.test/@ada-pages/player" />');
-    expect(html).toContain('<meta name="twitter:image" content="https://edge.test/@ada-pages/card.png" />');
-    expect(html).toContain('<meta property="og:image" content="https://edge.test/@ada-pages/card.png" />');
+    expect(html).toContain('<meta name="twitter:player" content="https://edge.test/c/ada-pages/player" />');
+    expect(html).toContain('<meta name="twitter:image" content="https://edge.test/c/ada-pages/card.png" />');
+    expect(html).toContain('<meta property="og:image" content="https://edge.test/c/ada-pages/card.png" />');
     expect(html).toContain('<script type="module" src="https://edge.test/card/card-page.js"></script>');
     expect(html).toContain("<title>Ada — Zeron member #");
     expect(html).not.toContain("noindex");

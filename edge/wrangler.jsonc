@@ -30,6 +30,7 @@
     { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
     { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
     { "pattern": "zeron.sh/@*", "zone_name": "zeron.sh" },
+    { "pattern": "zeron.sh/c/*", "zone_name": "zeron.sh" },
     // The card pages' script, style, fonts and art (public/card, built by
     // scripts/card-assets.mjs from apps/card-web; static assets below).
     { "pattern": "zeron.sh/card/*", "zone_name": "zeron.sh" },
