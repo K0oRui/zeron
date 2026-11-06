@@ -1887,6 +1887,7 @@ impl SessionsEngine {
         // a journal whose last turn ended some other way (an older engine
         // marked up front, and that turn went on to finish) has nothing to
         // pick back up.
+        let t_scan = std::time::Instant::now();
         let mut cut_off: std::collections::BTreeMap<String, Option<i64>> = self
             .inner
             .journal
@@ -1902,6 +1903,11 @@ impl SessionsEngine {
                 self.inner.journal.clear_shutdown_interrupt(&chat_id);
             }
         }
+        tracing::info!(
+            scan_ms = t_scan.elapsed().as_millis() as u64,
+            stale = cut_off.len(),
+            "stale-session journal scan"
+        );
         let mut recovered = 0usize;
         for (chat_id, shutdown_at) in cut_off {
             self.inner.journal.clear_shutdown_interrupt(&chat_id);
@@ -1913,6 +1919,7 @@ impl SessionsEngine {
             // stopped run closed its journal.
             let stopped = self.inner.journal.user_stopped(&chat_id);
             self.inner.journal.clear_user_stop(&chat_id);
+            let t_chat = std::time::Instant::now();
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
@@ -1925,6 +1932,7 @@ impl SessionsEngine {
                     .remember_harness_session(&chat_id, &session_id, &cwd, owner);
             }
             let entries = handle.doc().read_entries().unwrap_or_default();
+            let doc_ms = t_chat.elapsed().as_millis() as u64;
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
             // transcript never shows a duplicate).
@@ -2029,6 +2037,7 @@ impl SessionsEngine {
                 ?pickup,
                 attempts,
                 reached_provider = tail.reached_provider,
+                doc_ms,
                 "recovered interrupted session"
             );
             recovered += 1;

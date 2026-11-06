@@ -2587,6 +2587,11 @@ fn compact_work_title(
 
 struct HighlightEntry {
     key: DocumentHighlightKey,
+    /// The language and exact source `key` was hashed from. Comparing them lets
+    /// a repeat request reuse `key` without re-hashing the block with SHA-256
+    /// on every frame.
+    lang: Lang,
+    source: SharedString,
     document: Option<Weak<zeron_syntax::HighlightedDocument>>,
     _task: Option<Task<()>>,
 }
@@ -2610,36 +2615,43 @@ impl HighlightStore {
         code: &str,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+        let source: SharedString = code.into();
         let slot_key = (row_id.clone(), block_ix);
-        let document_key = DocumentHighlightKey::new(lang, code);
+        // Fast path: the same language and source text as the last request for
+        // this slot. Comparing the text skips re-hashing the whole block with
+        // SHA-256 on every frame just to look up an unchanged entry.
         if let Some(entry) = self.entries.get(&slot_key)
-            && entry.key == document_key
+            && entry.lang == lang
+            && entry.source == source
         {
             let document = entry.document.as_ref()?;
             if let Some(document) = document.upgrade() {
                 return Some(document);
             }
         }
+        let document_key = DocumentHighlightKey::new(lang, &source);
         if let Some(document) = self.cache.get(&document_key) {
             self.entries.insert(
                 slot_key,
                 HighlightEntry {
                     key: document_key,
+                    lang,
+                    source,
                     document: Some(Arc::downgrade(&document)),
                     _task: None,
                 },
             );
             return Some(document);
         }
-        let code = code.to_string();
-        let source_bytes = code.len();
+        let source_clone = source.clone();
+        let source_bytes = source.len();
         let task = cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let document = cx
                 .background_executor()
                 .spawn(async move {
                     zeron_syntax::highlight(zeron_syntax::HighlightRequest {
-                        source: &code,
+                        source: source.as_ref(),
                         path: None,
                         fence_tag: Some(match lang {
                             Lang::Rust => "rust",
@@ -2704,6 +2716,8 @@ impl HighlightStore {
             (row_id, block_ix),
             HighlightEntry {
                 key: document_key,
+                lang,
+                source: source_clone,
                 document: None,
                 _task: Some(task),
             },
@@ -2769,28 +2783,123 @@ impl TranscriptPreparation {
         if let Some(baseline) = &update.replay_baseline {
             self.baseline = Some(baseline.clone());
         }
+        // Build rows for entries the cache does not already hold. Settled
+        // entries are independent — each parses only its own parts, and the
+        // parser caches are keyed by part id — so a reset that rebuilds every
+        // entry (a cold open of a long chat) fans them across cores instead of
+        // paying the markdown parse serially. The streaming tail stays on this
+        // thread because its incremental parser advances across deltas.
+        let build_started = std::time::Instant::now();
+        let mut built: HashMap<String, Arc<Vec<Row>>> = HashMap::new();
+        let mut settled: Vec<&SessionMessageEntry> = Vec::new();
+        let mut streaming: Vec<&SessionMessageEntry> = Vec::new();
+        for entry in &self.entries {
+            if self.cache.contains_key(&entry.id) {
+                continue;
+            }
+            if entry.status == Some(MessageStatus::Streaming) {
+                streaming.push(entry);
+            } else {
+                settled.push(entry);
+            }
+        }
+        const PARALLEL_PREPARE_MIN: usize = 8;
+        const PARALLEL_PREPARE_MIN_BYTES: usize = 128 * 1024;
+        // Thread spawn is a few hundred microseconds; only fan out when there
+        // is enough parse work to win it back.
+        let settled_bytes: usize = settled
+            .iter()
+            .map(|entry| entry.parts.iter().map(|part| part.byte_len()).sum::<usize>())
+            .sum();
+        // Only fan out on a clean slate (a reset): a delta's workers would miss
+        // the live→complete parser handoff and the settled tree cache, both of
+        // which live on this thread.
+        let parallel = settled.len() >= PARALLEL_PREPARE_MIN
+            && settled_bytes >= PARALLEL_PREPARE_MIN_BYTES
+            && self.live_parsers.is_empty()
+            && self.tree_cache.is_empty();
+        if parallel {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(1)
+                .min(settled.len());
+            let chunk = settled.len().div_ceil(workers);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = settled
+                    .chunks(chunk)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut live_parsers = HashMap::new();
+                            let mut tree_cache = HashMap::new();
+                            let out: Vec<(String, Arc<Vec<Row>>)> = chunk
+                                .iter()
+                                .map(|entry| {
+                                    let rows =
+                                        rows_for_entry(entry, false, false, &mut |key, text| {
+                                            parse_for_row(
+                                                false,
+                                                key,
+                                                text,
+                                                &mut live_parsers,
+                                                &mut tree_cache,
+                                            )
+                                            .0
+                                        });
+                                    (entry.id.clone(), Arc::new(rows))
+                                })
+                                .collect();
+                            (out, live_parsers, tree_cache)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("transcript preparation worker"))
+                    .collect::<Vec<_>>()
+            });
+            for (out, live_parsers, tree_cache) in results {
+                self.live_parsers.extend(live_parsers);
+                self.tree_cache.extend(tree_cache);
+                built.extend(out);
+            }
+        } else {
+            for entry in &settled {
+                let rows = rows_for_entry(entry, false, false, &mut |key, text| {
+                    parse_for_row(false, key, text, &mut self.live_parsers, &mut self.tree_cache).0
+                });
+                built.insert(entry.id.clone(), Arc::new(rows));
+            }
+        }
+        for entry in &streaming {
+            let rows = rows_for_entry(entry, false, false, &mut |key, text| {
+                parse_for_row(true, key, text, &mut self.live_parsers, &mut self.tree_cache).0
+            });
+            built.insert(entry.id.clone(), Arc::new(rows));
+        }
+        // A delta rebuilds one entry; a cold open rebuilds them all. Log the
+        // latter so session-open cost is visible without a profiler.
+        if built.len() >= PARALLEL_PREPARE_MIN {
+            tracing::info!(
+                entries = self.entries.len(),
+                rebuilt = built.len(),
+                parallel,
+                elapsed_ms = build_started.elapsed().as_millis() as u64,
+                "prepared transcript rows"
+            );
+        }
+        for (id, rows) in built {
+            self.cache.insert(id, rows);
+        }
         let mut rows = HashMap::new();
         let mut historical = HashMap::new();
         let mut fully_historical = HashSet::new();
         let mut bytes = 0;
         for entry in &self.entries {
-            let built = if let Some(rows) = self.cache.get(&entry.id) {
-                rows.clone()
-            } else {
-                let streaming = entry.status == Some(MessageStatus::Streaming);
-                let built = Arc::new(rows_for_entry(entry, false, false, &mut |key, text| {
-                    parse_for_row(
-                        streaming,
-                        key,
-                        text,
-                        &mut self.live_parsers,
-                        &mut self.tree_cache,
-                    )
-                    .0
-                }));
-                self.cache.insert(entry.id.clone(), built.clone());
-                built
-            };
+            let built = self
+                .cache
+                .get(&entry.id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Vec::new()));
             rows.insert(entry.id.clone(), built);
             if self.baseline.as_ref().is_some_and(|b| b.covers(entry)) {
                 fully_historical.insert(entry.id.clone());
@@ -5577,6 +5686,13 @@ impl Transcript {
                 self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
             }
         }
+        // Rows are the only sources of highlight slots; drop the slots of rows
+        // the model no longer holds so the map cannot grow for a session's
+        // lifetime (dead live→split slots, replaced messages).
+        let live_row_ids: HashSet<&SharedString> = new_rows.iter().map(|row| &row.id).collect();
+        self.highlights
+            .entries
+            .retain(|(id, _), _| live_row_ids.contains(id));
         self.rows = new_rows;
         self.rows_revision = self.rows_revision.wrapping_add(1);
         if old_last != self.rows.len().checked_sub(1) {
@@ -12152,6 +12268,64 @@ mod tests {
         assert!(diff_rows(&first.rows["a"], &next.rows["a"]).is_some());
     }
 
+    #[test]
+    fn parallel_preparation_builds_every_entry_and_reuses_unchanged_rows() {
+        let mut worker = TranscriptPreparation::default();
+        // Enough settled entries, and enough text, to take the fan-out path.
+        let entries: Vec<_> = (0..24)
+            .map(|i| {
+                assistant(
+                    &format!("turn-{i}"),
+                    MessageStatus::Complete,
+                    vec![MessagePart::Text {
+                        id: format!("part-{i}"),
+                        text: format!(
+                            "## Section {i}\n\n{}\n",
+                            "lorem ipsum dolor sit amet ".repeat(300)
+                        ),
+                    }],
+                )
+            })
+            .collect();
+        let prepared = worker
+            .prepare(&zeron_doc::TranscriptUpdate {
+                frame: zeron_doc::TranscriptFrame::reset(&entries),
+                context_usage: None,
+                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+            })
+            .unwrap();
+        assert_eq!(prepared.rows.len(), entries.len());
+        for entry in &entries {
+            assert!(
+                !prepared.rows[&entry.id].is_empty(),
+                "entry {} produced no rows",
+                entry.id
+            );
+        }
+        // A later delta reuses the fan-out's rows for unchanged entries, which
+        // only holds if every worker merged its parser caches back.
+        let mut changed = entries.clone();
+        changed[0].parts.push(MessagePart::Text {
+            id: "extra".into(),
+            text: "tail".into(),
+        });
+        let next = worker
+            .prepare(&zeron_doc::TranscriptUpdate {
+                frame: zeron_doc::diff_transcript(&entries, &changed),
+                context_usage: None,
+                replay_baseline: None,
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &prepared.rows[&entries[0].id],
+            &next.rows[&entries[0].id]
+        ));
+        assert!(Arc::ptr_eq(
+            &prepared.rows[&entries[1].id],
+            &next.rows[&entries[1].id]
+        ));
+    }
+
     #[gpui::test]
     fn prepared_whale_open_and_revisit_do_not_build_rows_on_ui(cx: &mut gpui::TestAppContext) {
         let (update, prepared, preparation_ms) = std::thread::spawn(|| {
@@ -12180,11 +12354,8 @@ mod tests {
             let start = Instant::now();
             state.update(cx, |state, cx| {
                 state
-                    .receive_opening_transcript_update(update, false, cx)
+                    .receive_opening_transcript_update(update, Some(prepared.clone()), false, cx)
                     .unwrap();
-                state
-                    .prepared_transcripts
-                    .insert("whale".into(), prepared.clone());
             });
             transcript.update(cx, |this, cx| this.sync(cx));
             let open_ms = start.elapsed().as_millis();
@@ -12255,6 +12426,7 @@ mod tests {
                                 )),
                                 context_usage: None,
                             },
+                            None,
                             pending,
                             cx,
                         )

@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zeron UI performance audit</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --bg-soft: #12151a;
+    --panel: #161a20;
+    --panel-2: #1b2027;
+    --line: #262c35;
+    --line-soft: #1e232b;
+    --text: #e6e9ee;
+    --muted: #98a1ad;
+    --faint: #6b7480;
+    --accent: #6ea8fe;
+    --accent-2: #7ee0c0;
+    --crit: #ff6b6b;
+    --high: #ff9f43;
+    --med: #ffd166;
+    --low: #7ee0c0;
+    --good: #58c98b;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 12% -8%, #182130 0%, var(--bg) 46%) no-repeat, var(--bg);
+    color: var(--text);
+    font: 15px/1.62 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px 96px; }
+  code {
+    font: 12.5px/1.5 var(--mono);
+    background: #0e1216;
+    border: 1px solid var(--line-soft);
+    border-radius: 6px;
+    padding: 1px 6px;
+    color: #cfe3ff;
+    white-space: nowrap;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.hero {
+    padding: 64px 0 34px;
+    border-bottom: 1px solid var(--line-soft);
+    margin-bottom: 40px;
+  }
+  .eyebrow {
+    font: 600 12px/1 var(--mono);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin: 0 0 16px;
+  }
+  h1 { font-size: 40px; line-height: 1.12; margin: 0 0 14px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 16.5px; max-width: 720px; margin: 0; }
+  .meta { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 22px; color: var(--faint); font: 12.5px/1.4 var(--mono); }
+  .meta b { color: var(--muted); font-weight: 600; }
+
+  h2 { font-size: 23px; letter-spacing: -0.01em; margin: 56px 0 8px; }
+  h2 .n { color: var(--faint); font: 600 15px/1 var(--mono); margin-right: 10px; }
+  .lede { color: var(--muted); margin: 0 0 24px; max-width: 780px; }
+  p { margin: 0 0 14px; }
+  .section-note { color: var(--faint); font-size: 13px; }
+
+  .verdict {
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg-soft) 100%);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 26px 28px;
+  }
+  .verdict p:last-child { margin-bottom: 0; }
+  .verdict strong { color: #fff; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 26px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 16px 14px; }
+  .stat .v { font: 700 26px/1 var(--mono); color: #fff; letter-spacing: -0.02em; }
+  .stat .k { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+
+  .pill { display: inline-block; font: 700 10.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; padding: 5px 9px; border-radius: 999px; }
+  .pill.crit { background: rgba(255,107,107,.14); color: var(--crit); border: 1px solid rgba(255,107,107,.3); }
+  .pill.high { background: rgba(255,159,67,.13); color: var(--high); border: 1px solid rgba(255,159,67,.28); }
+  .pill.med  { background: rgba(255,209,102,.12); color: var(--med); border: 1px solid rgba(255,209,102,.26); }
+  .pill.low  { background: rgba(126,224,192,.12); color: var(--low); border: 1px solid rgba(126,224,192,.26); }
+  .pill.good { background: rgba(88,201,139,.13); color: var(--good); border: 1px solid rgba(88,201,139,.28); }
+
+  .issue {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px 24px 20px 26px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .issue::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+  .issue.crit::before { background: var(--crit); }
+  .issue.high::before { background: var(--high); }
+  .issue.med::before  { background: var(--med); }
+  .issue.low::before  { background: var(--low); }
+  .issue-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  .issue-rank { font: 700 13px/1 var(--mono); color: var(--faint); }
+  .issue h3 { font-size: 17.5px; margin: 0; flex: 1 1 auto; letter-spacing: -0.01em; }
+  .issue .where { color: var(--faint); font: 12px/1.5 var(--mono); margin: 2px 0 12px; }
+  .issue .row { display: grid; grid-template-columns: 92px 1fr; gap: 6px 14px; margin-top: 9px; }
+  .issue .row .lbl { color: var(--faint); font: 600 12px/1.6 var(--mono); text-transform: uppercase; letter-spacing: .06em; padding-top: 1px; }
+  .issue .row .txt { color: #d3d9e1; }
+  .issue .row .txt code { white-space: normal; }
+
+  .timeline { border-left: 2px solid var(--line); margin: 10px 0 0 8px; padding-left: 0; }
+  .phase { position: relative; padding: 0 0 22px 26px; }
+  .phase::before { content: ""; position: absolute; left: -7px; top: 5px; width: 12px; height: 12px; border-radius: 50%; background: var(--panel-2); border: 2px solid var(--accent); }
+  .phase.blocking::before { border-color: var(--crit); background: var(--crit); }
+  .phase.hidden::before { border-color: var(--med); }
+  .phase h4 { margin: 0 0 3px; font-size: 15.5px; }
+  .phase .t { font: 12px/1 var(--mono); color: var(--faint); }
+  .phase p { color: var(--muted); font-size: 13.5px; margin: 6px 0 0; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  .card h4 { margin: 0 0 8px; font-size: 15px; color: #fff; }
+  .card p { margin: 0; color: var(--muted); font-size: 13.5px; }
+  .card .ev { margin-top: 10px; font: 11.5px/1.6 var(--mono); color: var(--faint); }
+
+  ul.clean { list-style: none; padding: 0; margin: 0; }
+  ul.clean li { padding: 9px 0; border-bottom: 1px solid var(--line-soft); color: #d3d9e1; }
+  ul.clean li:last-child { border-bottom: 0; }
+  ul.clean li code { margin-right: 6px; }
+
+  .kv { display: grid; grid-template-columns: 210px 1fr; gap: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .kv > div { padding: 12px 16px; border-bottom: 1px solid var(--line-soft); }
+  .kv > div:nth-last-child(-n+2) { border-bottom: 0; }
+  .kv .k { background: var(--bg-soft); color: var(--muted); font: 12.5px/1.5 var(--mono); }
+  .kv .v { color: #d3d9e1; }
+
+  footer { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--line-soft); color: var(--faint); font-size: 12.5px; }
+
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: 1fr 1fr; }
+    .grid2 { grid-template-columns: 1fr; }
+    .issue .row { grid-template-columns: 1fr; gap: 2px; }
+    .issue .row .lbl { padding-top: 8px; }
+    .kv { grid-template-columns: 1fr; }
+    .kv .k { border-bottom: 0; }
+    h1 { font-size: 31px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <p class="eyebrow">Performance audit</p>
+    <h1>Zeron UI: where the time actually goes</h1>
+    <p class="sub">A read of the desktop UI (<code>crates/ui</code>, gpui) and the loading path that feeds it, focused on what is slow now and what is worth fixing. Every finding cites the code.</p>
+    <div class="meta">
+      <span><b>Repo</b> zeron</span>
+      <span><b>Revision</b> a25d3a26</span>
+      <span><b>Date</b> 2026-11-05</span>
+      <span><b>Scope</b> startup, loading, transcript, sidebar, palette, diff, history</span>
+      <span><b>Method</b> source trace + existing perf docs</span>
+    </div>
+  </header>
+
+  <section class="verdict">
+    <p><strong>This codebase is already performance-obsessed.</strong> The transcript is genuinely virtualized with memoized row heights and tail-only relayout, markdown re-parses only the streaming tail, syntax highlighting runs on a background executor, the sidebar row model is fingerprinted and cached, workspace search runs on a real index, and there are measured reports for composer, sidebar, idle, scroll and memory. Most of the obvious wins are already banked.</p>
+    <p>The remaining cost is concentrated in three places. Startup blocks the main thread on font enumeration and the engine boot, streaming rebuilds the entire row model on every token, and the whole shell repaints on every state change. Those three multiply everything else. Fix them and the rest of the list here stops mattering.</p>
+  </section>
+
+  <div class="stats">
+    <div class="stat"><div class="v">723</div><div class="k">Rust files in the workspace</div></div>
+    <div class="stat"><div class="v">24 MB</div><div class="k">of Rust source</div></div>
+    <div class="stat"><div class="v">10</div><div class="k">performance reports already in <code>docs/</code></div></div>
+    <div class="stat"><div class="v">3</div><div class="k">structural issues that drive the rest</div></div>
+  </div>
+
+  <h2><span class="n">01</span>Startup and loading, phase by phase</h2>
+  <p class="lede">The first painted frame is cheap on purpose, it is just the splash. Time to a usable shell is dominated by the engine, not by gpui. Red dots mark phases that block the main thread or the critical path.</p>
+
+  <div class="timeline">
+    <div class="phase blocking">
+      <h4>Main-thread setup before any window</h4>
+      <span class="t">crates/ui/src/lib.rs:183-227</span>
+      <p>Settings JSON load, keymap migration, font registration, theme library load, appearance and history init all run synchronously inside <code>app.run</code>. Font registration enumerates every installed system font and parses each face with <code>ttf_parser</code> (see issue 1). Unbounded by app data, bounded only by how many fonts the machine has.</p>
+    </div>
+    <div class="phase blocking">
+      <h4>Shell construction and keymap rebuild</h4>
+      <span class="t">crates/ui/src/shell.rs:2747-3187</span>
+      <p><code>Shell::new</code> builds the transcript, composer, voice controller, three orbs, the sidebar pane and the session card, plus roughly 40 focus handles. <code>apply_keymap</code> clears all bindings and rebuilds them twice (once for base, once localized). All synchronous, before the first frame.</p>
+    </div>
+    <div class="phase">
+      <h4>First frame: splash only</h4>
+      <span class="t">crates/ui/src/shell.rs:15218</span>
+      <p>The loading gate renders the shell root with the splash overlaid. Nothing heavy paints here, which is deliberate.</p>
+    </div>
+    <div class="phase blocking">
+      <h4>Background engine launch and attach poll</h4>
+      <span class="t">crates/ui/src/state.rs:419-461</span>
+      <p>On the default path the app spawns the background engine and polls the IPC port every 150 ms for up to 20 seconds. Two earlier probes (750 ms and 500 ms) run first. A cold engine start waits for the child to open SQLite and begin serving.</p>
+    </div>
+    <div class="phase blocking">
+      <h4>Engine assembly before the port serves</h4>
+      <span class="t">crates/engine/src/workspace_host.rs:250-375</span>
+      <p><code>DocsStore::open</code> runs WAL setup and a blocking checkpoint, then <code>WorkspaceHost::open</code> loads the whole workspace registry snapshot in one shot (with a one-time legacy Loro import on old profiles) and writes it back before returning. Boot time and memory scale with workspace size.</p>
+    </div>
+    <div class="phase hidden">
+      <h4>Ready, then a fixed splash fade</h4>
+      <span class="t">crates/ui/src/shell.rs:3667-3681</span>
+      <p>Once the engine reports ready the splash fades over about 680 ms (150 ms delay plus a 500 ms run). A fixed cost on top of the real load.</p>
+    </div>
+    <div class="phase">
+      <h4>Opening a chat</h4>
+      <span class="t">crates/engine/src/doc_host.rs:56-60</span>
+      <p>Warm docs reopen in about 11 ms; the watch prepares rows on the background executor and installs them on the foreground. For the 21 MB whale transcript that is about 806 ms background prep and 12 ms foreground install, per <code>docs/whale-ui-responsiveness.md</code>.</p>
+    </div>
+  </div>
+
+  <h2><span class="n">02</span>The biggest issues</h2>
+  <p class="lede">Ranked by likely impact. Severity reflects both how much time it costs and how widely it is felt. Items the project has already documented as deliberate tradeoffs are marked as such rather than presented as bugs.</p>
+
+  <div class="issue high">
+    <div class="issue-head">
+      <span class="issue-rank">01</span>
+      <h3>System font enumeration and parsing on the main thread at startup</h3>
+      <span class="pill high">High</span>
+    </div>
+    <div class="where">crates/ui/src/typography.rs:348-379 · called from crates/ui/src/lib.rs:190</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>installed_families_with_latin_metrics()</code> builds a <code>fontdb::Database</code>, calls <code>load_system_fonts()</code>, then parses every installed face with <code>ttf_parser::Face::parse</code> to test for the <code>m</code> glyph and fixed-width advances.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Work is O(installed fonts) and entirely on the UI thread before the first window. A machine with hundreds of fonts pays it on every launch. It is not measured in any of the existing reports.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Move the enumeration to <code>background_executor</code> and publish the availability map when ready, or parse lazily the first time a family picker opens. The embedded Geist faces can register immediately; only the system scan needs to move.</div></div>
+  </div>
+
+  <div class="issue high">
+    <div class="issue-head">
+      <span class="issue-rank">02</span>
+      <h3>Engine boot loads and rewrites the whole registry before serving</h3>
+      <span class="pill high">High</span>
+    </div>
+    <div class="where">crates/engine/src/workspace_host.rs:250, 262-294, 375 · crates/engine/src/lib.rs:249-299</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>WorkspaceHost::open</code> loads the entire registry snapshot, optionally imports a legacy Loro doc and reads every row, then persists the snapshot back synchronously before returning. It sits behind a 20-second polling loop (<code>crates/ui/src/state.rs:419-448</code>) that only resolves once the engine serves.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Boot time and peak memory scale with total workspace size (chats, spaces, devices, history). The splash hides it, but it is the real "loading everything" delay, and it happens on both cold app start and engine replacement.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Serve the port before the registry is fully hydrated and stream the registry to the UI as it loads, or make the boot-time <code>persist_snapshot</code> conditional on the snapshot actually being dirty. The legacy import can run in the background after first serve.</div></div>
+  </div>
+
+  <div class="issue high">
+    <div class="issue-head">
+      <span class="issue-rank">03</span>
+      <h3>Every streamed token rebuilds the entire transcript row model</h3>
+      <span class="pill high">High</span>
+    </div>
+    <div class="where">crates/ui/src/transcript.rs:5225-5260, 5670-5706 · crates/ui/src/state.rs:1980-1983, 4818-4831</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>sync</code> iterates every entry and rebuilds <code>new_rows</code> for all of them, then diffs the full vector with <code>diff_rows</code>, even though only the tail is spliced and remeasured. <code>rows_for</code> additionally clones each cached entry twice (<code>cached.rows.clone()</code> and an unconditional <code>rows: rows.clone()</code>).</div></div>
+    <div class="row"><div class="lbl">Compounding</div><div class="txt">On a text-append frame <code>apply_transcript_frame</code> removes <code>prepared_transcripts[selected]</code> before emitting, and the watch re-inserts it only afterward. So the emit-driven <code>sync</code> sees no prepared rows and falls back to rebuilding on the UI thread. The subagent path inserts prepared first, so it does not pay this.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Cost is O(total rows) per token. A 2000-row conversation re-clones roughly 2000 rows on every delta, at the streaming cadence. Background preparation exists to prevent exactly this and is being discarded on the hot path.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Insert <code>prepared</code> before the update emit (match the subagent ordering), and make <code>sync</code> a tail-only update when the entry list is append-only. Avoiding the second clone in <code>rows_for</code> is a cheap follow-up.</div></div>
+  </div>
+
+  <div class="issue high">
+    <div class="issue-head">
+      <span class="issue-rank">04</span>
+      <h3>Any state change repaints the whole shell, transcript and sidebar</h3>
+      <span class="pill high">High</span>
+    </div>
+    <div class="where">crates/ui/src/shell.rs:2748, 2928, 2934</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>Shell</code> observes <code>AppState</code> and calls <code>cx.notify()</code> on any change; <code>Shell</code> also notifies the transcript, which notifies the sidebar pane. Writes are change-gated, but a change has no granularity. The only targeted signal is <code>TranscriptTextChanged</code> for text-only appends.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">This is the multiplier. A settled tool call, a presence heartbeat, a pin, a resize or a hover all walk the full shell render. Documented as a known cost in <code>docs/performance-sidebar.md</code>, not a regression.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Hard to dismantle fully in gpui, but the highest-value move is a per-row sidebar notification channel (an event that names the changed chat), so a status flip does not re-run the whole list. The palette and other panes could subscribe to narrower signals too.</div></div>
+  </div>
+
+  <div class="issue high">
+    <div class="issue-head">
+      <span class="issue-rank">05</span>
+      <h3>Sidebar rebuilds its full row model once a second and does O(n) work per frame</h3>
+      <span class="pill high">High</span>
+    </div>
+    <div class="where">crates/ui/src/state.rs:5034-5124 · crates/ui/src/shell/spaces.rs:6760-7336</div>
+    <div class="row"><div class="lbl">What</div><div class="txt">The row-model cache key is a fingerprint that hashes the current clock second plus every chat, session, space, device and change-request snapshot. While the selected chat is working, <code>shell_clock_wake</code> forces a render every second, so the whole model rebuilds every second. Separately, <code>render_active_rows</code> computes <code>format_time_ago</code>, a row-id <code>String</code> and up to four key strings for <strong>every</strong> row before the off-screen test, plus an O(rows × groups) group scan and per-frame set/retain/order work.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Virtualization skips element content but not these per-row allocations, off-screen rows included. Cost scales with session count and is already documented as a per-paint cost in <code>docs/performance-sidebar.md</code>.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Move <code>format_time_ago</code> and the key strings below the off-screen split, cache them on the model row (they change only with the second or the row data), and key the model on derived statuses rather than the raw clock. The fingerprint itself could hash only fields that affect the drawn row.</div></div>
+  </div>
+
+  <div class="issue med">
+    <div class="issue-head">
+      <span class="issue-rank">06</span>
+      <h3>Per-frame hashing and cloning in every visible transcript row</h3>
+      <span class="pill med">Medium</span>
+    </div>
+    <div class="where">crates/ui/src/transcript.rs:8040-8045, 2614, 8700-8724 · crates/ui/src/syntax_cache.rs:26</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>render_row</code> clones the row and clones the whole <code>Theme</code> per visible row per frame. For each visible code block it computes <code>DocumentHighlightKey::new</code>, which SHA-256 hashes the full code text, just to look up an already-cached highlight. The tokenization itself is correctly backgrounded.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">A constant factor, but applied to every visible row and code block at repaint rate, including on hover, scroll and animation frames. Repeated hashing of the same buffers.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Memoize the document key per (row, block) so it is computed when content changes, not per frame. Borrow or <code>Arc</code> the row instead of cloning it, and hoist the theme clone out of the row loop.</div></div>
+  </div>
+
+  <div class="issue med">
+    <div class="issue-head">
+      <span class="issue-rank">07</span>
+      <h3>Command palette searches every chat on each keystroke and each hover</h3>
+      <span class="pill med">Medium</span>
+    </div>
+    <div class="where">crates/ui/src/shell/command_palette.rs:637, 765-803, 1145 · crates/ui/src/shell/thread_search.rs:27-41</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>palette_sections</code> is recomputed on every render, every arrow key and every mouse hover (<code>hover_command</code> notifies). <code>thread_matches</code> walks every chat, doing several linear scans and a <code>format!</code> per chat, and <code>score_thread</code> lowercases five fields per chat. Only workspace content search is debounced.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">O(all chats) with allocations per interaction. Hovering a result re-runs the whole search. Noticeable with a few hundred sessions.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Memoize sections by (query, tab) and drop the notify on hover (repaint only the hovered row). Lowercase the searchable fields once at chat-ingest time.</div></div>
+  </div>
+
+  <div class="issue med">
+    <div class="issue-head">
+      <span class="issue-rank">08</span>
+      <h3>Render path does synchronous filesystem probes for inline code links</h3>
+      <span class="pill med">Medium</span>
+    </div>
+    <div class="where">crates/ui/src/workspace_links.rs:120-131 · reached from crates/ui/src/transcript.rs:8183, 8217</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>PathProbes::kind</code> calls <code>std::fs::metadata</code> during row render to decide if an inline-code span names a real file or directory. It is memoized per path per link-roots revision, and the cache is cleared when link roots change.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">On a cache miss (new streamed text, first paint of a part, link-roots change) each span does a blocking metadata syscall during layout. <code>resolve_inline_code_path</code> can probe several roots plus context dirs per span.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Precompute the probe results during background row preparation, or move misses to the background executor and render the neutral state until they resolve.</div></div>
+  </div>
+
+  <div class="issue med">
+    <div class="issue-head">
+      <span class="issue-rank">09</span>
+      <h3>Caches that grow without eviction across a session</h3>
+      <span class="pill med">Medium</span>
+    </div>
+    <div class="where">crates/ui/src/transcript.rs:2599, 3615-3619, 5180 · crates/ui/src/file_icons.rs:213-215</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>HighlightStore.entries</code> is keyed by (row id, block index) and cleared only on chat attach. <code>blob_details</code> and <code>blob_fetch_order</code> hold full tool diff and output text and are never pruned. The file-icon raster cache is a process-global map with no budget.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">A long-lived window accumulates dead slots and retained payloads. <code>blob_details</code> even survives chat switches, since the attach reset does not include it. The rest of the caching in the crate is well bounded (syntax 96 docs / 24 MB LRU, formula cache, inline-link LRU), which makes these stand out.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Prune both maps on a row/attach sweep, and give the icon raster cache an LRU bound like the others.</div></div>
+  </div>
+
+  <div class="issue med">
+    <div class="issue-head">
+      <span class="issue-rank">10</span>
+      <h3>Diff pane allocations per row per frame</h3>
+      <span class="pill med">Medium</span>
+    </div>
+    <div class="where">crates/ui/src/changes.rs:3246, 3250, 3275, 3281</div>
+    <div class="row"><div class="lbl">What</div><div class="txt">Each visible diff row clones <code>parsed.key</code> (a <code>String</code>), clones the theme, and builds two <code>format!("changes-code-row-{ix}")</code> element ids per frame. The patch parse and highlighting are correctly off-thread and keyed.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Small allocations, but on a large diff this is a per-line, per-frame cost. The single-pass excerpt allocation (<code>vec![Vec::new(); max_line]</code> up to 200k) is on the background path, which is fine.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Borrow the parse key, hoist the theme clone, and build element ids with a reusable buffer or a cheaper stable id.</div></div>
+  </div>
+
+  <div class="issue low">
+    <div class="issue-head">
+      <span class="issue-rank">11</span>
+      <h3>Branch inspection spawns six to eight git processes in series</h3>
+      <span class="pill low">Low</span>
+    </div>
+    <div class="where">crates/engine/src/source_control.rs:1335-1436</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>GitCheckoutInspector::inspect</code> awaits <code>rev-parse</code>, <code>branch --show-current</code>, <code>rev-parse @{upstream}</code>, two <code>config --get</code>, <code>remote</code>, <code>remote get-url</code> (twice) and <code>symbolic-ref</code> as separate process spawns.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">It is on the RPC path that resolves PR context. On Windows, process spawn cost is real. The chain is serial and can be collapsed.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Batch into one <code>git for-each-ref</code> or a single <code>git status --porcelain=v2 --branch</code> call, and reuse results for the PR lookup.</div></div>
+  </div>
+
+  <div class="issue low">
+    <div class="issue-head">
+      <span class="issue-rank">12</span>
+      <h3>Two UI-thread parses per keystroke: composer markdown and git history</h3>
+      <span class="pill low">Low</span>
+    </div>
+    <div class="where">crates/ui/src/composer.rs:4483 · crates/ui/src/history.rs:2153-2206</div>
+    <div class="row"><div class="lbl">What</div><div class="txt"><code>composer_markdown::faces</code> runs a full <code>pulldown-cmark</code> parse of the draft on the UI thread whenever the composer reshapes (up to 128 KB), while syntax spans are backgrounded. History filters all loaded commits with per-commit <code>to_ascii_lowercase</code> and runs <code>layout_graph</code> twice (visible and all commits) on each keystroke.</div></div>
+    <div class="row"><div class="lbl">Why slow</div><div class="txt">Both are per-keystroke and grow with draft size or commit count. The composer is gated by a layout key, so it is per reshape rather than per frame.</div></div>
+    <div class="row"><div class="lbl">Fix</div><div class="txt">Move the composer face parse to the background executor alongside the syntax spans, and precompute a lowercase haystack per commit at load.</div></div>
+  </div>
+
+  <h2><span class="n">03</span>What is already fast</h2>
+  <p class="lede">Worth stating plainly, so the priority list above is read in context. These are the non-obvious things that are done well.</p>
+  <div class="grid2">
+    <div class="card">
+      <h4>Transcript virtualization is real</h4>
+      <p>gpui <code>list()</code> with a 320 px overdraw, row heights memoized by <code>ListState</code>. Streaming remeasures only the tail; a whole-list <code>remeasure()</code> is reserved for width, font or style changes, never a token.</p>
+      <div class="ev">transcript.rs:3789, 5543-5585, 11503</div>
+    </div>
+    <div class="card">
+      <h4>Markdown parses incrementally</h4>
+      <p>The streaming tail re-parses from the second-to-last stable block boundary, completed blocks are shared by length, and highlighting plus row preparation run on the background executor.</p>
+      <div class="ev">crates/markdown/src/parser.rs:2100-2178 · transcript.rs:2605-2712</div>
+    </div>
+    <div class="card">
+      <h4>Bounded caches where it counts</h4>
+      <p>Syntax documents are a 96-entry / 24 MB LRU, the formula cache is byte-bounded, the inline-link cache is an LRU, and the transcript render cache retains only the viewport plus overdraw.</p>
+      <div class="ev">syntax_cache.rs:14-16 · markdown/render.rs:443-509</div>
+    </div>
+    <div class="card">
+      <h4>Animation clocks are leased</h4>
+      <p>The shared pulse clock runs at 30 Hz, small spinners at 15 Hz, and leases expire when hidden. The macOS renderer stops its display link when frame requests park, cutting idle wakeups by about 96% in the measured report.</p>
+      <div class="ev">motion.rs:206-273 · docs/performance-idle-presence.md</div>
+    </div>
+    <div class="card">
+      <h4>Workspace search is indexed</h4>
+      <p>File and content search run on a per-root fff index with an idle-eviction lifecycle, cutting tree search from hundreds of milliseconds to low single digits on a large monorepo.</p>
+      <div class="ev">crates/engine/src/workspace_search.rs · docs/performance-workspace-search.md</div>
+    </div>
+    <div class="card">
+      <h4>Diff parsing is keyed and off-thread</h4>
+      <p>The patch parse is skipped when the key is unchanged, runs on the background executor otherwise, and highlights per file by fingerprint. Only the per-row render allocations remain.</p>
+      <div class="ev">changes.rs:2348-2363, 3106-3237</div>
+    </div>
+  </div>
+
+  <h2><span class="n">04</span>How to measure it yourself</h2>
+  <p class="lede">The repo already ships the tooling. The findings above are from reading code, not from a benchmark run on this machine, so treat the ordering as a hypothesis to confirm.</p>
+  <div class="kv">
+    <div class="k">ZERON_FRAME_STATS=1</div><div class="v">Per-view render cadence, including sidebar frames per second. The right way to see issue 4 and 5.</div>
+    <div class="k">ZERON_NO_RENDER_CACHE=1</div><div class="v">A/B knob for the transcript flatten cache.</div>
+    <div class="k">scripts/perf/resource-profile.mjs</div><div class="v">The replay profiler used for the CPU and RSS reports. Drives a captured stream through the real window.</div>
+    <div class="k">scripts/perf/profile-composer.py</div><div class="v">Composer-focused CPU and memory profiler with real input events.</div>
+    <div class="k">scripts/fixtures/resource-stream.jsonl</div><div class="v">The 52 KB captured reply reused by most perf docs, at a fixed delta cadence.</div>
+    <div class="k">ZERON_WHALE_SNAPSHOT</div><div class="v">Runs the huge-transcript open and revisit test used to validate background preparation.</div>
+    <div class="k">crate bench, engine</div><div class="v"><code>cargo run --release -p zeron-engine --example workspace_search_bench</code> for the search index.</div>
+  </div>
+  <p class="section-note" style="margin-top:14px">Existing reports worth reading first: <code>docs/performance-sidebar.md</code>, <code>docs/performance-resource-usage.md</code>, <code>docs/whale-ui-responsiveness.md</code>, <code>docs/performance-idle-presence.md</code>.</p>
+
+  <footer>
+    Generated from a source trace of <code>crates/ui</code> and <code>crates/engine</code> at revision <code>a25d3a26</code>, plus the existing performance reports under <code>docs/</code>. Line references are to that revision. No code was changed. The three structural issues at the top are the ones worth confirming with <code>ZERON_FRAME_STATS</code> before any refactor.
+  </footer>
+
+</div>
+</body>
+</html>

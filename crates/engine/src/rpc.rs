@@ -3097,8 +3097,9 @@ impl RpcService for EngineRpc {
                 // discardable) even when the chat is archived; the guard lives
                 // exactly as long as the stream.
                 let interest = self.diff_sync.retain_chat(&p.chat_id);
+                let open_started = std::time::Instant::now();
                 let stream = if opening_tail {
-                    opening_doc_messages_stream(self.doc_host.clone(), p.chat_id).await?
+                    opening_doc_messages_stream(self.doc_host.clone(), p.chat_id.clone()).await?
                 } else {
                     let handle = self
                         .doc_host
@@ -3106,6 +3107,12 @@ impl RpcService for EngineRpc {
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     doc_messages_stream(handle.watch_messages(), handle.doc_arc())
                 };
+                tracing::debug!(
+                    chat = %p.chat_id,
+                    opening_tail,
+                    open_ms = open_started.elapsed().as_millis() as u64,
+                    "opened chat transcript"
+                );
                 Ok(RpcReply::Stream(
                     stream
                         .map(move |frame| {

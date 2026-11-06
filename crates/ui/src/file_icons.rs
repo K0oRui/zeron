@@ -208,6 +208,11 @@ pub fn icon(identity: FileIconIdentity<'_>, appearance: Appearance) -> Img {
     img(asset_path(identity, appearance)).flex_none()
 }
 
+/// Bound on the process-global raster map. The real themed icon set is well
+/// below this, so eviction only guards a pathological blend of distinct
+/// filenames and never fires in normal use.
+const MAX_RASTER_ICONS: usize = 1024;
+
 /// A file-theme icon rasterized for painting straight into a text layout,
 /// where no [`Img`] element can sit. Rasterized once per asset path.
 pub(crate) fn raster(path: &SharedString, cx: &App) -> Option<Arc<RenderImage>> {
@@ -219,6 +224,9 @@ pub(crate) fn raster(path: &SharedString, cx: &App) -> Option<Arc<RenderImage>> 
     }
     let svg = Assets.load(path).ok()??;
     let image = cx.svg_renderer().render_single_frame(&svg, 2.0).ok()?;
+    if cache.len() >= MAX_RASTER_ICONS {
+        cache.clear();
+    }
     cache.insert(path.clone(), image.clone());
     Some(image)
 }

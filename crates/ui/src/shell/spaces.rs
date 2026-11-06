@@ -3950,7 +3950,6 @@ impl Shell {
         full_height: f32,
         content: AnyElement,
     ) -> AnyElement {
-        let target = if open { full_height } else { 0.0 };
         let frame = div().w_full().flex_none().overflow_hidden().child(content);
         let Some(tween) = self
             .sidebar_disclosure_motion
@@ -3958,7 +3957,15 @@ impl Shell {
             .copied()
             .filter(|motion| motion.animating())
         else {
-            return frame.h(px(target)).into_any_element();
+            // Open: let the content set the body height. A nested disclosure inside
+            // it (a project placed in a section) then reflows every row below it
+            // smoothly, instead of the outer body snapping to a precomputed height
+            // while only the nested body animates.
+            return if open {
+                frame.into_any_element()
+            } else {
+                frame.h(px(0.0)).into_any_element()
+            };
         };
         let denominator = full_height.max(1.0);
         frame
@@ -7138,8 +7145,6 @@ impl Shell {
                 let row_project = row.group.as_ref().map(|(key, _)| key.clone());
                 let in_project_block = section_projects
                     .is_some_and(|keys| row_project.as_ref().is_some_and(|key| keys.contains(key)));
-                let time_ago: SharedString =
-                    format_time_ago(row.last_message_at.unwrap_or(row.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(id.as_str());
                 let height = sidebar_row_height(
                     self.settings.sidebar_compact,
@@ -7227,6 +7232,10 @@ impl Shell {
                         .flex_none()
                         .into_any_element()
                 } else {
+                    // Only a drawn row spends the time-ago allocation; off-screen
+                    // placeholders no longer pay it per frame.
+                    let time_ago: SharedString =
+                        format_time_ago(row.last_message_at.unwrap_or(row.created_at), now).into();
                     let element = self.render_chat_row(
                         id.to_string(),
                         Some(row.device_id.as_str()),

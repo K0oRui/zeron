@@ -247,7 +247,10 @@ impl WorkspaceHost {
     /// Load (or migrate, or init) the registry, upsert this device's row, start
     /// the change-driven task, and join the edge registry room when configured.
     pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
+        let open_started = std::time::Instant::now();
         let stored = store.load_snapshot(REGISTRY_DOC_ID)?;
+        let had_snapshot = stored.is_some();
+        let load_ms = open_started.elapsed().as_millis() as u64;
         let mut doc = match stored {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
                 .map_err(|e| EngineError::Other(format!("registry snapshot load failed: {e}")))?,
@@ -331,6 +334,9 @@ impl WorkspaceHost {
         })?;
 
         let state = doc.read_all()?;
+        let chat_count = state.chats.len();
+        let space_count = state.spaces.len();
+        let device_count = state.devices.len();
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
@@ -372,9 +378,14 @@ impl WorkspaceHost {
         // Persist immediately: after this boot the migration source is never
         // read again, so the registry snapshot must exist even if the process
         // dies before the first debounced save.
+        // Stays synchronous on the boot path: this save also compacts a bloated
+        // registry, and the free-page reclaim below depends on it having run
+        // (see the `boot_compaction_reclaims_the_freed_store_pages` test).
+        let persist_started = std::time::Instant::now();
         if let Err(error) = host.inner.persist_snapshot() {
             tracing::warn!(%error, "registry snapshot save failed");
         }
+        let persist_ms = persist_started.elapsed().as_millis() as u64;
         // Reclaim free pages (a bloated store, or the pages a one-time
         // registry compaction just freed) off the boot path. The store gates
         // the VACUUM on its own thresholds, so ordinary boots only checkpoint.
@@ -385,6 +396,16 @@ impl WorkspaceHost {
         if host.inner.config.edge.is_some() {
             tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
         }
+        tracing::info!(
+            load_ms,
+            persist_ms,
+            total_ms = open_started.elapsed().as_millis() as u64,
+            chats = chat_count,
+            spaces = space_count,
+            devices = device_count,
+            migrated = !had_snapshot,
+            "workspace registry opened"
+        );
         Ok(host)
     }
 
