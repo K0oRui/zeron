@@ -42,6 +42,9 @@ struct ChatJournal {
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
+    /// Mirrors the `{chat_id}.open` marker: the last appended event was not a
+    /// `Done`. Cached so a streaming append never re-stats the marker file.
+    open: bool,
 }
 
 /// Append-only JSONL journal store, one file per chat.
@@ -80,6 +83,24 @@ impl RunJournal {
 
     fn stop_path(&self, chat_id: &str) -> PathBuf {
         self.dir.join(format!("{}.stopped", sanitize_id(chat_id)))
+    }
+
+    /// Marker beside a chat's journal while its run is unfinished. Boot recovery
+    /// reads these instead of tail-reading every journal ([`Self::stale_sessions`]).
+    fn open_path(&self, chat_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.open", sanitize_id(chat_id)))
+    }
+
+    /// Mark a run open (its journal's last event is not `Done`). Idempotent.
+    pub fn note_run_open(&self, chat_id: &str) {
+        if let Err(err) = std::fs::write(self.open_path(chat_id), []) {
+            tracing::warn!(chat = %chat_id, error = %err, "run-open marker write failed");
+        }
+    }
+
+    /// Clear the open marker once a run's `Done` has been journaled. Idempotent.
+    pub fn clear_run_open(&self, chat_id: &str) {
+        let _ = std::fs::remove_file(self.open_path(chat_id));
     }
 
     /// Auto-resume revival budget (zeron `resumeAttempt`/`MAX_AUTO_RESUME`):
@@ -171,49 +192,74 @@ impl RunJournal {
 
     /// Append one event; returns its journal seq.
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
-        let mut files = self.lock();
-        if !files.contains_key(chat_id) {
-            // Bound the open-fd set: entries were never removed, so every chat
-            // ever run held a descriptor for the process lifetime. Dropping is
-            // safe — the next append reopens and rescans the tail. The cap
-            // comfortably exceeds concurrent runs, so eviction stays rare.
-            const OPEN_FILE_CAP: usize = 16;
-            if files.len() >= OPEN_FILE_CAP {
-                files.clear();
+        let done = matches!(event, AgentEvent::Done { .. });
+        let (seq, opened, closed) = {
+            let mut files = self.lock();
+            if !files.contains_key(chat_id) {
+                // Bound the open-fd set: entries were never removed, so every chat
+                // ever run held a descriptor for the process lifetime. Dropping is
+                // safe — the next append reopens and rescans the tail. The cap
+                // comfortably exceeds concurrent runs, so eviction stays rare.
+                const OPEN_FILE_CAP: usize = 16;
+                if files.len() >= OPEN_FILE_CAP {
+                    files.clear();
+                }
+                let path = self.path_for(chat_id);
+                let (next_seq, needs_newline) = scan_tail(&path)?;
+                let file = OpenOptions::new().create(true).append(true).open(&path)?;
+                // The marker mirrors "last event was not Done"; trust it when the
+                // journal is (re)opened rather than re-statting it per append.
+                let open = self
+                    .dir
+                    .join(format!("{}.open", sanitize_id(chat_id)))
+                    .exists();
+                files.insert(
+                    chat_id.to_string(),
+                    ChatJournal {
+                        file,
+                        next_seq,
+                        needs_newline,
+                        open,
+                    },
+                );
             }
-            let path = self.path_for(chat_id);
-            let (next_seq, needs_newline) = scan_tail(&path)?;
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            files.insert(
-                chat_id.to_string(),
-                ChatJournal {
-                    file,
-                    next_seq,
-                    needs_newline,
-                },
-            );
-        }
-        // Entry guaranteed present; avoid unwrap in a library path regardless.
-        let Some(journal) = files.get_mut(chat_id) else {
-            return Err(JournalError::Io(std::io::Error::other(
-                "journal entry vanished under lock",
-            )));
-        };
-        let seq = journal.next_seq;
-        let line = serde_json::to_string(&JournalLine {
-            seq,
-            event: event.clone(),
-        })?;
-        let mut buf = Vec::with_capacity(line.len() + 2);
-        if journal.needs_newline {
+            // Entry guaranteed present; avoid unwrap in a library path regardless.
+            let Some(journal) = files.get_mut(chat_id) else {
+                return Err(JournalError::Io(std::io::Error::other(
+                    "journal entry vanished under lock",
+                )));
+            };
+            let seq = journal.next_seq;
+            let line = serde_json::to_string(&JournalLine {
+                seq,
+                event: event.clone(),
+            })?;
+            let mut buf = Vec::with_capacity(line.len() + 2);
+            if journal.needs_newline {
+                buf.push(b'\n');
+            }
+            buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
+            journal.file.write_all(&buf)?;
+            journal.file.flush()?;
+            journal.needs_newline = false;
+            journal.next_seq = seq + 1;
+            // Keep the boot hint in step with the journal: a `Done` closes the
+            // run, anything else opens it. Only a transition touches the marker.
+            let closed = done && journal.open;
+            let opened = !done && !journal.open;
+            if closed {
+                journal.open = false;
+            } else if opened {
+                journal.open = true;
+            }
+            (seq, opened, closed)
+        };
+        if opened {
+            self.note_run_open(chat_id);
+        } else if closed {
+            self.clear_run_open(chat_id);
         }
-        buf.extend_from_slice(line.as_bytes());
-        buf.push(b'\n');
-        journal.file.write_all(&buf)?;
-        journal.file.flush()?;
-        journal.needs_newline = false;
-        journal.next_seq = seq + 1;
         Ok(seq)
     }
 
@@ -249,10 +295,54 @@ impl RunJournal {
         RevEvents::open(&self.path_for(chat_id))
     }
 
-    /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
-    /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
+    /// Chat ids whose run died mid-stream and need recovery (stamp `aborted`,
+    /// close the journal).
+    ///
+    /// Reads the `.open` markers a run maintains instead of every journal: opening
+    /// and tail-reading hundreds of multi-megabyte journals was the whole boot cost.
+    /// A marker is only a hint, so each candidate is confirmed against its own
+    /// journal. The first call seeds the markers from a full scan, so an install
+    /// that predates them (or a test that writes journals by hand) is not missed;
+    /// boots after that are a directory listing plus a few tail reads.
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
+        let index = self.dir.join(".open-index");
+        if !index.exists() {
+            let stale = self.scan_all_journals()?;
+            for chat_id in &stale {
+                self.note_run_open(chat_id);
+            }
+            if let Err(err) = std::fs::write(&index, []) {
+                tracing::warn!(error = %err, "open-index sentinel write failed");
+            }
+            return Ok(stale);
+        }
         let mut stale = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("open") {
+                continue;
+            }
+            let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match last_valid_line(&self.path_for(chat_id))? {
+                // The run finished: drop a marker a crash left behind.
+                Some((_, AgentEvent::Done { .. })) | None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Some(_) => stale.push(chat_id.to_string()),
+            }
+        }
+        stale.sort();
+        Ok(stale)
+    }
+
+    /// Every journal whose tail is not `Done`: the pre-marker discovery, kept for
+    /// the one-time seeding above. Tail reads are independent per file, so they fan
+    /// out across cores.
+    fn scan_all_journals(&self) -> Result<Vec<String>, JournalError> {
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -262,12 +352,57 @@ impl RunJournal {
             let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            // Tail read only: journals reach tens of MB and boot scans every one.
-            match last_valid_line(&path)? {
-                Some((_, AgentEvent::Done { .. })) | None => {}
-                Some(_) => stale.push(chat_id.to_string()),
-            }
+            candidates.push((chat_id.to_string(), path));
         }
+        // Tail read only: journals reach tens of MB and boot scans every one. A few
+        // files are not worth a thread spawn; a large journal dir is.
+        const PARALLEL_MIN: usize = 8;
+        let scan = |path: &Path| -> Result<bool, JournalError> {
+            Ok(matches!(
+                last_valid_line(path)?,
+                Some((_, event)) if !matches!(event, AgentEvent::Done { .. })
+            ))
+        };
+        let mut stale: Vec<String> = if candidates.len() >= PARALLEL_MIN {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(1)
+                .min(candidates.len());
+            let chunk = candidates.len().div_ceil(workers);
+            let per_worker: Vec<Result<Vec<String>, JournalError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = candidates
+                    .chunks(chunk)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut out = Vec::new();
+                            for (chat_id, path) in chunk {
+                                if scan(path)? {
+                                    out.push(chat_id.clone());
+                                }
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("journal scan worker"))
+                    .collect()
+            });
+            let mut out = Vec::new();
+            for result in per_worker {
+                out.extend(result?);
+            }
+            out
+        } else {
+            let mut out = Vec::new();
+            for (chat_id, path) in &candidates {
+                if scan(path)? {
+                    out.push(chat_id.clone());
+                }
+            }
+            out
+        };
         stale.sort();
         Ok(stale)
     }
@@ -275,6 +410,7 @@ impl RunJournal {
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);
+        self.clear_run_open(chat_id);
         let path = self.path_for(chat_id);
         if path.exists() {
             std::fs::remove_file(path)?;
@@ -733,6 +869,59 @@ mod tests {
         assert_eq!(journal.stale_sessions().unwrap(), expected);
         assert!(expected.contains(&"multi-chunk-garbage-tail".to_string()));
         assert!(!expected.contains(&"multi-chunk-middle-line".to_string()));
+    }
+
+    #[test]
+    fn open_markers_drive_the_boot_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // A finished run clears its marker; a crashed one leaves it.
+        journal.append("done-chat", &text("a")).unwrap();
+        journal.append("done-chat", &done()).unwrap();
+        journal.append("dead-chat", &text("a")).unwrap();
+        assert!(!dir.path().join("done-chat.open").exists());
+        assert!(dir.path().join("dead-chat.open").exists());
+
+        // The first scan seeds the markers; a later boot trusts them.
+        assert_eq!(
+            journal.stale_sessions().unwrap(),
+            vec!["dead-chat".to_string()]
+        );
+        let reopened = RunJournal::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.stale_sessions().unwrap(),
+            vec!["dead-chat".to_string()]
+        );
+
+        // A marker a crash left beside a finished journal is verified away.
+        std::fs::write(dir.path().join("done-chat.open"), []).unwrap();
+        assert_eq!(
+            reopened.stale_sessions().unwrap(),
+            vec!["dead-chat".to_string()]
+        );
+        assert!(!dir.path().join("done-chat.open").exists());
+    }
+
+    #[test]
+    fn stale_sessions_parallel_scan_matches_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        // More journals than the parallel threshold, so the fan-out path runs.
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            let chat = format!("chat-{i:02}");
+            let bytes = if i % 3 == 0 {
+                format!("{}\n", line(1, text("streaming")))
+            } else {
+                format!("{}\n", line(1, done()))
+            };
+            std::fs::write(dir.path().join(format!("{chat}.jsonl")), bytes).unwrap();
+            if i % 3 == 0 {
+                expected.push(chat);
+            }
+        }
+        let journal = RunJournal::open(dir.path()).unwrap();
+        expected.sort();
+        assert_eq!(journal.stale_sessions().unwrap(), expected);
     }
 
     #[test]

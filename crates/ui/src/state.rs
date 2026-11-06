@@ -1977,9 +1977,11 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        if let Some(id) = &self.selected_chat {
-            self.prepared_transcripts.remove(id);
-        }
+        // The prepared snapshot is not cleared here: the watch pumps own its
+        // lifecycle and install the fresh snapshot before the frame emits, so
+        // the synchronous transcript sync can reuse it (see
+        // `receive_opening_transcript_update`). Clearing it here would drop the
+        // just-installed snapshot and force an O(rows) rebuild on the UI thread.
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
@@ -2044,6 +2046,7 @@ impl AppState {
     pub(crate) fn receive_opening_transcript_update(
         &mut self,
         update: zeron_doc::TranscriptUpdate,
+        prepared: Option<Arc<crate::transcript::PreparedTranscript>>,
         history_pending: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), TranscriptDesync> {
@@ -2059,12 +2062,28 @@ impl AppState {
         } else {
             Vec::new()
         };
+        // Install the freshly prepared rows before the frame is applied. The
+        // apply emits, which drives the transcript's synchronous `sync`; seeing
+        // the prepared snapshot there lets it reuse rows instead of rebuilding
+        // every entry on the UI thread. The subagent pump orders it the same
+        // way; the primary pump used to install it only after the emit.
+        if let Some(prepared) = prepared
+            && let Some(id) = self.selected_chat.clone()
+        {
+            self.prepared_transcripts.insert(id, prepared);
+        }
         cx.background_executor()
             .spawn(async move {
                 drop((old_prepared, old_entries));
             })
             .detach();
-        self.receive_transcript_update(update, cx)?;
+        let result = self.receive_transcript_update(update, cx);
+        if result.is_err()
+            && let Some(id) = &self.selected_chat
+        {
+            self.prepared_transcripts.remove(id);
+        }
+        result?;
         if history_pending {
             self.transcript_replayed = false;
         }
@@ -4821,13 +4840,14 @@ fn spawn_transcript_watch(
                         if history_pending && state.transcript_replayed {
                             return;
                         }
-                        if let Err(err) =
-                            state.receive_opening_transcript_update(update, history_pending, cx)
-                        {
+                        if let Err(err) = state.receive_opening_transcript_update(
+                            update,
+                            Some(prepared),
+                            history_pending,
+                            cx,
+                        ) {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
-                        } else {
-                            state.prepared_transcripts.insert(chat_id.clone(), prepared);
                         }
                     }
                 });
@@ -6118,7 +6138,7 @@ mod tests {
             };
             state.select_chat(Some("whale".into()), cx);
             state
-                .receive_opening_transcript_update(update("tail"), true, cx)
+                .receive_opening_transcript_update(update("tail"), None, true, cx)
                 .unwrap();
             assert_eq!(state.transcript[0].id, "tail");
             assert!(
@@ -6132,10 +6152,10 @@ mod tests {
             );
             state.select_chat(Some("whale".into()), cx);
             state
-                .receive_opening_transcript_update(update("full"), false, cx)
+                .receive_opening_transcript_update(update("full"), None, false, cx)
                 .unwrap();
             state
-                .receive_opening_transcript_update(update("tail"), true, cx)
+                .receive_opening_transcript_update(update("tail"), None, true, cx)
                 .unwrap();
             assert_eq!(
                 state.transcript[0].id, "full",
@@ -6144,7 +6164,7 @@ mod tests {
             state.select_chat(None, cx);
             state.select_chat(Some("whale".into()), cx);
             state
-                .receive_opening_transcript_update(update("tail"), true, cx)
+                .receive_opening_transcript_update(update("tail"), None, true, cx)
                 .unwrap();
             assert_eq!(
                 state.transcript[0].id, "full",

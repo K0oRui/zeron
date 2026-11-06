@@ -586,6 +586,14 @@ impl Shell {
                 .sidebar_collapsed_groups
                 .contains(&collapse_key);
             let motion_key = format!("group:{collapse_key}");
+            // The nested project disclosure animates its body height exactly like a
+            // top-level project group; without this it snapped open and shut.
+            let body_height = project_rows
+                .iter()
+                .map(|(_, height, _)| *height)
+                .sum::<f32>()
+                + SIDEBAR_LIST_GAP * project_rows.len().saturating_sub(1) as f32;
+            self.begin_queued_sidebar_reveal(&motion_key, !collapsed, body_height);
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let count = project_rows.len();
             let drag_label = label.clone();
@@ -593,6 +601,7 @@ impl Shell {
                 self.render_project_group_icon(&chat_id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, cx)
             });
             let toggle_key = collapse_key.clone();
+            let toggle_motion_key = motion_key.clone();
             let header = spaces::sidebar_disclosure_header(
                 theme,
                 icon,
@@ -608,10 +617,18 @@ impl Shell {
                 move || format!("section-project-{id}-{key}")
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.settings.sidebar_collapsed_groups.remove(&toggle_key) {
+                let was_open = !this.settings.sidebar_collapsed_groups.contains(&toggle_key);
+                this.begin_sidebar_disclosure_motion(
+                    &toggle_motion_key,
+                    if was_open { body_height } else { 0.0 },
+                    if was_open { 0.0 } else { body_height },
+                );
+                if was_open {
                     this.settings
                         .sidebar_collapsed_groups
                         .insert(toggle_key.clone());
+                } else {
+                    this.settings.sidebar_collapsed_groups.remove(&toggle_key);
                 }
                 this.schedule_save(cx);
                 cx.notify();
@@ -647,19 +664,11 @@ impl Shell {
                     })
                 },
             );
-            let body_height = if collapsed {
-                0.0
-            } else {
-                project_rows
-                    .iter()
-                    .map(|(_, height, _)| *height)
-                    .sum::<f32>()
-                    + SIDEBAR_LIST_GAP * project_rows.len().saturating_sub(1) as f32
-            };
             let line_before = show_line && insert_before.as_deref() == Some(key.as_str());
             let line_after =
                 show_line && insert_after_last && last_anchor.as_deref() == Some(key.as_str());
-            let block_height = spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT + body_height;
+            let block_height =
+                spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT + if collapsed { 0.0 } else { body_height };
             // The lifted project leaves an empty landing pad of its own height
             // so the gap can travel without moving the rows below it.
             let placeholder = placeholder_key.as_deref() == Some(key.as_str());
@@ -683,22 +692,25 @@ impl Shell {
                     )
                     .into_any_element()
             } else {
+                let body = self.render_sidebar_disclosure_body(
+                    &motion_key,
+                    !collapsed,
+                    body_height,
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .pl(px(10.0))
+                        .gap(px(SIDEBAR_LIST_GAP))
+                        .children(project_rows.into_iter().map(|(_, _, row)| row))
+                        .into_any_element(),
+                );
                 div()
                     .w_full()
                     .flex()
                     .flex_col()
                     .child(header)
-                    .when(!collapsed, |el| {
-                        el.child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .pl(px(10.0))
-                                .gap(px(SIDEBAR_LIST_GAP))
-                                .children(project_rows.into_iter().map(|(_, _, row)| row)),
-                        )
-                    })
+                    .child(body)
                     .relative()
                     .when(line_before, |el| {
                         el.child(insert_line().top(px(-SIDEBAR_LIST_GAP)))

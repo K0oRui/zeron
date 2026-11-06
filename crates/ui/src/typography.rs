@@ -351,6 +351,18 @@ fn installed_families_with_latin_metrics() -> BTreeMap<String, bool> {
 
     let mut families = BTreeMap::new();
     for face in database.faces() {
+        // A family is non-fixed forever once one of its faces measures
+        // proportional, so a face whose families are all already non-fixed
+        // cannot change any result. Skipping it avoids parsing the many faces
+        // of the common proportional families on the main thread at startup.
+        if !face.families.is_empty()
+            && face
+                .families
+                .iter()
+                .all(|(name, _)| families.get(name) == Some(&false))
+        {
+            continue;
+        }
         let Some(Some(fixed_width)) = database.with_face_data(face.id, |data, index| {
             ttf_parser::Face::parse(data, index)
                 .ok()

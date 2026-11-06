@@ -3269,16 +3269,17 @@ impl Changes {
             }
             _ => DiffCodeWidth::Wrapped,
         };
+        let code_row_prefix: SharedString = format!("changes-code-row-{ix}").into();
         let code_scroll = match horizontal {
             Some(horizontal) => DiffCodeScrollContext {
                 handle: horizontal.scroll.clone(),
-                prefix: SharedString::from(format!("changes-code-row-{ix}")),
+                prefix: code_row_prefix,
             },
             // No horizontal state (stale row): the scroll id is only used as
             // an element key, so a throwaway handle keeps the row renderable.
             None => DiffCodeScrollContext {
                 handle: gpui::ScrollHandle::new(),
-                prefix: SharedString::from(format!("changes-code-row-{ix}")),
+                prefix: code_row_prefix,
             },
         };
         match row {

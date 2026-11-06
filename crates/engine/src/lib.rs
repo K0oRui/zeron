@@ -239,6 +239,7 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
+        let t0 = std::time::Instant::now();
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
@@ -247,6 +248,7 @@ impl EngineCore {
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
+        let t_store = t0.elapsed();
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
@@ -271,6 +273,7 @@ impl EngineCore {
                 local_only: matches!(profile.scope(), WorkspaceScope::Local),
             },
         )?;
+        let t_workspace = t0.elapsed();
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
@@ -306,6 +309,7 @@ impl EngineCore {
             terminals::link::SERVICE_PREFIX,
             Arc::new(terminals::link::Service::new(terminals.clone())),
         );
+        let t_services = t0.elapsed();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -358,6 +362,7 @@ impl EngineCore {
         let headroom = headroom::Headroom::open(data_dir);
         registry.set_headroom(headroom.clone());
         headroom.start_if_enabled();
+        let t_accounts = t0.elapsed();
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -370,6 +375,16 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let t_done = t0.elapsed();
+        tracing::info!(
+            store_ms = t_store.as_millis() as u64,
+            workspace_ms = (t_workspace - t_store).as_millis() as u64,
+            services_ms = (t_services - t_workspace).as_millis() as u64,
+            accounts_ms = (t_accounts - t_services).as_millis() as u64,
+            sync_ms = (t_done - t_accounts).as_millis() as u64,
+            total_ms = t_done.as_millis() as u64,
+            "engine core assembly phases"
+        );
         Ok(Self {
             sessions,
             doc_host,
