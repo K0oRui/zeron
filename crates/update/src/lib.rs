@@ -3,27 +3,22 @@
 //! (its own report-only checker, the "Check for Updates…" menu item, the
 //! sidebar update strip, and the desktop install paths).
 //!
-//! Release layout (see `.github/workflows/release.yml`): the feed is this
-//! project's own GitHub Releases. `https://api.github.com/repos/<repo>/releases/latest`
-//! names the newest version and lists its assets; the assets themselves are
-//! downloaded from their browser URLs under
-//! `https://github.com/<repo>/releases/download/<tag>/<file>`, so no CDN, no
-//! edge release proxy, and no host of our own sits in the update path. The
-//! workflow also attaches a `manifest.json` (version + sha256 per artifact) to
-//! each release; the updater uses it when present for checksum-pinned
-//! downloads and otherwise falls back to the API's asset list. `ZERON_RELEASES_URL`
-//! still overrides the whole base (mirrors, forks, air-gapped networks).
+//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
+//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
+//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
+//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
+//! releases published before the manifest existed.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
 //!   installer and the Linux tarball's `install.sh`): download the headless
-//!   tarball into a new versioned dir, flip the symlink, then restart the
-//!   service (daemon) or relaunch (desktop). Same flow the installer script
-//!   performs, natively.
+//!   tarball into a new versioned dir, then restart into a trial of it that
+//!   moves the symlink only once it has proved it's ready ([`transaction`]).
 //! - **MacApp** (running out of an app bundle): download the app tarball, swap the
-//!   bundle directory, relaunch. Driven by the UI.
+//!   bundle directory, relaunch, driven by the UI; or, asked from another device,
+//!   the engine's own trial of it ([`transaction`]).
 //! - **WindowsPortable** (the Windows installer or portable zip — both carry
-//!   `zeron-update.json`): swap the executable in place. Driven by the UI.
+//!   `zeron-update.json`): swap the executable in place, the same two ways.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only — the
 //!   UI's advisory strip links to [`RELEASES_PAGE`].
 //!
@@ -47,9 +42,36 @@ use tokio::sync::watch;
 #[cfg(windows)]
 pub mod windows;
 
-/// The version compiled into this binary (the workspace version).
+pub mod channel;
+pub mod desktop;
+pub mod transaction;
+pub use channel::Channel;
+pub use transaction::{UpdateReport, UpdateState};
+
+/// The version compiled into this binary: the workspace's, or a beta's
+/// (`ZERON_ENGINE_VERSION=0.2.137-beta.3` at build time). Betas of one release
+/// share a workspace version, and a running engine only knows a bundle replaced
+/// it by this being older than the bundle's.
 pub const fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    match option_env!("ZERON_ENGINE_VERSION") {
+        Some(version) => version,
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
+
+static APP_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The app's own version when it isn't this crate's: a beta interface built
+/// apart from the workspace (`0.2.136-beta.1`). Set once, before the desktop
+/// checker starts.
+pub fn set_app_version(version: &str) {
+    let _ = APP_VERSION.set(version.trim().to_owned());
+}
+
+/// The version the desktop app compares releases with: [`set_app_version`]'s,
+/// or [`current_version`].
+pub fn app_version() -> &'static str {
+    APP_VERSION.get().map(String::as_str).unwrap_or(current_version())
 }
 
 /// Successful checks repeat this often. The feed is a sub-kilobyte,
@@ -87,20 +109,28 @@ const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// What the updater needs to know about the newest release: its version, where
-/// its assets live, and (when the release carries one) a sha256 per artifact.
+/// `{edge}/releases/manifest.json` — written by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty when the release has no
-    /// `manifest.json` asset — downloads then come straight from the release's
-    /// asset list and skip checksum verification (with a log).
+    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
+    /// via `latest.txt` — downloads then skip checksum verification (with a log).
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
-    /// Base URL the artifacts are fetched from, without a trailing slash:
-    /// the release's own `manifest.json` for a mirrored/custom feed, or
-    /// `https://github.com/<repo>/releases/download/<tag>` for a GitHub
-    /// release. Not part of the wire format — [`fetch_latest`] fills it in.
+    /// The engine inside the release's app, when it isn't `version`'s own (a
+    /// beta app carries the stable engine).
+    #[serde(default, rename = "engineVersion", skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    /// The oldest macOS the release's app runs on, when it's newer than the
+    /// stable app's (beta: [`channel::BETA_MINIMUM_MACOS`]).
+    #[serde(default, rename = "minimumMacOS", skip_serializing_if = "Option::is_none")]
+    pub minimum_macos: Option<String>,
+    /// The channel this manifest was fetched from: where its files are.
+    #[serde(skip)]
+    pub channel: Channel,
+    /// Where this manifest's artifacts live, without a trailing slash: a
+    /// configured feed's channel base, or this project's GitHub release asset
+    /// directory. Not part of the wire format; the fetchers fill it in.
     #[serde(skip)]
     pub base: Option<String>,
 }
@@ -158,18 +188,79 @@ pub fn mac_app_artifact(version: &str) -> String {
     format!("zeron-{version}-macos-{arch}-app.tar.gz")
 }
 
-fn parse_version(v: &str) -> Option<Vec<u64>> {
-    let nums: Vec<u64> = v
-        .trim()
-        .trim_start_matches('v')
+/// A release version: dotted numbers and, for a prerelease, its semver
+/// identifiers (`0.2.136-beta.2` → `[0, 2, 136]`, `["beta", "2"]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Version {
+    core: Vec<u64>,
+    pre: Vec<PreId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreId {
+    // Numeric identifiers sort below alphanumeric ones (semver 11.4.3).
+    Num(u64),
+    Text(String),
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.core.cmp(&other.core).then_with(|| {
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                // A release outranks its prereleases.
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                // Identifier by identifier; a shorter prefix is lower.
+                (false, false) => self.pre.cmp(&other.pre),
+            }
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Dotted numbers with an optional leading `v` and an optional `-prerelease`
+/// (`0.2.136-beta.1`). Build metadata (`+…`) and anything else is rejected.
+fn parse_version(v: &str) -> Option<Version> {
+    let v = v.trim().trim_start_matches('v');
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
+    let core: Vec<u64> = core
         .split('.')
         .map(|p| p.parse().ok())
         .collect::<Option<_>>()?;
-    (!nums.is_empty()).then_some(nums)
+    if core.is_empty() {
+        return None;
+    }
+    let pre = match pre {
+        None => Vec::new(),
+        Some(pre) => pre
+            .split('.')
+            .map(|id| {
+                if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    None
+                } else if id.chars().all(|c| c.is_ascii_digit()) {
+                    id.parse().ok().map(PreId::Num)
+                } else {
+                    Some(PreId::Text(id.to_ascii_lowercase()))
+                }
+            })
+            .collect::<Option<_>>()?,
+    };
+    Some(Version { core, pre })
 }
 
-/// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a malformed release tag must not
+/// Strictly-newer compare (`0.1.10` > `0.1.9` > `0.1`), semver's for
+/// prereleases: `0.2.135` < `0.2.136-beta.1` < `0.2.136-beta.2` < `0.2.136`.
+/// Unparseable versions never count as newer — a garbage `latest.txt` must not
 /// trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     match (parse_version(latest), parse_version(current)) {
@@ -178,75 +269,134 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release's metadata: the version, where its artifacts live,
-/// and its per-artifact sha256 when the release published a `manifest.json`.
-///
-/// Two feeds, in this order:
-/// 1. A base URL, when one is configured (the `ZERON_RELEASES_URL` override or
-///    the Windows package's `zeron-update.json`): `{base}/manifest.json`, then
-///    `{base}/latest.txt` for releases that predate the manifest. Artifacts
-///    come from the same base.
-/// 2. Otherwise this project's own GitHub Releases:
-///    `https://api.github.com/repos/<repo>/releases/latest` names the version
-///    and lists the assets, which are fetched from their
-///    `https://github.com/<repo>/releases/download/<tag>/<file>` URLs. A
-///    `manifest.json` asset, when the workflow attached one, supplies checksums.
-pub async fn fetch_latest() -> anyhow::Result<Manifest> {
-    fetch_latest_from(None).await
+/// What a release means for the build that's running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offer {
+    /// Nothing to install.
+    Current,
+    /// A newer release on the build's own channel (or a newer beta for a
+    /// stable build that chose beta).
+    Newer,
+    /// The chosen channel's release replaces this build of the other
+    /// channel even though it isn't newer: leaving beta for stable.
+    Switch,
+    /// Not installable here, and why (in words for the person).
+    Held(String),
 }
 
-/// [`fetch_latest`] with the feed base supplied instead of resolved from the
-/// environment — what the checker's own tests drive.
-async fn fetch_latest_from(base: Option<String>) -> anyhow::Result<Manifest> {
-    let resolved = match base {
-        Some(base) => Some(validate_release_override(&base)?),
-        None => release_base()?,
-    };
-    let Some(base) = resolved else {
-        return fetch_github_latest().await;
-    };
-    let client = http_client()?;
-    let manifest_url = format!("{base}/manifest.json");
-    match fetch_release_metadata(&client, &manifest_url).await {
-        Ok(response) if response.status.is_success() => {
-            let mut manifest: Manifest = serde_json::from_slice(&response.body)
-                .with_context(|| format!("parsing {manifest_url}"))?;
-            if manifest.version.trim().is_empty() {
-                bail!("{manifest_url} has an empty version");
-            }
-            manifest.base = Some(base.clone());
-            return Ok(manifest);
-        }
-        Ok(response) => tracing::debug!(
-            status = %response.status,
-            "release manifest unavailable; trying latest.txt"
-        ),
-        Err(err) => tracing::debug!(
-            error = %err,
-            "release manifest fetch failed; trying latest.txt"
-        ),
+impl Offer {
+    pub fn installs(&self) -> bool {
+        matches!(self, Self::Newer | Self::Switch)
     }
-    let latest_url = format!("{base}/latest.txt");
-    let response = fetch_release_metadata(&client, &latest_url)
-        .await
-        .context("fetching latest.txt")?;
-    anyhow::ensure!(
-        response.status.is_success(),
-        "fetching latest.txt: HTTP {}",
-        response.status
-    );
-    let version = std::str::from_utf8(&response.body)
-        .context("reading latest.txt as UTF-8")?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        bail!("latest.txt is empty");
+}
+
+/// What `manifest` (the `selected` channel's) offers a build of `running`
+/// whose bundle carries the engine `running_engine`, on macOS `macos`.
+///
+/// - Its channel's release installs when newer.
+/// - Choosing beta on a stable build installs a beta only when it's newer:
+///   a stable that moved past the last beta waits for the next one.
+/// - Choosing stable on a beta build installs stable even when older, unless
+///   stable's engine is older than the one the beta brought (it would run on
+///   data a newer engine wrote): then it waits until stable catches up.
+/// - A release needing a newer macOS than this one is held.
+pub fn offer(
+    manifest: &Manifest,
+    running: &str,
+    selected: Channel,
+    running_engine: Option<&str>,
+    macos: Option<&str>,
+) -> Offer {
+    let latest = manifest.version.as_str();
+    if parse_version(latest).is_none() || latest.trim() == running.trim() {
+        return Offer::Current;
     }
-    Ok(Manifest {
-        version,
-        files: BTreeMap::new(),
-        base: Some(base),
-    })
+    let leaving_beta = Channel::of_version(running) == Channel::Beta && selected == Channel::Stable;
+    if !leaving_beta && !version_newer(latest, running) {
+        return Offer::Current;
+    }
+    if let (Some(minimum), Some(system)) = (manifest.minimum_macos.as_deref(), macos)
+        && !channel::macos_at_least(system, minimum)
+    {
+        return Offer::Held(format!(
+            "Zeron {latest} needs macOS {minimum} or later. This Mac has macOS {system}."
+        ));
+    }
+    if !leaving_beta {
+        return Offer::Newer;
+    }
+    let target_engine = manifest.engine_version.as_deref().unwrap_or(latest);
+    if let Some(engine) = running_engine
+        && version_newer(engine, target_engine)
+    {
+        return Offer::Held(format!(
+            "This beta's engine ({engine}) is newer than Zeron {latest}'s. You'll move to Stable once it catches up."
+        ));
+    }
+    if version_newer(latest, running) {
+        Offer::Newer
+    } else {
+        Offer::Switch
+    }
+}
+
+/// Fetch the newest release metadata: `manifest.json`, falling back to
+/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
+    fetch_latest_on(edge_url, channel::selected()).await
+}
+
+/// [`fetch_latest`] from `channel`'s feed.
+///
+/// A configured feed (`ZERON_RELEASES_URL` or the Windows package's config)
+/// wins; otherwise this project's own GitHub Releases.
+pub async fn fetch_latest_on(edge_url: &str, channel: Channel) -> anyhow::Result<Manifest> {
+    if let Some(base) = configured_release_base(edge_url)? {
+        let base = channel.base(&base);
+        let mut manifest = fetch_latest_from(&base).await?;
+        manifest.base = Some(base);
+        manifest.channel = channel;
+        return Ok(manifest);
+    }
+    let mut manifest = fetch_github_latest().await?;
+    manifest.channel = channel;
+    Ok(manifest)
+}
+
+/// A configured feed base, or `None` for the GitHub Releases feed: the
+/// `ZERON_RELEASES_URL` override, the Windows package's `zeron-update.json`,
+/// or a loopback `edge_url` (a local feed or a test's server). The project's
+/// own edge is ignored in favour of GitHub Releases, which is this fork's
+/// feed.
+fn configured_release_base(edge_url: &str) -> anyhow::Result<Option<String>> {
+    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+        && !url.trim().is_empty()
+    {
+        return validate_release_override(&url).map(Some);
+    }
+    #[cfg(windows)]
+    if let Some(url) = windows::release_url()? {
+        return Ok(Some(url.trim_end_matches('/').to_owned()));
+    }
+    if edge_is_loopback(edge_url) {
+        return Ok(Some(format!("{}/releases", edge_url.trim_end_matches('/'))));
+    }
+    Ok(None)
+}
+
+/// Whether `edge_url` points at the local machine: a feed only it serves.
+fn edge_is_loopback(edge_url: &str) -> bool {
+    reqwest::Url::parse(edge_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
 }
 
 /// The GitHub REST view of a release — only the fields the updater reads.
@@ -404,6 +554,7 @@ fn manifest_from_release(
         version,
         files,
         base,
+        ..Manifest::default()
     })
 }
 
@@ -423,6 +574,45 @@ fn github_token() -> Option<String> {
         }
     }
     None
+}
+
+async fn fetch_latest_from(base: &str) -> anyhow::Result<Manifest> {
+    let client = http_client()?;
+    let manifest_url = format!("{base}/manifest.json");
+    match fetch_release_metadata(&client, &manifest_url).await {
+        Ok(response) if response.status.is_success() => {
+            let manifest: Manifest =
+                serde_json::from_slice(&response.body).context("parsing manifest.json")?;
+            if manifest.version.trim().is_empty() {
+                bail!("manifest.json has an empty version");
+            }
+            return Ok(manifest);
+        }
+        Ok(response) => {
+            tracing::debug!(status = %response.status, "manifest.json unavailable; trying latest.txt")
+        }
+        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
+    }
+    let latest_url = format!("{base}/latest.txt");
+    let response = fetch_release_metadata(&client, &latest_url)
+        .await
+        .context("fetching latest.txt")?;
+    anyhow::ensure!(
+        response.status.is_success(),
+        "fetching latest.txt: HTTP {}",
+        response.status
+    );
+    let version = std::str::from_utf8(&response.body)
+        .context("reading latest.txt as UTF-8")?
+        .trim()
+        .to_string();
+    if version.is_empty() {
+        bail!("latest.txt is empty");
+    }
+    Ok(Manifest {
+        version,
+        ..Manifest::default()
+    })
 }
 
 #[derive(Debug)]
@@ -453,9 +643,9 @@ async fn fetch_release_metadata_with_limits(
     let request = async {
         let response = client
             .get(url)
-            // Intermediaries must revalidate: GitHub serves the release API
-            // through a short-lived cache, and a proxy holding an old answer
-            // for longer is exactly the "prompt appears late" failure.
+            // Intermediaries must revalidate: the edge already bounds its own
+            // cache to a minute, and a proxy holding an old manifest for
+            // longer is exactly the "prompt appears late" failure.
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send()
             .await
@@ -518,24 +708,14 @@ fn http_client_with_timeouts(connect: Duration, read: Duration) -> anyhow::Resul
 
 fn validate_release_override(value: &str) -> anyhow::Result<String> {
     let url = reqwest::Url::parse(value.trim()).context("invalid update feed URL")?;
-    // HTTPS everywhere, except a loopback feed: that traffic never leaves the
-    // machine, so TLS there buys nothing and would only block local mirrors
-    // and the tests that serve a release from 127.0.0.1.
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
+    // A test install's local feed, in a debug build only: release builds can't be
+    // pointed anywhere but HTTPS.
+    let local_test_feed =
+        cfg!(debug_assertions) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
     anyhow::ensure!(
-        url.host_str().is_some() && (url.scheme() == "https" || (url.scheme() == "http" && loopback)),
-        "update feed must use HTTPS (plain HTTP only for a loopback mirror)"
+        local_test_feed || (url.scheme() == "https" && url.host_str().is_some()),
+        "update feed must use HTTPS"
     );
-    // Artifact URLs are built by appending to `url.path()`. `Url::parse`
-    // already resolves dot segments (`..`, including percent-encoded forms),
-    // so a parsed base cannot climb out of its own path.
     anyhow::ensure!(
         url.username().is_empty()
             && url.password().is_none()
@@ -555,28 +735,21 @@ pub const RELEASES_PAGE: &str = "https://github.com/K0oRui/zeron/releases";
 /// installation cannot replace itself.
 pub const LATEST_RELEASE_PAGE: &str = "https://github.com/K0oRui/zeron/releases/latest";
 
-/// The release feed: this project's GitHub Releases API. Every check is one
-/// anonymous GET of `releases/latest`; nothing of ours is in the path.
+/// The release feed when no base is configured: this project's GitHub
+/// Releases API. Every check is one GET of `releases/latest`.
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/K0oRui/zeron/releases/latest";
 
-/// A configured release feed — the whole tree under it (`manifest.json`,
-/// `latest.txt`, the artifacts). `None` = the GitHub Releases feed.
-fn release_base() -> anyhow::Result<Option<String>> {
-    release_base_from(std::env::var("ZERON_RELEASES_URL").ok().as_deref())
-}
-
-/// [`release_base`] with the `ZERON_RELEASES_URL` override supplied (or not).
-fn release_base_from(override_url: Option<&str>) -> anyhow::Result<Option<String>> {
-    if let Some(url) = override_url
+fn release_base(edge_url: &str) -> anyhow::Result<String> {
+    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
     {
-        return validate_release_override(url).map(Some);
+        return validate_release_override(&url);
     }
     #[cfg(windows)]
     if let Some(url) = windows::release_url()? {
-        return Ok(Some(url.trim_end_matches('/').to_owned()));
+        return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(None)
+    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
 }
 
 // ---------------------------------------------------------------------------
@@ -661,16 +834,19 @@ impl InstallKind {
 
     pub async fn stage_desktop(
         &self,
+        edge_url: &str,
         manifest: &Manifest,
         data_dir: &Path,
     ) -> anyhow::Result<PathBuf> {
         match self {
-            Self::MacApp { .. } => stage_mac_app(manifest, data_dir).await,
+            Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
             Self::Managed { app_root } if self.supports_desktop_update() => {
-                stage_headless(manifest, app_root).await
+                stage_headless(edge_url, manifest, app_root).await
             }
             #[cfg(windows)]
-            Self::WindowsPortable { directory } => windows::stage(manifest, directory).await,
+            Self::WindowsPortable { directory } => {
+                windows::stage(edge_url, manifest, directory).await
+            }
             _ => bail!("this installation does not support desktop updates"),
         }
     }
@@ -680,11 +856,21 @@ impl InstallKind {
     /// effect at the next launch ("install on quit"). Either way the caller
     /// must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path, relaunch: bool) -> anyhow::Result<()> {
+        // The engine is trying a new version out (asked from another device), and
+        // going back from that needs the installed app to stay as it was.
+        if channel::data_dir()
+            .and_then(transaction::read)
+            .is_some_and(|update| update.in_progress())
+        {
+            bail!("An update is already in progress on this device.");
+        }
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
                 // The swap copied the staged bundle; the cache is spent.
-                if let Some(version_dir) = staged.parent() {
+                if let Some(version_dir) = staged.parent()
+                    && !process_runs_from(version_dir)
+                {
                     let _ = std::fs::remove_dir_all(version_dir);
                 }
                 if relaunch {
@@ -751,6 +937,158 @@ fn dir_writable(dir: &Path) -> bool {
     }
 }
 
+/// How this copy of Zeron is installed, as `UpdateStatus` reports it. A client
+/// shows what the device can do from this and `can_apply_remotely`, rather
+/// than guessing from its platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallMethod {
+    /// Installed by the Linux installer and kept running by the service manager.
+    LinuxService,
+    /// Installed on Linux and run by the desktop app.
+    LinuxApp,
+    /// Installed by the Linux installer, but started by hand: nothing would
+    /// start it again after an update.
+    StartedByHand,
+    /// The macOS app.
+    MacApp,
+    /// The Windows installer or portable package.
+    WindowsApp,
+    /// Built from source or copied by hand.
+    Unmanaged,
+    /// A newer engine's method this client doesn't know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a device can do about its own updates, for `UpdateStatus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAbility {
+    pub install: InstallMethod,
+    /// `ApplyUpdate` works from another device.
+    pub can_apply_remotely: bool,
+    /// Why it doesn't, in words for the person.
+    pub cannot_apply_reason: Option<String>,
+    /// What to run on the device instead, when there's a command for it.
+    pub manual_command: Option<String>,
+}
+
+/// The one command that installs Zeron on Linux.
+const LINUX_INSTALL_COMMAND: &str = "curl -fsSL https://zeron.sh/install.sh | sh";
+
+impl UpdateAbility {
+    fn refused(
+        install: InstallMethod,
+        reason: impl Into<String>,
+        manual_command: Option<&str>,
+    ) -> Self {
+        Self {
+            install,
+            can_apply_remotely: false,
+            cannot_apply_reason: Some(reason.into()),
+            manual_command: manual_command.map(str::to_owned),
+        }
+    }
+
+    /// `supervised`: something starts this engine again once it stops (see
+    /// [`running_as_installed_service`]). `systemd`: that something is the
+    /// service manager rather than the desktop app. `blocker`: why the
+    /// installation can't replace itself right now.
+    fn decide(
+        kind: &InstallKind,
+        os: &str,
+        supervised: bool,
+        systemd: bool,
+        blocker: Option<UpdateBlocker>,
+    ) -> Self {
+        match kind {
+            InstallKind::Managed { .. } if os != "linux" => Self::refused(
+                InstallMethod::Unmanaged,
+                "Zeron on a Mac updates through the Zeron app. Install the app on this Mac.",
+                None,
+            ),
+            InstallKind::Managed { .. } if !supervised => Self::refused(
+                InstallMethod::StartedByHand,
+                "Zeron was started by hand on this device, so nothing would start it again \
+                 after an update. Update it on the device, then start it again.",
+                Some("zeron update"),
+            ),
+            InstallKind::Managed { .. } => {
+                let install = if systemd {
+                    InstallMethod::LinuxService
+                } else {
+                    InstallMethod::LinuxApp
+                };
+                match blocker {
+                    Some(blocker) => Self::refused(install, blocker.to_string(), None),
+                    None => Self {
+                        install,
+                        can_apply_remotely: true,
+                        cannot_apply_reason: None,
+                        manual_command: None,
+                    },
+                }
+            }
+            // The app's background engine can carry out an update itself. One
+            // run any other way has nothing to bring it back.
+            InstallKind::MacApp { .. } => Self::desktop(
+                InstallMethod::MacApp,
+                "This Zeron wasn't started by the app, so nothing would bring it back after an \
+                 update. Update it from the Zeron app on that Mac.",
+                supervised,
+                blocker,
+            ),
+            #[cfg(windows)]
+            InstallKind::WindowsPortable { .. } => Self::desktop(
+                InstallMethod::WindowsApp,
+                "This Zeron wasn't started by the app, so nothing would bring it back after an \
+                 update. Update it from the Zeron app on that PC.",
+                supervised,
+                blocker,
+            ),
+            InstallKind::Unmanaged => Self::refused(
+                InstallMethod::Unmanaged,
+                "This copy of Zeron wasn't installed by the installer, so it can't replace itself.",
+                (os == "linux").then_some(LINUX_INSTALL_COMMAND),
+            ),
+        }
+    }
+
+    fn desktop(
+        install: InstallMethod,
+        unsupervised: &str,
+        supervised: bool,
+        blocker: Option<UpdateBlocker>,
+    ) -> Self {
+        match blocker {
+            _ if !supervised => Self::refused(install, unsupervised, None),
+            Some(blocker) => Self::refused(install, blocker.to_string(), None),
+            None => Self {
+                install,
+                can_apply_remotely: true,
+                cannot_apply_reason: None,
+                manual_command: None,
+            },
+        }
+    }
+
+    /// This process's: how it's installed, and whether it can update from afar.
+    pub fn current() -> Self {
+        let kind = detect_install();
+        Self::decide(
+            &kind,
+            std::env::consts::OS,
+            running_as_installed_service(),
+            MANAGED_RESTART.get().is_none(),
+            kind.desktop_update_blocker(),
+        )
+    }
+}
+
+/// Set on a new version on trial: the installation it's running in place of
+/// (macOS: the app bundle; Windows: the folder).
+pub const INSTALLED_AT_ENV: &str = "ZERON_INSTALLED_AT";
+
 /// Where this process was installed from, resolved once: an update moves
 /// the running image aside (Windows renames it to `zeron.exe.old`), and a
 /// long-running engine must still recognise the installation it belongs to.
@@ -758,6 +1096,14 @@ pub fn detect_install() -> InstallKind {
     static INSTALL: std::sync::OnceLock<InstallKind> = std::sync::OnceLock::new();
     INSTALL
         .get_or_init(|| {
+            // A new version on trial runs from beside the installation it's
+            // going to become.
+            if let Some(installed) = std::env::var_os(INSTALLED_AT_ENV).map(PathBuf::from) {
+                #[cfg(windows)]
+                return InstallKind::WindowsPortable { directory: installed };
+                #[cfg(not(windows))]
+                return InstallKind::MacApp { bundle: installed };
+            }
             let Ok(exe) = std::env::current_exe() else {
                 return InstallKind::Unmanaged;
             };
@@ -813,9 +1159,7 @@ pub fn installed_version(kind: &InstallKind) -> Option<String> {
             .file_name()?
             .to_str()?
             .to_owned(),
-        InstallKind::MacApp { bundle } => bundle_short_version(
-            &std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?,
-        )?,
+        InstallKind::MacApp { bundle } => bundle_engine_version(bundle)?,
         #[cfg(windows)]
         InstallKind::WindowsPortable { directory } => windows::installed_version(directory)?,
         _ => return None,
@@ -823,42 +1167,55 @@ pub fn installed_version(kind: &InstallKind) -> Option<String> {
     parse_version(&version).map(|_| version)
 }
 
-/// `CFBundleShortVersionString` from an XML property list (the packaging
-/// template; codesign leaves the format alone).
-fn bundle_short_version(plist: &str) -> Option<String> {
-    let after_key = plist
-        .split("<key>CFBundleShortVersionString</key>")
-        .nth(1)?;
+/// The engine a macOS app bundle carries: its Info.plist's `ZeronEngineVersion`
+/// (packaging writes it; a beta app's engine is stable's, older than the app),
+/// else `CFBundleShortVersionString` (bundles from before the key, whose
+/// engine was always the app's own version). An engine compares this with
+/// its own to restart into a newer one; comparing the app's version would
+/// restart a beta's engine forever.
+pub fn bundle_engine_version(bundle: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    plist_string(&plist, "ZeronEngineVersion").or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
+}
+
+/// The app's own version in a macOS bundle (a beta's isn't its engine's). A
+/// beta says it in `ZeronVersion`: its short version has to stay numeric, so
+/// that alone would read `0.2.137-beta.3` as the stable `0.2.137`.
+pub fn bundle_app_version(bundle: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    plist_string(&plist, "ZeronVersion").or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
+}
+
+/// A string value from an XML property list (the packaging template;
+/// codesign leaves the format alone).
+fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let after_key = plist.split(&format!("<key>{key}</key>")).nth(1)?;
     let value = after_key.trim_start().strip_prefix("<string>")?;
     let end = value.find("</string>")?;
-    Some(value[..end].trim().to_owned())
+    Some(value[..end].trim().to_owned()).filter(|v| !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Where one artifact of `manifest` is downloaded from: the feed resolved by
-/// [`fetch_latest`] (a configured base, or the GitHub release's asset
-/// directory) when it carries one, else the configured feed.
-fn artifact_url(manifest: &Manifest, file: &str) -> anyhow::Result<String> {
-    let base = match &manifest.base {
-        Some(base) => base.trim_end_matches('/').to_owned(),
-        None => release_base()?
-            .context("release metadata did not say where its artifacts live")?,
-    };
-    Ok(format!("{base}/{file}"))
-}
-
-/// Stream one release artifact to `dest`, verifying the manifest sha256 when
+/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
 /// present. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
+    edge_url: &str,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = artifact_url(manifest, file)?;
+    // From the feed the manifest came from: the GitHub release's asset
+    // directory, or a configured feed's channel base (a beta's files are
+    // beta's).
+    let base = match &manifest.base {
+        Some(base) => base.trim_end_matches('/').to_owned(),
+        None => manifest.channel.base(&release_base(edge_url)?),
+    };
+    let url = format!("{base}/{file}");
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(
@@ -945,7 +1302,11 @@ async fn verify_staged_binary(binary: &Path, version: &str) -> anyhow::Result<()
 
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
-pub async fn stage_headless(manifest: &Manifest, app_root: &Path) -> anyhow::Result<PathBuf> {
+pub async fn stage_headless(
+    edge_url: &str,
+    manifest: &Manifest,
+    app_root: &Path,
+) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_managed_update_platform()?;
     let version = &manifest.version;
@@ -963,10 +1324,10 @@ pub async fn stage_headless(manifest: &Manifest, app_root: &Path) -> anyhow::Res
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
-        download_release_file(manifest, &file, &tarball).await?;
+        download_release_file(edge_url, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
-        // Tarball root is the versioned stage dir (see scripts/package/package-linux.sh);
+        // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
         // strip it exactly as install.sh does.
         run(
             "tar",
@@ -1066,10 +1427,23 @@ pub fn running_as_installed_service() -> bool {
 }
 
 fn in_zeron_service_cgroup(cgroups: &str) -> bool {
+    in_service_cgroup(cgroups, &service_unit())
+}
+
+fn in_service_cgroup(cgroups: &str, unit: &str) -> bool {
     cgroups
         .lines()
         .filter_map(|line| line.rsplit(':').next())
-        .any(|path| path.split('/').any(|part| part == "zeron.service"))
+        .any(|path| path.split('/').any(|part| part == unit))
+}
+
+/// The systemd unit this engine runs as. `ZERON_SERVICE_UNIT` names another, so
+/// a test install beside a real one can never restart the real one.
+pub fn service_unit() -> String {
+    std::env::var("ZERON_SERVICE_UNIT")
+        .ok()
+        .filter(|unit| !unit.trim().is_empty())
+        .unwrap_or_else(|| "zeron.service".to_owned())
 }
 
 /// Restart the installed engine service (the same units `zeron daemon` and the
@@ -1089,10 +1463,28 @@ pub fn restart_service() -> anyhow::Result<()> {
             &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.app")],
         )
     } else {
-        run(
-            "systemctl",
-            &["--user", "--no-block", "restart", "zeron.service"],
-        )
+        ask_systemd_to_restart(&service_unit())
+    }
+}
+
+/// Called from inside the unit, `systemctl` is in the cgroup being stopped and can
+/// be killed by the very restart it asked for. Killed isn't refused: only an exit
+/// status says it didn't work.
+fn ask_systemd_to_restart(unit: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "--no-block", "restart", unit])
+        .output()
+        .context("running systemctl")?;
+    restart_outcome(output.status.code(), &output.stderr)
+}
+
+fn restart_outcome(code: Option<i32>, stderr: &[u8]) -> anyhow::Result<()> {
+    match code {
+        None | Some(0) => Ok(()),
+        Some(code) => bail!(
+            "systemctl restart failed ({code}): {}",
+            String::from_utf8_lossy(stderr).trim()
+        ),
     }
 }
 
@@ -1104,7 +1496,11 @@ pub fn restart_service() -> anyhow::Result<()> {
 /// (idempotent). The bundle is unpacked beside its final name and renamed in
 /// only after its binary answers with the expected version, so an interrupted
 /// unpack can never be mistaken for a staged update. Returns the staged bundle.
-pub async fn stage_mac_app(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
+pub async fn stage_mac_app(
+    edge_url: &str,
+    manifest: &Manifest,
+    data_dir: &Path,
+) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_mac_app_update_platform()?;
     let version = &manifest.version;
@@ -1124,7 +1520,7 @@ pub async fn stage_mac_app(manifest: &Manifest, data_dir: &Path) -> anyhow::Resu
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let file = mac_app_artifact(version);
     let tarball = dir.join(&file);
-    download_release_file(manifest, &file, &tarball).await?;
+    download_release_file(edge_url, manifest, &file, &tarball).await?;
     let unpack = dir.join(".unpack");
     std::fs::create_dir_all(&unpack)?;
     let unpacked = run(
@@ -1161,9 +1557,96 @@ fn prune_stale_stages(updates: &Path, keep: &str) {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name() != keep {
+        if entry.file_name() != keep && !process_runs_from(&entry.path()) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// Whether any process runs an executable from under `dir`. A bundle that's still
+/// in use mustn't be deleted: with its image gone, AppleSystemPolicy rejects every
+/// process it forks, thousands of times a minute (#1037). Can't tell: yes.
+pub fn process_runs_from(dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut pids = vec![0 as libc::pid_t; 8192];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: the buffer is `bytes` long; the call writes at most that.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if count <= 0 {
+            return true;
+        }
+        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        pids.iter().take(count as usize).filter(|pid| **pid > 0).any(|&pid| {
+            // SAFETY: `path` is PROC_PIDPATHINFO_MAXSIZE bytes, as the call needs.
+            let len =
+                unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+            len > 0 && Path::new(std::ffi::OsStr::from_bytes(&path[..len as usize])).starts_with(&dir)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// Bundles an update set aside (`.Zeron.app.old-…`) or left half-installed
+/// (`.Zeron.app.new-…`), once nothing runs from them.
+pub fn prune_retired_mac_bundles(bundle: &Path) {
+    let (Some(parent), Some(name)) = (bundle.parent(), bundle.file_name()) else {
+        return;
+    };
+    let name = name.to_string_lossy();
+    let (old, new) = (format!(".{name}.old-"), format!(".{name}.new-"));
+    // An update waiting to be tried needs its copy.
+    let waiting = channel::data_dir()
+        .and_then(transaction::read)
+        .filter(|update| update.in_progress())
+        .and_then(|update| match update.layout {
+            transaction::Layout::MacBundle { incoming, .. } => Some(incoming),
+            _ => None,
+        });
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if (file_name.starts_with(&old) || file_name.starts_with(&new))
+            && waiting.as_deref() != Some(entry.path().as_path())
+            && !process_runs_from(&entry.path())
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Exchange two bundles in one step: `incoming` becomes `bundle` and the old one
+/// is left under the retired name. Nothing ever finds `bundle` missing.
+pub(crate) fn swap_mac_bundles(incoming: &Path, bundle: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes());
+        let (from, to) = (c(incoming)?, c(bundle)?);
+        // SAFETY: both are NUL-terminated paths.
+        if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("swapping in the new app");
+        }
+        let parent = bundle.parent().context("app bundle has no parent directory")?;
+        let name = bundle.file_name().context("app bundle has no name")?.to_string_lossy();
+        let retired = parent.join(format!(".{name}.old-{}", std::process::id()));
+        // If this is lost to a crash, it's tidied up under the name it has.
+        let _ = std::fs::rename(incoming, &retired);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (incoming, bundle);
+        bail!("macOS app updates are not supported on {}", std::env::consts::OS)
     }
 }
 
@@ -1199,7 +1682,9 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&fresh);
         return Err(err).context("installing the new app bundle");
     }
-    let _ = std::fs::remove_dir_all(&old);
+    // Not deleted: the background engine, this very app, or an update's trial may
+    // still be running from it. Gone once nothing is (#1037).
+    prune_retired_mac_bundles(bundle);
     Ok(())
 }
 
@@ -1254,17 +1739,72 @@ pub struct UpdateStatus {
     pub checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The channel the check followed (`stable` | `beta`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// `latest_version` exists but can't be installed here, and why (an
+    /// older macOS; a beta's engine newer than stable's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
+    /// Installing `latest_version` leaves this build's channel and may go
+    /// back a version (beta → stable).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub switch: bool,
+    /// How this copy is installed. Absent from older engines and from the
+    /// desktop app's own checker: unknown, so don't guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallMethod>,
+    /// Whether another device can install the update (`ApplyUpdate`). Absent
+    /// from older engines: they don't say. An older engine refuses
+    /// `ApplyUpdate` itself when it can't, so treat absent as "try, and show
+    /// its refusal", never as a promise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_apply_remotely: Option<bool>,
+    /// Why it can't, in words for the person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cannot_apply_reason: Option<String>,
+    /// What to run on the device instead, when there's a command for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
+    /// The latest update asked of this engine and how it went. Match its `id`
+    /// with `ApplyUpdate`'s `updateId`: reconnecting doesn't say whether the
+    /// update worked or went back. Absent from older engines, which only have
+    /// `currentVersion` to go by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateReport>,
+    /// On a macOS app install, the installed app's version, which is what
+    /// `latestVersion` is compared with. It isn't `currentVersion` on a beta,
+    /// whose engine is stable's. Absent elsewhere and from older engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 impl UpdateStatus {
-    fn initial() -> Self {
+    fn initial(version: &str) -> Self {
         Self {
-            current_version: current_version().to_string(),
+            current_version: version.to_string(),
             latest_version: None,
             update_available: false,
             checked_at: None,
             error: None,
+            channel: None,
+            held: None,
+            switch: false,
+            install: None,
+            can_apply_remotely: None,
+            cannot_apply_reason: None,
+            manual_command: None,
+            update: None,
+            app_version: None,
         }
+    }
+
+    fn with_ability(mut self, ability: UpdateAbility) -> Self {
+        self.install = Some(ability.install);
+        self.can_apply_remotely = Some(ability.can_apply_remotely);
+        self.cannot_apply_reason = ability.cannot_apply_reason;
+        self.manual_command = ability.manual_command;
+        self
     }
 }
 
@@ -1297,7 +1837,7 @@ enum Role {
     Desktop,
 }
 
-/// Background release checker: polls GitHub Releases hourly on a wall-clock
+/// Background release checker: polls `{edge}/releases` hourly on a wall-clock
 /// schedule (so sleep/wake cannot stretch it), backs off on failure, and
 /// publishes [`UpdateStatus`] over a watch channel. In the engine, managed
 /// installs with `ZERON_AUTO_UPDATE` set stage + apply + service restart on
@@ -1305,10 +1845,11 @@ enum Role {
 /// the apply defers and re-probes every [`IDLE_RECHECK`].
 #[derive(Clone)]
 pub struct Updater {
+    edge_url: String,
     role: Arc<Role>,
-    /// Explicit feed base; `None` = resolve `ZERON_RELEASES_URL` / the Windows
-    /// package's config / GitHub Releases at check time. Only tests set it.
-    feed: Option<String>,
+    /// The version releases are compared with: the engine's own, or the app's
+    /// ([`app_version`]).
+    version: Arc<str>,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     /// Wakes the loop; `forced` says whether the wake demands a check or only
     /// a fresh look at the wall clock.
@@ -1325,34 +1866,41 @@ pub struct Updater {
 
 impl Updater {
     /// Spawn the engine's check loop (must run on a tokio runtime).
-    pub fn spawn(quiescent: Option<QuiescentCheck>) -> Self {
-        Self::spawn_role(Role::Engine { quiescent }, None)
+    pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
+        Self::spawn_role(edge_url, Role::Engine { quiescent })
     }
 
     /// Spawn the desktop app's report-only check loop (must run on a tokio
     /// runtime).
-    pub fn spawn_desktop() -> Self {
-        Self::spawn_role(Role::Desktop, None)
+    pub fn spawn_desktop(edge_url: String) -> Self {
+        Self::spawn_role(edge_url, Role::Desktop)
     }
 
-    /// A desktop checker pinned to a feed: the crate's own tests serve a
-    /// release locally instead of publishing one.
-    #[cfg(test)]
-    fn spawn_desktop_with_feed(feed: String) -> Self {
-        Self::spawn_role(Role::Desktop, Some(feed))
-    }
-
-    fn spawn_role(role: Role, feed: Option<String>) -> Self {
+    fn spawn_role(edge_url: String, role: Role) -> Self {
         let initial_delay = match role {
             Role::Engine { .. } => ENGINE_INITIAL_DELAY,
             Role::Desktop => DESKTOP_INITIAL_DELAY,
         };
-        let (status_tx, _) = watch::channel(UpdateStatus::initial());
+        let version: Arc<str> = match role {
+            Role::Engine { .. } => current_version().into(),
+            Role::Desktop => app_version().into(),
+        };
+        let initial = UpdateStatus::initial(&version);
+        let initial = match role {
+            Role::Engine { .. } => UpdateStatus {
+                update: channel::data_dir().and_then(transaction::report),
+                app_version: installed_app_version(),
+                ..initial.with_ability(UpdateAbility::current())
+            },
+            Role::Desktop => initial,
+        };
+        let (status_tx, _) = watch::channel(initial);
         let (wake_tx, _) = watch::channel(0);
         let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
+            edge_url,
             role: Arc::new(role),
-            feed,
+            version,
             status_tx: Arc::new(status_tx),
             wake_tx: Arc::new(wake_tx),
             forced: Arc::new(AtomicBool::new(false)),
@@ -1371,7 +1919,7 @@ impl Updater {
     }
 
     /// Stop the check loop and wait for it to exit — a replaced runtime must
-    /// not keep polling the release feed (or auto-applying) in the background.
+    /// not keep polling `{edge}/releases` (or auto-applying) in the background.
     /// Idempotent, and callable from any clone.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -1419,7 +1967,7 @@ impl Updater {
     /// One user-requested check, awaited: publishes the result like a
     /// scheduled check and returns it.
     pub async fn check(&self) -> anyhow::Result<UpdateStatus> {
-        match fetch_latest_from(self.feed.clone()).await {
+        match fetch_latest(&self.edge_url).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 Ok(self.status_tx.borrow().clone())
@@ -1463,6 +2011,8 @@ impl Updater {
                             && matches!(*self.role, Role::Engine { .. })
                             && auto_update_enabled()
                             && let InstallKind::Managed { .. } = detect_install()
+                            && UpdateAbility::current().can_apply_remotely
+                            && !self.went_back_from_latest()
                         {
                             self.auto_apply_when_idle().await;
                         }
@@ -1487,9 +2037,9 @@ impl Updater {
     /// idle→restart gap to well under a second.
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
-            match fetch_latest_from(self.feed.clone()).await {
+            match fetch_latest(&self.edge_url).await {
                 Ok(manifest) if version_newer(&manifest.version, current_version()) => {
-                    if let Err(err) = stage_headless(&manifest, &app_root).await {
+                    if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
                     }
@@ -1514,8 +2064,8 @@ impl Updater {
             // the newest release. Re-check quiescence immediately before the
             // symlink swap: work can begin while that network/disk I/O runs.
             match self.apply_inner(true).await {
-                Ok(Some(version)) => {
-                    tracing::info!(%version, "auto-update applied; service restarting");
+                Ok(Some(applied)) => {
+                    tracing::info!(version = %applied.version, "auto-update accepted; service restarting");
                     return;
                 }
                 Ok(None) => {
@@ -1535,12 +2085,52 @@ impl Updater {
     }
 
     fn publish(&self, manifest: Manifest) {
+        // A macOS app's bundle carries the engine a switch must not go below, and
+        // its own version is what releases are compared with: a beta's engine is
+        // stable's, so by the engine's version a newer beta looks like nothing new.
+        let bundle = match detect_install() {
+            InstallKind::MacApp { bundle } => Some(bundle),
+            _ => None,
+        };
+        let running_engine = bundle.as_deref().and_then(bundle_engine_version);
+        let app_version = bundle.as_deref().and_then(bundle_app_version);
+        let running = match &*self.role {
+            Role::Engine { .. } => app_version.as_deref().unwrap_or(&self.version),
+            Role::Desktop => &self.version,
+        };
+        let offer = offer(
+            &manifest,
+            running,
+            manifest.channel,
+            running_engine.as_deref(),
+            channel::macos_version(),
+        );
         let status = UpdateStatus {
-            current_version: current_version().to_string(),
-            update_available: version_newer(&manifest.version, current_version()),
-            latest_version: Some(manifest.version),
+            current_version: self.version.to_string(),
+            update_available: offer.installs(),
+            latest_version: Some(manifest.version.clone()),
             checked_at: Some(now_ms()),
             error: None,
+            channel: Some(manifest.channel.as_str().to_owned()),
+            held: match &offer {
+                Offer::Held(why) => Some(why.clone()),
+                _ => None,
+            },
+            switch: offer == Offer::Switch,
+            install: None,
+            can_apply_remotely: None,
+            cannot_apply_reason: None,
+            manual_command: None,
+            update: None,
+            app_version: None,
+        };
+        let status = match &*self.role {
+            Role::Engine { .. } => UpdateStatus {
+                update: channel::data_dir().and_then(transaction::report),
+                app_version,
+                ..status.with_ability(UpdateAbility::current())
+            },
+            Role::Desktop => status,
         };
         if status.update_available {
             tracing::info!(
@@ -1554,7 +2144,10 @@ impl Updater {
 
     /// One check; returns false on fetch failure (retry sooner).
     async fn check_once(&self) -> bool {
-        match fetch_latest_from(self.feed.clone()).await {
+        if let InstallKind::MacApp { bundle } = detect_install() {
+            prune_retired_mac_bundles(&bundle);
+        }
+        match fetch_latest(&self.edge_url).await {
             Ok(manifest) => {
                 self.publish(manifest);
                 true
@@ -1568,10 +2161,35 @@ impl Updater {
         }
     }
 
-    /// Stage + apply the newest release on THIS device (managed installs only),
-    /// then restart the service after a short delay so the caller's RPC reply
-    /// flushes before systemd/launchd kills this process.
-    pub async fn apply(&self) -> anyhow::Result<String> {
+    /// The latest release is one this device already tried and went back from.
+    /// Trying again on a timer would cut running chats off every hour for the
+    /// same result; a person asking still can.
+    fn went_back_from_latest(&self) -> bool {
+        let latest = self.status_tx.borrow().latest_version.clone();
+        channel::data_dir()
+            .and_then(transaction::read)
+            .is_some_and(|last| {
+                last.phase == transaction::Phase::RolledBack
+                    && latest.as_deref() == Some(last.target.as_str())
+            })
+    }
+
+    /// Publish the update's latest state, after something settled it.
+    pub fn refresh_update_report(&self) {
+        let update = channel::data_dir().and_then(transaction::report);
+        let app_version = installed_app_version();
+        self.status_tx.send_modify(|status| {
+            status.update = update;
+            status.current_version = self.version.to_string();
+            status.app_version = app_version;
+        });
+    }
+
+    /// Stage the newest release on THIS device and restart into a trial of it.
+    /// The answer goes out first: the restart waits a moment so that it can.
+    /// What became of the update is `UpdateStatus`'s `update`, under the id
+    /// answered here.
+    pub async fn apply(&self) -> anyhow::Result<AppliedUpdate> {
         self.apply_inner(false)
             .await?
             .ok_or_else(|| anyhow::anyhow!("update became busy before apply"))
@@ -1580,30 +2198,212 @@ impl Updater {
     /// `require_quiescent` is used by automatic updates. It deliberately checks
     /// after all network and staging I/O and directly before the destructive
     /// swap/restart boundary; `None` tells the caller to wait and try again.
-    async fn apply_inner(&self, require_quiescent: bool) -> anyhow::Result<Option<String>> {
-        let InstallKind::Managed { app_root } = detect_install() else {
-            bail!(
-                "this install is not update-managed — the desktop app updates from its UI; \
-                 source builds update via git"
-            );
-        };
-        let manifest = fetch_latest_from(self.feed.clone()).await?;
-        if !version_newer(&manifest.version, current_version()) {
-            bail!("already up to date ({})", current_version());
+    async fn apply_inner(&self, require_quiescent: bool) -> anyhow::Result<Option<AppliedUpdate>> {
+        let ability = UpdateAbility::current();
+        if !ability.can_apply_remotely {
+            bail!("{}", ability.cannot_apply_reason.unwrap_or_default());
         }
-        stage_headless(&manifest, &app_root).await?;
+        let data_dir = channel::data_dir()
+            .context("this engine has no data directory")?
+            .to_path_buf();
+        if transaction::read(&data_dir).is_some_and(|last| last.in_progress()) {
+            bail!("An update is already in progress on this device.");
+        }
+        let manifest = fetch_latest(&self.edge_url).await?;
+        let Some(prepared) =
+            prepare_this_install(&self.edge_url, &manifest, &data_dir).await?
+        else {
+            bail!("already up to date ({})", current_version());
+        };
         if require_quiescent && !self.quiescent_now() {
             return Ok(None);
         }
-        apply_headless(&app_root, &manifest.version)?;
-        tokio::spawn(async {
+        // Already on disk as `current`: there's nothing to try out, only to
+        // restart into.
+        let update_id = match prepared.layout {
+            None => None,
+            Some(layout) => {
+                let requested = transaction::request(
+                    &data_dir,
+                    layout,
+                    &prepared.from,
+                    &manifest.version,
+                    if MANAGED_RESTART.get().is_some() {
+                        transaction::RestartMode::Relaunch
+                    } else {
+                        transaction::RestartMode::Service { unit: service_unit() }
+                    },
+                )?;
+                self.refresh_update_report();
+                Some(requested.id)
+            }
+        };
+        let updater = self.clone();
+        let restarting = update_id.clone();
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(800)).await;
             if let Err(err) = restart_service() {
                 tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+                if let (Some(id), Some(data_dir)) = (&restarting, channel::data_dir()) {
+                    transaction::fail_request(
+                        data_dir,
+                        id,
+                        "Zeron couldn't restart to install the update, so nothing changed.".into(),
+                    );
+                    updater.refresh_update_report();
+                }
             }
         });
-        Ok(Some(manifest.version))
+        Ok(Some(AppliedUpdate {
+            version: manifest.version,
+            update_id,
+        }))
     }
+}
+
+/// The installed macOS app's own version.
+fn installed_app_version() -> Option<String> {
+    match detect_install() {
+        InstallKind::MacApp { bundle } => bundle_app_version(&bundle),
+        _ => None,
+    }
+}
+
+/// A release ready to try.
+struct PreparedInstall {
+    from: String,
+    /// `None`: it's already what's installed.
+    layout: Option<transaction::Layout>,
+}
+
+/// Whatever this kind of install needs done before anything stops. `None`: nothing
+/// newer to install. A release that isn't installable here is an error, in words
+/// for the person.
+async fn prepare_this_install(
+    edge_url: &str,
+    manifest: &Manifest,
+    data_dir: &Path,
+) -> anyhow::Result<Option<PreparedInstall>> {
+    match detect_install() {
+        InstallKind::Managed { app_root } => {
+            if !version_newer(&manifest.version, current_version()) {
+                return Ok(None);
+            }
+            prepare_install(edge_url, manifest, &app_root, data_dir).await?;
+            let from = installed_version(&InstallKind::Managed {
+                app_root: app_root.clone(),
+            })
+            .unwrap_or_else(|| current_version().to_owned());
+            Ok(Some(PreparedInstall {
+                layout: (from != manifest.version)
+                    .then_some(transaction::Layout::Versioned { app_root }),
+                from,
+            }))
+        }
+        InstallKind::MacApp { bundle } => {
+            // The engine's version isn't the app's (a beta carries stable's).
+            let from = bundle_app_version(&bundle).context("reading the installed app's version")?;
+            match offer(
+                manifest,
+                &from,
+                manifest.channel,
+                bundle_engine_version(&bundle).as_deref(),
+                channel::macos_version(),
+            ) {
+                Offer::Newer | Offer::Switch => {}
+                Offer::Held(why) => bail!(why),
+                Offer::Current => return Ok(None),
+            }
+            let parent = bundle.parent().context("app bundle has no parent directory")?;
+            let download = artifact_size(edge_url, manifest, &mac_app_artifact(&manifest.version))
+                .await
+                .unwrap_or(transaction::UNKNOWN_ARTIFACT_BYTES);
+            // A staged copy and the one beside the installed app.
+            if let Err(why) = transaction::ensure_room(data_dir, parent, download.saturating_mul(2)) {
+                bail!(why);
+            }
+            let staged = stage_mac_app(edge_url, manifest, data_dir).await?;
+            let name = bundle.file_name().context("app bundle has no name")?.to_string_lossy();
+            let incoming = parent.join(format!(".{name}.new-{}", transaction::new_id()));
+            // Everything that can fail about installing it happens here, with
+            // nothing stopped: it's a plain copy, and then one atomic swap.
+            if let Err(err) = run("ditto", &[&staged.to_string_lossy(), &incoming.to_string_lossy()]) {
+                let _ = std::fs::remove_dir_all(&incoming);
+                return Err(err).context("copying the new app into place");
+            }
+            if let Some(version_dir) = staged.parent()
+                && !process_runs_from(version_dir)
+            {
+                let _ = std::fs::remove_dir_all(version_dir);
+            }
+            Ok(Some(PreparedInstall {
+                from,
+                layout: Some(transaction::Layout::MacBundle { bundle, incoming }),
+            }))
+        }
+        #[cfg(windows)]
+        InstallKind::WindowsPortable { directory } => {
+            let from = windows::installed_version(&directory)
+                .unwrap_or_else(|| current_version().to_owned());
+            if !version_newer(&manifest.version, &from) {
+                return Ok(None);
+            }
+            let download = artifact_size(edge_url, manifest, &windows::artifact(&manifest.version))
+                .await
+                .unwrap_or(transaction::UNKNOWN_ARTIFACT_BYTES);
+            if let Err(why) = transaction::ensure_room(data_dir, &directory, download) {
+                bail!(why);
+            }
+            let incoming = windows::stage(edge_url, manifest, &directory).await?;
+            Ok(Some(PreparedInstall {
+                from,
+                layout: Some(transaction::Layout::WindowsFolder { directory, incoming }),
+            }))
+        }
+        InstallKind::Unmanaged => bail!("this install doesn't update itself"),
+    }
+}
+
+/// What `ApplyUpdate` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedUpdate {
+    pub version: String,
+    /// `UpdateStatus`'s `update.id`, to find out how it went. Absent when the
+    /// version was already installed and only needed a restart.
+    pub update_id: Option<String>,
+}
+
+/// Everything before an update has to stop anything: refuse if there's no room,
+/// then download, verify and unpack the release beside the running one.
+pub async fn prepare_install(
+    edge_url: &str,
+    manifest: &Manifest,
+    app_root: &Path,
+    data_dir: &Path,
+) -> anyhow::Result<()> {
+    let download = if app_root.join(&manifest.version).join("zeron").exists() {
+        0
+    } else {
+        artifact_size(edge_url, manifest, &headless_artifact(&manifest.version))
+            .await
+            .unwrap_or(transaction::UNKNOWN_ARTIFACT_BYTES)
+    };
+    if let Err(why) = transaction::ensure_room(data_dir, app_root, download) {
+        bail!(why);
+    }
+    stage_headless(edge_url, manifest, app_root).await?;
+    Ok(())
+}
+
+/// What the feed says the release's download weighs, if it says.
+async fn artifact_size(edge_url: &str, manifest: &Manifest, file: &str) -> Option<u64> {
+    let base = match &manifest.base {
+        Some(base) => base.trim_end_matches('/').to_owned(),
+        None => manifest.channel.base(&release_base(edge_url).ok()?),
+    };
+    let url = format!("{base}/{file}");
+    let response = http_client().ok()?.head(&url).send().await.ok()?;
+    response.status().is_success().then(|| response.content_length())?
 }
 
 /// Wall-clock check deadlines with failure backoff.
@@ -1714,6 +2514,133 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed() -> InstallKind {
+        InstallKind::Managed {
+            app_root: PathBuf::from("/home/me/.zeron/app"),
+        }
+    }
+
+    /// A test install beside a real one names its own unit, and then the real
+    /// one's cgroup isn't its own.
+    #[test]
+    fn the_service_is_recognised_by_its_own_unit_only() {
+        let cgroups = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zeron.service\n";
+        assert!(in_service_cgroup(cgroups, "zeron.service"));
+        assert!(!in_service_cgroup(cgroups, "zeron-test.service"));
+    }
+
+    /// Inside the unit, the restart kills the `systemctl` that asked for it.
+    #[test]
+    fn a_restart_that_kills_its_own_systemctl_still_counts() {
+        assert!(restart_outcome(None, b"").is_ok());
+        assert!(restart_outcome(Some(0), b"").is_ok());
+        let refused = restart_outcome(Some(1), b"Unit not found.").unwrap_err();
+        assert!(refused.to_string().contains("Unit not found."), "{refused}");
+    }
+
+    #[test]
+    fn a_linux_service_can_update_from_afar() {
+        let ability = UpdateAbility::decide(&managed(), "linux", true, true, None);
+        assert_eq!(ability.install, InstallMethod::LinuxService);
+        assert!(ability.can_apply_remotely);
+        assert_eq!(ability.cannot_apply_reason, None);
+        assert_eq!(ability.manual_command, None);
+        let app = UpdateAbility::decide(&managed(), "linux", true, false, None);
+        assert_eq!(app.install, InstallMethod::LinuxApp);
+        assert!(app.can_apply_remotely);
+    }
+
+    #[test]
+    fn what_cant_update_from_afar_says_why_and_what_to_run() {
+        let by_hand = UpdateAbility::decide(&managed(), "linux", false, false, None);
+        assert_eq!(by_hand.install, InstallMethod::StartedByHand);
+        assert!(!by_hand.can_apply_remotely);
+        assert_eq!(by_hand.manual_command.as_deref(), Some("zeron update"));
+
+        let read_only = UpdateAbility::decide(
+            &managed(),
+            "linux",
+            true,
+            true,
+            Some(UpdateBlocker::NotWritable(PathBuf::from("/opt/zeron"))),
+        );
+        assert_eq!(read_only.install, InstallMethod::LinuxService);
+        assert!(!read_only.can_apply_remotely);
+        assert!(read_only.cannot_apply_reason.unwrap().contains("/opt/zeron"));
+
+        let bundle = InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Zeron.app"),
+        };
+        let mac = UpdateAbility::decide(&bundle, "macos", true, false, None);
+        assert_eq!(mac.install, InstallMethod::MacApp);
+        assert!(mac.can_apply_remotely, "the app's background engine can");
+        let mac_by_hand = UpdateAbility::decide(&bundle, "macos", false, false, None);
+        assert!(!mac_by_hand.can_apply_remotely);
+        assert!(mac_by_hand.cannot_apply_reason.unwrap().contains("Mac"));
+        let mac_translocated = UpdateAbility::decide(
+            &bundle,
+            "macos",
+            true,
+            false,
+            Some(UpdateBlocker::Translocated),
+        );
+        assert!(!mac_translocated.can_apply_remotely);
+        assert!(mac_translocated.cannot_apply_reason.unwrap().contains("Applications"));
+
+        // No macOS headless release exists, whatever the old layout says.
+        let old_mac_service = UpdateAbility::decide(&managed(), "macos", true, true, None);
+        assert_eq!(old_mac_service.install, InstallMethod::Unmanaged);
+        assert!(!old_mac_service.can_apply_remotely);
+
+        let source = UpdateAbility::decide(&InstallKind::Unmanaged, "linux", false, false, None);
+        assert_eq!(source.install, InstallMethod::Unmanaged);
+        assert_eq!(source.manual_command.as_deref(), Some(LINUX_INSTALL_COMMAND));
+        let mac_source = UpdateAbility::decide(&InstallKind::Unmanaged, "macos", false, false, None);
+        assert_eq!(mac_source.manual_command, None);
+    }
+
+    /// An older engine's report has none of the fields; a newer engine's
+    /// method this build doesn't know is `Unknown`, not a parse failure that
+    /// would lose the whole report.
+    #[test]
+    fn older_and_newer_engines_reports_still_read() {
+        let older: UpdateStatus = serde_json::from_value(serde_json::json!({
+            "currentVersion": "0.2.100",
+            "latestVersion": "0.2.136",
+            "updateAvailable": true,
+        }))
+        .unwrap();
+        assert_eq!(older.install, None);
+        assert_eq!(older.can_apply_remotely, None);
+        assert_eq!(older.cannot_apply_reason, None);
+        assert_eq!(older.manual_command, None);
+
+        let newer: UpdateStatus = serde_json::from_value(serde_json::json!({
+            "currentVersion": "0.2.200",
+            "install": "somethingNew",
+            "canApplyRemotely": false,
+        }))
+        .unwrap();
+        assert_eq!(newer.install, Some(InstallMethod::Unknown));
+        assert_eq!(newer.can_apply_remotely, Some(false));
+    }
+
+    #[test]
+    fn the_report_names_its_fields_for_clients() {
+        let status = UpdateStatus::initial("1.0.0").with_ability(UpdateAbility::decide(
+            &managed(),
+            "linux",
+            false,
+            false,
+            None,
+        ));
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["install"], "startedByHand");
+        assert_eq!(value["canApplyRemotely"], false);
+        assert_eq!(value["manualCommand"], "zeron update");
+        assert!(value["cannotApplyReason"].is_string());
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {
@@ -1896,15 +2823,8 @@ mod tests {
             validate_release_override(" https://example.com/releases/ ").unwrap(),
             "https://example.com/releases"
         );
-        // Loopback mirrors may use plain HTTP (a LAN-less local feed).
-        for local in ["http://127.0.0.1:8080", "http://localhost:8080/x", "http://[::1]:8080"] {
-            assert!(validate_release_override(local).is_ok(), "rejected {local}");
-        }
-        // Off-machine feeds must be HTTPS, and none may smuggle credentials,
-        // a query, or a fragment into the artifact URLs.
         for url in [
             "http://example.com/releases",
-            "http://127.0.0.1.example.com/releases",
             "file:///tmp/update",
             "https://user:password@example.com",
             "https://example.com?feed=x",
@@ -2000,17 +2920,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = Manifest {
             version: "9.9.9".into(),
-            files: BTreeMap::new(),
-            base: Some("http://127.0.0.1:1".into()),
+            ..Manifest::default()
         };
         let app_root = tmp.path().join("app");
         let data_dir = tmp.path().join("data");
 
-        let managed_err = stage_headless(&manifest, &app_root).await.unwrap_err();
+        let managed_err = stage_headless("http://127.0.0.1:1", &manifest, &app_root)
+            .await
+            .unwrap_err();
         assert!(managed_err.to_string().contains("not supported on windows"));
         assert!(!app_root.exists(), "managed staging must not touch disk");
 
-        let mac_err = stage_mac_app(&manifest, &data_dir).await.unwrap_err();
+        let mac_err = stage_mac_app("http://127.0.0.1:1", &manifest, &data_dir)
+            .await
+            .unwrap_err();
         assert!(mac_err.to_string().contains("not supported on windows"));
         assert!(!data_dir.exists(), "macOS staging must not touch disk");
 
@@ -2133,6 +3056,23 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_restarts_into_the_next_beta_and_the_stable_it_becomes() {
+        let attempts = |installed: &str, running: &str| {
+            let restarts = std::cell::Cell::new(0);
+            SupersededRestart::default().poll_installed(installed, running, || true, || {
+                restarts.set(restarts.get() + 1);
+                Ok(())
+            });
+            restarts.get()
+        };
+        assert_eq!(attempts("0.2.137-beta.19", "0.2.137-beta.18"), 1);
+        assert_eq!(attempts("0.2.137", "0.2.137-beta.19"), 1);
+        assert_eq!(attempts("0.2.137-beta.18", "0.2.137-beta.18"), 0);
+        // (What a numeric version on both would miss.)
+        assert_eq!(attempts("0.2.137", "0.2.137"), 0);
+    }
+
+    #[test]
     fn systemd_service_cgroup_is_recognized() {
         assert!(in_zeron_service_cgroup(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zeron.service\n"
@@ -2152,8 +3092,119 @@ mod tests {
     fn bundle_version_reads_the_packaged_plist() {
         let template = include_str!("../../../dist/macos/Info.plist");
         let plist = template.replace("__VERSION__", "0.3.1");
-        assert_eq!(bundle_short_version(&plist).as_deref(), Some("0.3.1"));
-        assert_eq!(bundle_short_version("<plist></plist>"), None);
+        assert_eq!(plist_string(&plist, "CFBundleShortVersionString").as_deref(), Some("0.3.1"));
+        // Packaging names the engine it bundles.
+        assert_eq!(plist_string(&plist, "ZeronEngineVersion").as_deref(), Some("0.3.1"));
+        assert_eq!(plist_string("<plist></plist>", "CFBundleShortVersionString"), None);
+    }
+
+    #[test]
+    fn a_bundle_s_engine_version_is_its_key_else_the_app_s() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("Zeron.app");
+        std::fs::create_dir_all(bundle.join("Contents")).unwrap();
+        let write = |body: &str| std::fs::write(bundle.join("Contents/Info.plist"), body).unwrap();
+        // A beta: the app is 0.2.136-beta.1, its engine stable's 0.2.135. An
+        // engine weighing the app's version would restart forever.
+        write(
+            "<plist><dict><key>CFBundleShortVersionString</key><string>0.2.136</string>\
+             <key>ZeronEngineVersion</key><string>0.2.135</string></dict></plist>",
+        );
+        assert_eq!(bundle_engine_version(&bundle).as_deref(), Some("0.2.135"));
+        let mac = InstallKind::MacApp { bundle: bundle.clone() };
+        assert_eq!(installed_version(&mac).as_deref(), Some("0.2.135"));
+        // A bundle from before the key.
+        write("<plist><dict><key>CFBundleShortVersionString</key><string>0.2.134</string></dict></plist>");
+        assert_eq!(bundle_engine_version(&bundle).as_deref(), Some("0.2.134"));
+    }
+
+    #[test]
+    fn prereleases_sort_as_semver_says() {
+        let ordered = ["0.2.134", "0.2.135", "0.2.136-beta.1", "0.2.136-beta.2", "0.2.136-beta.10", "0.2.136", "0.2.137-beta.1"];
+        for pair in ordered.windows(2) {
+            assert!(version_newer(pair[1], pair[0]), "{} > {}", pair[1], pair[0]);
+            assert!(!version_newer(pair[0], pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        assert!(!version_newer("0.2.136-beta.1", "0.2.136-beta.1"));
+        assert!(version_newer("v0.2.136-beta.1", "0.2.135"));
+        // Garbage never counts as newer.
+        for bad in ["0.2.136-", "0.2.136-beta..1", "0.2.136+build", "beta", ""] {
+            assert!(!version_newer(bad, "0.0.1"), "{bad}");
+            assert!(parse_version(bad).is_none(), "{bad}");
+        }
+        // The numeric compare is unchanged.
+        assert!(version_newer("0.1.10", "0.1.9") && version_newer("0.1.0", "0.1"));
+    }
+
+    fn manifest_of(version: &str, channel: Channel) -> Manifest {
+        Manifest {
+            version: version.into(),
+            channel,
+            ..Manifest::default()
+        }
+    }
+
+    #[test]
+    fn a_build_takes_newer_releases_of_its_channel() {
+        let stable = manifest_of("0.2.136", Channel::Stable);
+        assert_eq!(offer(&stable, "0.2.135", Channel::Stable, None, None), Offer::Newer);
+        assert_eq!(offer(&stable, "0.2.136", Channel::Stable, None, None), Offer::Current);
+        assert_eq!(offer(&stable, "0.2.137", Channel::Stable, None, None), Offer::Current);
+        let beta = manifest_of("0.2.136-beta.2", Channel::Beta);
+        assert_eq!(offer(&beta, "0.2.136-beta.1", Channel::Beta, Some("0.2.135"), None), Offer::Newer);
+        assert_eq!(offer(&beta, "0.2.136-beta.2", Channel::Beta, Some("0.2.135"), None), Offer::Current);
+    }
+
+    #[test]
+    fn choosing_beta_on_stable_takes_only_a_newer_beta() {
+        let beta = manifest_of("0.2.136-beta.1", Channel::Beta);
+        assert_eq!(offer(&beta, "0.2.135", Channel::Beta, None, None), Offer::Newer);
+        // Stable moved past the last beta: wait for the next one.
+        assert_eq!(offer(&beta, "0.2.136", Channel::Beta, None, None), Offer::Current);
+    }
+
+    #[test]
+    fn leaving_beta_installs_stable_even_when_older() {
+        let stable = manifest_of("0.2.135", Channel::Stable);
+        assert_eq!(offer(&stable, "0.2.136-beta.2", Channel::Stable, Some("0.2.135"), None), Offer::Switch);
+        // A stable that caught up is simply newer.
+        let caught_up = manifest_of("0.2.136", Channel::Stable);
+        assert_eq!(offer(&caught_up, "0.2.136-beta.2", Channel::Stable, Some("0.2.135"), None), Offer::Newer);
+    }
+
+    #[test]
+    fn leaving_beta_waits_when_stable_s_engine_is_older_than_the_beta_s() {
+        let stable = manifest_of("0.2.135", Channel::Stable);
+        let held = offer(&stable, "0.2.136-beta.3", Channel::Stable, Some("0.2.136"), None);
+        assert!(matches!(&held, Offer::Held(why) if why.contains("catches up")), "{held:?}");
+        // A manifest naming its engine is weighed by that.
+        let named = Manifest { engine_version: Some("0.2.136".into()), ..stable };
+        assert_eq!(offer(&named, "0.2.136-beta.3", Channel::Stable, Some("0.2.136"), None), Offer::Switch);
+    }
+
+    #[test]
+    fn a_release_for_a_newer_macos_is_held() {
+        let beta = Manifest {
+            minimum_macos: Some("14.0".into()),
+            ..manifest_of("0.2.136-beta.1", Channel::Beta)
+        };
+        let held = offer(&beta, "0.2.135", Channel::Beta, None, Some("13.6"));
+        assert!(matches!(&held, Offer::Held(why) if why.contains("macOS 14.0")), "{held:?}");
+        assert_eq!(offer(&beta, "0.2.135", Channel::Beta, None, Some("14.1")), Offer::Newer);
+        assert!(!held.installs());
+    }
+
+    #[test]
+    fn a_beta_manifest_reads_its_extra_fields() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"version":"0.2.136-beta.1","engineVersion":"0.2.135","minimumMacOS":"14.0","files":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.engine_version.as_deref(), Some("0.2.135"));
+        assert_eq!(manifest.minimum_macos.as_deref(), Some("14.0"));
+        // A stable manifest has neither.
+        let stable: Manifest = serde_json::from_str(r#"{"version":"0.2.135","files":{}}"#).unwrap();
+        assert_eq!((stable.engine_version, stable.minimum_macos), (None, None));
     }
 
     #[cfg(unix)]
@@ -2222,212 +3273,6 @@ mod tests {
         assert!(!dir_writable(&tmp.path().join("missing")));
     }
 
-    /// A served release: `manifest.json` (version + the sha256 of `body`) for
-    /// `{base}/manifest.json`, and `body` itself for any other path, e.g. the
-    /// `{base}/artifact` the manifest names.
-    async fn serve_release(
-        version: &str,
-        body: Vec<u8>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        // `Manifest` skips `base` on the wire: `fetch_latest` fills it in from
-        // the feed it resolved, so the document only needs version + files.
-        let manifest = format!(
-            r#"{{"version":"{version}","files":{{"artifact":{{"sha256":"{:x}"}}}}}}"#,
-            Sha256::digest(&body)
-        );
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let (manifest, body) = (manifest.clone(), body.clone());
-                tokio::spawn(async move {
-                    let mut request = [0; 4096];
-                    let Ok(read) = socket.read(&mut request).await else {
-                        return;
-                    };
-                    let request = String::from_utf8_lossy(&request[..read]).to_string();
-                    let (body, kind) = if request.contains("manifest.json") {
-                        (manifest.into_bytes(), "application/json")
-                    } else {
-                        (body, "application/octet-stream")
-                    };
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(&body).await;
-                });
-            }
-        });
-        (base, server)
-    }
-
-    fn github_release(assets: &[(&str, &str, Option<&str>)]) -> GithubRelease {
-        GithubRelease {
-            tag_name: "v0.3.0".into(),
-            assets: assets
-                .iter()
-                .map(|(name, url, digest)| GithubAsset {
-                    name: (*name).to_owned(),
-                    browser_download_url: (*url).to_owned(),
-                    digest: digest.map(str::to_owned),
-                })
-                .collect(),
-        }
-    }
-
-    const GITHUB_ASSET_BASE: &str =
-        "https://github.com/K0oRui/zeron/releases/download/v0.3.0";
-
-    #[test]
-    fn github_release_tag_names_the_version_and_assets_name_the_files() {
-        let release = github_release(&[
-            (
-                "zeron-0.3.0-linux-x86_64.tar.gz",
-                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-x86_64.tar.gz",
-                Some("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
-            ),
-            (
-                "manifest.json",
-                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/manifest.json",
-                None,
-            ),
-        ]);
-        let manifest = manifest_from_release(&release, None).unwrap();
-        assert_eq!(manifest.version, "0.3.0");
-        assert_eq!(manifest.base.as_deref(), Some(GITHUB_ASSET_BASE));
-        // The checksum file is metadata, not an artifact, and the asset's own
-        // digest stands in for it.
-        assert_eq!(manifest.files.len(), 1);
-        assert_eq!(
-            manifest.files["zeron-0.3.0-linux-x86_64.tar.gz"]
-                .sha256
-                .as_deref(),
-            Some("1111111111111111111111111111111111111111111111111111111111111111")
-        );
-        assert_eq!(
-            artifact_url(&manifest, "zeron-0.3.0-linux-x86_64.tar.gz").unwrap(),
-            format!("{GITHUB_ASSET_BASE}/zeron-0.3.0-linux-x86_64.tar.gz")
-        );
-    }
-
-    #[test]
-    fn release_manifest_checksums_win_and_stray_versions_are_ignored() {
-        let release = github_release(&[(
-            "zeron-0.3.0-macos-arm64-app.tar.gz",
-            "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-macos-arm64-app.tar.gz",
-            None,
-        )]);
-        let file = |sha: &str| Manifest {
-            version: "0.3.0".into(),
-            files: [(
-                "zeron-0.3.0-macos-arm64-app.tar.gz".to_owned(),
-                FileMeta {
-                    sha256: Some(sha.to_owned()),
-                },
-            )]
-            .into(),
-            base: None,
-        };
-        let checksums = file("2222222222222222222222222222222222222222222222222222222222222222");
-        let manifest = manifest_from_release(&release, Some(&checksums)).unwrap();
-        assert_eq!(
-            manifest.files["zeron-0.3.0-macos-arm64-app.tar.gz"]
-                .sha256
-                .as_deref(),
-            Some("2222222222222222222222222222222222222222222222222222222222222222")
-        );
-
-        // A manifest published with a different release must not pin this one.
-        let stale = Manifest {
-            version: "0.2.0".into(),
-            ..checksums.clone()
-        };
-        let manifest = manifest_from_release(&release, Some(&stale)).unwrap();
-        assert_eq!(
-            manifest.files["zeron-0.3.0-macos-arm64-app.tar.gz"].sha256,
-            None
-        );
-
-        // An asset the manifest does not list still appears, carrying the
-        // API's digest, so the feed never loses a file.
-        let listed = Manifest {
-            version: "0.3.0".into(),
-            files: BTreeMap::new(),
-            base: None,
-        };
-        let release = github_release(&[
-            (
-                "zeron-0.3.0-linux-aarch64.tar.gz",
-                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-aarch64.tar.gz",
-                Some("sha256:3333333333333333333333333333333333333333333333333333333333333333"),
-            ),
-            (
-                "zeron-0.3.0-linux-x86_64.tar.gz",
-                "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-linux-x86_64.tar.gz",
-                None,
-            ),
-        ]);
-        let manifest = manifest_from_release(&release, Some(&listed)).unwrap();
-        assert_eq!(manifest.files.len(), 2);
-        assert_eq!(
-            manifest.files["zeron-0.3.0-linux-aarch64.tar.gz"]
-                .sha256
-                .as_deref(),
-            Some("3333333333333333333333333333333333333333333333333333333333333333")
-        );
-        assert_eq!(
-            manifest.files["zeron-0.3.0-linux-x86_64.tar.gz"].sha256,
-            None
-        );
-    }
-
-    #[test]
-    fn release_without_any_checksums_still_yields_a_usable_feed() {
-        let release = github_release(&[(
-            "zeron-0.3.0-windows-x86_64.exe",
-            "https://github.com/K0oRui/zeron/releases/download/v0.3.0/zeron-0.3.0-windows-x86_64.exe",
-            None,
-        )]);
-        let manifest = manifest_from_release(&release, None).unwrap();
-        assert_eq!(manifest.version, "0.3.0");
-        assert!(manifest.files.contains_key("zeron-0.3.0-windows-x86_64.exe"));
-        assert!(
-            artifact_url(&manifest, "zeron-0.3.0-windows-x86_64.exe")
-                .unwrap()
-                .starts_with(GITHUB_ASSET_BASE)
-        );
-    }
-
-    /// An override becomes the feed base (trailing slash dropped); with no
-    /// override the updater uses GitHub Releases, i.e. no base at all.
-    #[test]
-    fn release_feed_resolves_an_override_and_defaults_to_github() {
-        assert_eq!(
-            release_base_from(Some("https://mirror.example.com/zeron/"))
-                .unwrap()
-                .as_deref(),
-            Some("https://mirror.example.com/zeron")
-        );
-        // A blank override is "not configured", not an error.
-        assert_eq!(release_base_from(Some("   ")).unwrap(), None);
-        #[cfg(not(windows))]
-        assert_eq!(release_base_from(None).unwrap(), None);
-        // An override that cannot be a safe artifact base is rejected before
-        // any request is made.
-        assert!(release_base_from(Some("http://example.com/feed")).is_err());
-        // And the same base is what a check would fetch from.
-        assert_eq!(
-            validate_release_override("https://mirror.example.com/zeron").unwrap(),
-            "https://mirror.example.com/zeron"
-        );
-    }
-
     /// Serves `body` for every request until aborted.
     async fn serve_forever(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2454,13 +3299,10 @@ mod tests {
         (base, server)
     }
 
-    /// The configured-feed path: `{base}/manifest.json` names the release.
-    /// The feed is injected, so this touches no process state and needs no
-    /// serialisation.
     #[tokio::test]
     async fn desktop_checker_reports_a_newer_release_on_demand() {
-        let (base, server) = serve_release("999.0.0", Vec::new()).await;
-        let updater = Updater::spawn_desktop_with_feed(base);
+        let (base, server) = serve_forever(br#"{"version":"999.0.0","files":{}}"#.to_vec()).await;
+        let updater = Updater::spawn_desktop(base);
         let status = updater.check().await.unwrap();
         assert!(status.update_available);
         assert_eq!(status.latest_version.as_deref(), Some("999.0.0"));
@@ -2501,9 +3343,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         std::fs::create_dir_all(&app_root).unwrap();
-        // One manifest per served tarball: the checksum pins which bytes the
-        // staged binary must come from.
-        let manifest = |base: &str, bytes: &[u8]| Manifest {
+        let manifest = |bytes: &[u8]| Manifest {
             version: "9.9.9".into(),
             files: [(
                 headless_artifact("9.9.9"),
@@ -2512,15 +3352,15 @@ mod tests {
                 },
             )]
             .into(),
-            base: Some(base.to_owned()),
+            ..Manifest::default()
         };
 
         let wrong = fake_headless_tarball(&tmp.path().join("wrong"), "1.0.0");
-        let (wrong_base, wrong_server) = serve_forever(wrong.clone()).await;
-        let error = stage_headless(&manifest(&wrong_base, &wrong), &app_root)
+        let (base, server) = serve_forever(wrong.clone()).await;
+        let error = stage_headless(&base, &manifest(&wrong), &app_root)
             .await
             .unwrap_err();
-        wrong_server.abort();
+        server.abort();
         assert!(
             format!("{error:#}").contains("expected \"zeron 9.9.9\""),
             "unexpected error: {error:#}"
@@ -2529,12 +3369,35 @@ mod tests {
         assert_eq!(std::fs::read_dir(&app_root).unwrap().count(), 0);
 
         let right = fake_headless_tarball(&tmp.path().join("right"), "9.9.9");
-        let (right_base, right_server) = serve_forever(right.clone()).await;
-        let staged = stage_headless(&manifest(&right_base, &right), &app_root)
+        let (base, server) = serve_forever(right.clone()).await;
+        let staged = stage_headless(&base, &manifest(&right), &app_root)
             .await
             .unwrap();
-        right_server.abort();
+        server.abort();
         assert_eq!(staged, app_root.join("9.9.9"));
         assert!(staged.join("zeron").is_file());
+    }
+
+    #[test]
+    fn a_beta_bundle_says_its_beta_version_not_its_numeric_short_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = dir.path().join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        // As scripts/package-zgx-beta.sh writes it.
+        std::fs::write(
+            contents.join("Info.plist"),
+            "<plist><dict><key>CFBundleShortVersionString</key><string>0.2.137</string>\
+             <key>ZeronEngineVersion</key><string>0.2.136</string>\
+             <key>ZeronVersion</key><string>0.2.137-beta.16</string></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(bundle_app_version(dir.path()).as_deref(), Some("0.2.137-beta.16"));
+        // A stable bundle has no `ZeronVersion`.
+        std::fs::write(
+            contents.join("Info.plist"),
+            "<plist><dict><key>CFBundleShortVersionString</key><string>0.2.136</string></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(bundle_app_version(dir.path()).as_deref(), Some("0.2.136"));
     }
 }

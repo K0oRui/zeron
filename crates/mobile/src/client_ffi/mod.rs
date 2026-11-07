@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use zeron_client as zc;
 
-pub use cloud::*;
 pub use session::*;
 pub use types::*;
 

@@ -474,7 +474,7 @@ impl OpencodeHarness {
         cwd: Option<&str>,
         mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<Server, HarnessError> {
-        self.server_with_env(cwd, mcp, &Default::default(), AccessMode::FullAccess)
+        self.server_with_env(cwd, mcp, &[], &Default::default(), AccessMode::FullAccess)
             .await
     }
 
@@ -485,14 +485,31 @@ impl OpencodeHarness {
         &self,
         cwd: Option<&str>,
         mcp: Option<&zeron_proto::McpServer>,
+        extra_mcp: &[zeron_proto::McpServer],
         run_env: &std::collections::BTreeMap<String, String>,
         access: AccessMode,
     ) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
+            if !extra_mcp.is_empty() {
+                tracing::warn!(
+                    target: "zeron_harness::opencode",
+                    count = extra_mcp.len(),
+                    "attached to an existing opencode server; plugin MCP servers are skipped"
+                );
+            }
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn_with_env(&exe, cwd, self.startup_timeout, mcp, run_env, access).await
+        Server::spawn_with_extras(
+            &exe,
+            cwd,
+            self.startup_timeout,
+            mcp,
+            extra_mcp,
+            run_env,
+            access,
+        )
+        .await
     }
 
     /// `files = None` previews (returns the paths a commit could restore).
@@ -515,6 +532,7 @@ impl OpencodeHarness {
             .server_with_env(
                 directory.as_deref(),
                 request.mcp.as_ref(),
+                &request.extra_mcp,
                 &request.env,
                 access(&request),
             )
@@ -776,6 +794,7 @@ impl Harness for OpencodeHarness {
             .server_with_env(
                 cwd.as_deref(),
                 request.mcp.as_ref(),
+                &request.extra_mcp,
                 &request.env,
                 access(&request),
             )
@@ -976,19 +995,8 @@ impl Server {
         .await
     }
 
-    /// Spawn `opencode serve` on a free loopback port with a per-run Basic
-    /// password, and wait for a generation-bearing health answer (which
-    /// also resolves [`Protocol`]). `run_env` is the host-resolved run
-    /// environment ([`RunRequest::env`]); `access` adds its permission
-    /// rules ([`access_config`]).
-    ///
-    /// Every opencode process shares one SQLite database; a server booting
-    /// while another migrates or checkpoints it can exit with "database is
-    /// locked" (more often on Windows, whose file locks are mandatory and
-    /// whose malware scan holds new WAL files), and concurrent first starts
-    /// race each other's schema migration ([`MigrationRace`]). Those exits
-    /// alone are retried, and on a fresh port, which also covers the port
-    /// race inherent in handing a released port to the child.
+    /// [`Self::spawn_with_extras`] without plugin MCP servers.
+    #[cfg(test)]
     async fn spawn_with_env(
         exe: &std::path::Path,
         cwd: Option<&str>,
@@ -997,12 +1005,48 @@ impl Server {
         run_env: &std::collections::BTreeMap<String, String>,
         access: AccessMode,
     ) -> Result<Self, HarnessError> {
+        Self::spawn_with_extras(exe, cwd, startup, mcp, &[], run_env, access).await
+    }
+
+    /// Spawn `opencode serve` on a free loopback port with a per-run Basic
+    /// password, and wait for a generation-bearing health answer (which
+    /// also resolves [`Protocol`]). `run_env` is the host-resolved run
+    /// environment ([`RunRequest::env`]); `access` adds its permission
+    /// rules ([`access_config`]). The plugins' native MCP servers
+    /// ([`RunRequest::extra_mcp`]) ride beside Zeron's own `mcp`.
+    ///
+    /// Every opencode process shares one SQLite database; a server booting
+    /// while another migrates or checkpoints it can exit with "database is
+    /// locked" (more often on Windows, whose file locks are mandatory and
+    /// whose malware scan holds new WAL files), and concurrent first starts
+    /// race each other's schema migration ([`MigrationRace`]). Those exits
+    /// alone are retried, and on a fresh port, which also covers the port
+    /// race inherent in handing a released port to the child.
+    async fn spawn_with_extras(
+        exe: &std::path::Path,
+        cwd: Option<&str>,
+        startup: Duration,
+        mcp: Option<&zeron_proto::McpServer>,
+        extra_mcp: &[zeron_proto::McpServer],
+        run_env: &std::collections::BTreeMap<String, String>,
+        access: AccessMode,
+    ) -> Result<Self, HarnessError> {
         // Known up front (cached per binary): it picks the MCP and
         // permission config shapes and which health endpoints to probe first.
         let version = opencode_version(exe).await;
         let mut attempt = 0;
         loop {
-            match Self::spawn_once(exe, cwd, startup, mcp, run_env, access, version.as_ref()).await
+            match Self::spawn_once(
+                exe,
+                cwd,
+                startup,
+                mcp,
+                extra_mcp,
+                run_env,
+                access,
+                version.as_ref(),
+            )
+            .await
             {
                 Err(SpawnFailure::Retryable(error)) if attempt < SPAWN_RETRIES => {
                     attempt += 1;
@@ -1022,11 +1066,13 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_once(
         exe: &std::path::Path,
         cwd: Option<&str>,
         startup: Duration,
         mcp: Option<&zeron_proto::McpServer>,
+        extra_mcp: &[zeron_proto::McpServer],
         run_env: &std::collections::BTreeMap<String, String>,
         access: AccessMode,
         version: Option<&semver::Version>,
@@ -1071,15 +1117,16 @@ impl Server {
             }
             (None, _) => None,
         };
-        if mcp_layer.is_some() || restricted || headroom.is_some() {
+        if mcp_layer.is_some() || !extra_mcp.is_empty() || restricted || headroom.is_some() {
             // Set after the run env, merging into its inline config (the
             // user's layer for this run) rather than replacing it.
             let inherited = run_env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .cloned()
                 .or_else(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok());
-            let mut inline = inline_config(inherited.as_deref(), mcp_layer, headroom.as_ref())
-                .map_err(fatal)?;
+            let mut inline =
+                inline_config(inherited.as_deref(), mcp_layer, extra_mcp, headroom.as_ref())
+                    .map_err(fatal)?;
             if restricted {
                 // A restricted run never starts without its rules: it would
                 // do unasked what the person chose to approve.
@@ -4873,6 +4920,7 @@ fn part_snapshot_events(
                     is_error: status == "error",
                     output,
                     diff: None,
+                    exit_code: None,
                 });
             }
             events
@@ -6087,16 +6135,21 @@ fn parse_inline_config(inherited: Option<&str>) -> Result<Value, HarnessError> {
 }
 
 /// The inline config layer for one run: the user's inherited config, then the
-/// Zeron MCP server, then Headroom's provider routing. Each layer merges into
-/// the one before it, so a run can carry any part on its own.
+/// Zeron MCP server and each plugin server ([`RunRequest::extra_mcp`]), then
+/// Headroom's provider routing. Each layer merges into the one before it, so a
+/// run can carry any part on its own.
 fn inline_config(
     inherited: Option<&str>,
     mcp: Option<(&zeron_proto::McpServer, Protocol)>,
+    extras: &[zeron_proto::McpServer],
     headroom: Option<&HeadroomRoute>,
 ) -> Result<String, HarnessError> {
     let mut config = parse_inline_config(inherited)?;
     if let Some((mcp, protocol)) = mcp {
         add_mcp(&mut config, mcp, protocol)?;
+        for extra in extras {
+            add_mcp(&mut config, extra, protocol)?;
+        }
     }
     if let Some(route) = headroom {
         add_headroom(&mut config, route);
@@ -6383,6 +6436,49 @@ fn permission_list<'a>(
 #[cfg(test)]
 mod mcp_injection_tests {
     use super::*;
+
+    #[test]
+    fn inline_config_adds_plugin_servers_beside_zeron_in_both_generations() {
+        let zeron = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: Default::default(),
+        };
+        let extra = zeron_proto::McpServer {
+            name: "plugin-focus".into(),
+            command: "/data/plugins/.loaded/focus/0123/bin/server".into(),
+            args: vec!["--stdio".into()],
+            env: [("FOCUS".to_owned(), "1".to_owned())].into_iter().collect(),
+        };
+        assert_eq!(
+            inline_config(Some("{\"model\":\"keep\"}"), None, &[], None).unwrap(),
+            "{\"model\":\"keep\"}"
+        );
+        for (protocol, servers) in [(Protocol::V1, "/mcp"), (Protocol::V2, "/mcp/servers")] {
+            let inline = inline_config(
+                Some(r#"{"model":"keep"}"#),
+                Some((&zeron, protocol)),
+                std::slice::from_ref(&extra),
+                None,
+            )
+            .unwrap();
+            let config: Value = serde_json::from_str(&inline).unwrap();
+            assert_eq!(config["model"], "keep");
+            let servers = config.pointer(servers).unwrap();
+            assert_eq!(
+                servers["zeron"]["command"],
+                json!(["/opt/zeron/zeron", "mcp"])
+            );
+            let plugin = &servers["plugin-focus"];
+            assert_eq!(
+                plugin["command"],
+                json!(["/data/plugins/.loaded/focus/0123/bin/server", "--stdio"])
+            );
+            assert_eq!(plugin["environment"], json!({ "FOCUS": "1" }));
+            assert_eq!(plugin["type"], "local");
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -6675,12 +6771,12 @@ if (process.argv.includes('--version')) {{
                 }
             };
             let first: Value = serde_json::from_str(
-                &inline_config(Some(inherited), Some((&mcp, protocol)), None).unwrap(),
+                &inline_config(Some(inherited), Some((&mcp, protocol)), &[], None).unwrap(),
             )
             .unwrap();
             mcp.env.insert("ZERON_CHAT_ID".into(), "second".into());
             let second: Value = serde_json::from_str(
-                &inline_config(Some(inherited), Some((&mcp, protocol)), None).unwrap(),
+                &inline_config(Some(inherited), Some((&mcp, protocol)), &[], None).unwrap(),
             )
             .unwrap();
             assert_eq!(first["model"], "keep");
@@ -6707,7 +6803,7 @@ if (process.argv.includes('--version')) {{
                 assert!(servers["zeron"].get("enabled").is_none());
             }
             for invalid in ["[]", "{", r#"{"mcp":false}"#] {
-                assert!(inline_config(Some(invalid), Some((&mcp, protocol)), None).is_err());
+                assert!(inline_config(Some(invalid), Some((&mcp, protocol)), &[], None).is_err());
             }
             mcp.env.insert("ZERON_CHAT_ID".into(), "first".into());
         }
@@ -6751,7 +6847,7 @@ mod headroom_injection_tests {
         let mcp = mcp();
         for protocol in [Protocol::V1, Protocol::V2] {
             let raw =
-                inline_config(Some(inherited), Some((&mcp, protocol)), Some(&route)).unwrap();
+                inline_config(Some(inherited), Some((&mcp, protocol)), &[], Some(&route)).unwrap();
             let config: Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(config["model"], "keep");
             assert_eq!(
@@ -6788,7 +6884,7 @@ mod headroom_injection_tests {
             HeadroomRoute::from_env(&env(&[("HEADROOM_PROXY_URL", "http://127.0.0.1:9000")]))
                 .unwrap();
         let config: Value =
-            serde_json::from_str(&inline_config(None, None, Some(&route)).unwrap()).unwrap();
+            serde_json::from_str(&inline_config(None, None, &[], Some(&route)).unwrap()).unwrap();
         assert_eq!(
             config["provider"]["openai"]["options"]["baseURL"],
             "http://127.0.0.1:9000/v1"

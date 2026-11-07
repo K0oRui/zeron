@@ -163,6 +163,8 @@ pub fn session_file_in(
             find_named(&roots, id, 4)
         }
         HarnessId::Fx => None,
+        // A registry agent's own session store is unknown.
+        HarnessId::Registry(_) => None,
     }
 }
 

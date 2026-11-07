@@ -107,6 +107,7 @@ fn agent_name(harness: HarnessId) -> &'static str {
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "Muse Code",
         HarnessId::Mock => "Mock",
+        HarnessId::Registry(agent) => agent.registry_id(),
     }
 }
 
@@ -959,6 +960,7 @@ mod tests {
             error: None,
             can_apply: true,
             manual_command: None,
+            wait_reason: None,
             compatibility: None,
             held_back: None,
         }

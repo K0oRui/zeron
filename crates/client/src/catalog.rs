@@ -148,7 +148,6 @@ const FULL_LADDER: &[&str] = &[
 const CLAUDE_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultrathink"];
 const CODEX_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const CODEX_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// Static fallback = the engine's `default_enabled()` pair. ACP agents
 /// appear only through a device's live catalog (opt-in per device).

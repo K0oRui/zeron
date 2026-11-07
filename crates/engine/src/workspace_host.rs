@@ -927,6 +927,7 @@ impl WorkspaceHost {
             checkout_id: None,
             repository_id: None,
             github_repo: None,
+            icon: None,
             created_at: Utc::now(),
         };
         self.mutate(|doc| doc.upsert_space(&space))?;
@@ -1074,6 +1075,7 @@ impl WorkspaceHost {
             config,
             cwd,
             parent_chat_id,
+            None,
         )
     }
 
@@ -1092,6 +1094,7 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
         parent_chat_id: Option<String>,
+        child_kind: Option<zeron_proto::ChildKind>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
@@ -1127,6 +1130,7 @@ impl WorkspaceHost {
             }
             None => cwd.unwrap_or_default(),
         };
+        let parent = parent_chat_id.filter(|p| !p.trim().is_empty());
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
@@ -1150,7 +1154,9 @@ impl WorkspaceHost {
                 harness_session_harness: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
-                parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                // (What a child is to its parent: only a child has a kind.)
+                child_kind: child_kind.filter(|_| parent.is_some()),
+                parent_chat_id: parent,
             })
         })?;
         Ok(())
@@ -1203,6 +1209,7 @@ impl WorkspaceHost {
                 checkout_id: None,
                 repository_id: None,
                 github_repo: None,
+                icon: None,
                 created_at: Utc::now(),
             })
         })?;
@@ -1250,6 +1257,7 @@ impl WorkspaceHost {
                 // Groups with the clones of the repository on other devices.
                 repository_id: Some(zeron_proto::view::cloud_repository_id(&spaces, github_repo)),
                 github_repo: Some(github_repo.to_string()),
+                icon: None,
                 created_at: Utc::now(),
             })
         })?;
@@ -1258,6 +1266,10 @@ impl WorkspaceHost {
 
     pub fn rename_space(&self, space_id: &str, name: Option<&str>) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_space(space_id, name))?)
+    }
+
+    pub fn set_space_icon(&self, space_id: &str, icon: Option<&zeron_proto::SpaceIcon>) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_space_icon(space_id, icon))?)
     }
 
     /// Hard-delete a space and its chats (registry cascade — one atomic batch).
