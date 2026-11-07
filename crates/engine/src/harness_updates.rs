@@ -5371,7 +5371,7 @@ esac
             let target = dir.join("grok");
             std::fs::write(
                 &target,
-                "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check) echo 'A new version of Grok Build is available: 1.0.4 -> 1.0.41 [stable]' ;;\n  update:) touch \"$(dirname \"$0\")/updater-ran\" ;;\n  *) exit 2 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 'grok 1.0.4 (d846eb93d9) [stable]' ;;\n  update:--check) echo '{\"currentVersion\":\"1.0.4\",\"latestVersion\":\"1.0.41\",\"updateAvailable\":true,\"error\":null}' ;;\n  update:) touch \"$(dirname \"$0\")/updater-ran\" ;;\n  *) exit 2 ;;\nesac\n",
             )
             .unwrap();
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
