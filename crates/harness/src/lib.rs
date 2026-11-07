@@ -388,6 +388,7 @@ pub trait Harness: Send + Sync {
 }
 
 pub mod acp;
+pub mod acp_registry;
 pub(crate) mod adapter_install;
 pub mod approval;
 pub mod archive_install;
@@ -397,7 +398,8 @@ mod catalog;
 mod catalog_failure;
 mod revert;
 pub(crate) mod code_signature;
-pub mod redact;
+/// Secret redaction, shared with the doc fold (command output tails).
+pub use zeron_proto::redact;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod claude;
 pub mod codex;

@@ -2379,6 +2379,7 @@ mod tests {
                     checkout_id: Some("checkout".into()),
                     repository_id: None,
                     github_repo: None,
+                    icon: None,
                     created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
                 };
                 let project_key = zeron_proto::view::project_key(&space);

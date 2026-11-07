@@ -300,6 +300,7 @@ fn change_request_lookup(root: &std::path::Path) -> Arc<StaticChangeRequestLooku
             state: ChangeRequestState::Open,
             base_ref: "main".into(),
             head_ref: "feature/status".into(),
+            signals: None,
         },
         resolves: AtomicUsize::new(0),
     })
@@ -514,6 +515,77 @@ async fn checkout_change_request_stream_matches_locally_and_through_device_routi
 
     core_a.shutdown().await;
     core_b.shutdown().await;
+}
+
+/// Clients watch a chat's `sourceContext.repoRoot`. It is canonical, so it can
+/// differ from the chat's cwd (always on Windows, where it is `\\?\C:\…`). A
+/// chat outside every project must still resolve, without a space scan, and
+/// a root that is gone must be rejected rather than resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_change_request_accepts_a_local_chats_source_root() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let checkout = dirs.path().join("checkout");
+    init_git_repo(&checkout);
+    let app = checkout.join("app");
+    std::fs::create_dir_all(&app).expect("app folder");
+    let repo_root = std::fs::canonicalize(&checkout).expect("canonical checkout");
+
+    let mut core = assemble(&dirs.path().join("b"), "device-b");
+    core.change_requests = CheckoutChangeRequests::new(
+        core.repos.clone(),
+        "device-b",
+        change_request_lookup(&checkout),
+    );
+    core.workspace
+        .create_chat(
+            "chat-outside-projects",
+            None,
+            Some("device-b"),
+            None,
+            Some(app.to_string_lossy().into_owned()),
+        )
+        .expect("chat");
+    core.workspace
+        .set_chat_source_context(
+            "chat-outside-projects",
+            &zeron_proto::ConversationSourceContext {
+                checkout_id: "checkout".into(),
+                repo_root: repo_root.to_string_lossy().into_owned(),
+                cwd: app.to_string_lossy().into_owned(),
+                branch: "feature/status".into(),
+                head_sha: None,
+                observed_at: chrono::Utc::now(),
+            },
+        )
+        .expect("source context");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let mut watch = client
+        .subscribe_checked(
+            methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+            serde_json::json!({ "cwd": repo_root }),
+        )
+        .await
+        .expect("a local chat's source root is a known checkout");
+    tokio::time::timeout(Duration::from_secs(5), watch.recv())
+        .await
+        .expect("frame before timeout")
+        .expect("initial frame");
+
+    std::fs::remove_dir_all(&checkout).expect("remove checkout");
+    let rejected = match client
+        .subscribe_checked(
+            methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+            serde_json::json!({ "cwd": repo_root }),
+        )
+        .await
+    {
+        Ok(_) => panic!("a removed checkout must be rejected"),
+        Err(error) => error,
+    };
+    assert!(rejected.to_string().contains("not a known checkout"));
+
+    core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -925,6 +997,7 @@ async fn target_device_id_routes_over_the_relay() {
             worktree: None,
             resume: None,
             env: Default::default(),
+            extra_mcp: Vec::new(),
         },
         message_id: "m-a-1".into(),
     })
@@ -2013,6 +2086,13 @@ async fn workspace_entry_mutations_are_forwarded_to_the_owning_plain_folder() {
     })).await.unwrap();
     assert_eq!(deleted["status"], "applied");
     assert!(!folder.join("renamed.txt").exists());
+    // Made on the host, from the viewer.
+    let created=client.call(methods::CREATE_WORKSPACE_ENTRY,serde_json::json!({
+        "spaceId":"mutation-space","targetDeviceId":"mutation-host","operationId":"remote-create",
+        "expectedCheckoutId":page["checkoutId"],"path":"made.txt","kind":"file"
+    })).await.unwrap();
+    assert_eq!(created["status"], "applied");
+    assert_eq!(std::fs::read(folder.join("made.txt")).unwrap(), b"");
     viewer.shutdown().await;
     host.shutdown().await;
 }
@@ -2195,4 +2275,100 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
     b.shutdown().await;
     drop(host);
     relay.abort();
+}
+
+/// A device answering `UpdateStatus` with one report and then staying quiet, as an
+/// engine does between checks.
+struct OneStatus(&'static str);
+
+#[async_trait]
+impl RpcService for OneStatus {
+    async fn handle(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<zeron_rpc::RpcReply, RpcError> {
+        if method == methods::UPDATE_STATUS {
+            let item = serde_json::json!({ "currentVersion": self.0 });
+            return Ok(zeron_rpc::RpcReply::Stream(
+                futures::stream::once(async move { item })
+                    .chain(futures::stream::pending())
+                    .boxed(),
+            ));
+        }
+        zeron_rpc::RpcReply::value(&serde_json::json!({}))
+    }
+}
+
+/// Updating a device takes it away for a moment. Whoever asked for its status, on
+/// another device, goes on hearing about it on the same subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_status_follows_another_device_through_its_restart() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let host = |version: &'static str| {
+        HostRelay::spawn(
+            HostRelayConfig::new(&relay_url, "other-device", Arc::new(StaticToken("test-user".into()))),
+            Arc::new(OneStatus(version)),
+            Arc::new(|_| true),
+        )
+    };
+    let before = host("1.0.0");
+
+    let core = assemble(&dirs.path().join("asker"), "asking-device");
+    let mut link_config =
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
+    link_config.probe_timeout = Duration::from_secs(5);
+    core.set_links(LinkCache::new(link_config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let params = serde_json::json!({ "targetDeviceId": "other-device" });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut updates = loop {
+        match client.subscribe_checked(methods::UPDATE_STATUS, params.clone()).await {
+            Ok(updates) => break updates,
+            Err(error) => {
+                assert!(tokio::time::Instant::now() < deadline, "never reached it: {error}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let item = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+        .await
+        .expect("the first report")
+        .expect("the subscription");
+    assert_eq!(item["currentVersion"], "1.0.0");
+
+    drop(before);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let _after = host("2.0.0");
+
+    // The test room doesn't say a host went, as a device dying without a word
+    // doesn't: this is the follow asking again.
+    let item = tokio::time::timeout(Duration::from_secs(90), updates.recv())
+        .await
+        .expect("a report after the restart")
+        .expect("the same subscription must still be open");
+    assert_eq!(item["currentVersion"], "2.0.0");
+}
+
+/// Asking a device that isn't there says so plainly, and nothing has started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn updating_a_device_that_cannot_be_reached_says_so_plainly() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let core = assemble(&dirs.path().join("asker"), "asking-device");
+    let mut link_config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    link_config.probe_timeout = Duration::from_secs(2);
+    core.set_links(LinkCache::new(link_config));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let error = client
+        .call(
+            methods::APPLY_UPDATE,
+            serde_json::json!({ "targetDeviceId": "not-here" }),
+        )
+        .await
+        .expect_err("nothing can answer");
+    assert!(error.to_string().contains("can't be reached"), "{error}");
+    assert!(error.to_string().contains("didn't start"), "{error}");
 }

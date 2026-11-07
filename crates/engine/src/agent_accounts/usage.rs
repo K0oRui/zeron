@@ -378,6 +378,7 @@ pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
             resets_at,
         }],
         plan_label: None,
+        codex_reset_credits: None,
     })
 }
 
@@ -464,6 +465,7 @@ pub(super) fn devin_usage_snapshot(
         UsageSnapshot {
             windows,
             plan_label,
+            codex_reset_credits: None,
         },
         identity,
     ))
@@ -576,6 +578,7 @@ pub(super) fn copilot_usage_snapshot(body: &serde_json::Value) -> Option<UsageSn
     (!windows.is_empty() || plan_label.is_some()).then_some(UsageSnapshot {
         windows,
         plan_label,
+        codex_reset_credits: None,
     })
 }
 
@@ -605,6 +608,7 @@ pub(super) fn nous_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
     (body.get("user").is_some() || subscription.is_some()).then_some(UsageSnapshot {
         windows,
         plan_label,
+        codex_reset_credits: None,
     })
 }
 

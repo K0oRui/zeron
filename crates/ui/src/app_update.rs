@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use gpui_tokio::Tokio;
-use zeron_update::{InstallKind, UpdateBlocker, UpdateStatus, Updater};
+use zeron_update::{Channel, InstallKind, UpdateBlocker, UpdateStatus, Updater};
 
 /// Download/install lifecycle of the newest release in this process.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +68,7 @@ pub struct AppUpdate {
     blocker: Option<UpdateBlocker>,
     /// Background download + install on quit (`ZERON_AUTO_UPDATE` unset or on).
     automatic: bool,
+    edge_url: String,
     data_dir: PathBuf,
     checker: Updater,
     status: Option<UpdateStatus>,
@@ -76,6 +77,9 @@ pub struct AppUpdate {
     /// Version whose advisory strip the user dismissed (a newer release shows
     /// it again).
     dismissed: Option<String>,
+    /// Why "Get beta updates" couldn't turn on (an older macOS; not an app
+    /// install), shown under it.
+    channel_note: Option<SharedString>,
     _status_watch: Task<()>,
     download: Option<Task<()>>,
     user_check: Option<Task<()>>,
@@ -88,8 +92,8 @@ impl Global for GlobalAppUpdate {}
 impl AppUpdate {
     /// Start the desktop checker. Call once at boot, after `gpui_tokio` is
     /// initialized.
-    pub fn init(data_dir: PathBuf, cx: &mut App) {
-        let entity = cx.new(|cx| Self::new(data_dir, cx));
+    pub fn init(edge_url: String, data_dir: PathBuf, cx: &mut App) {
+        let entity = cx.new(|cx| Self::new(edge_url, data_dir, cx));
         cx.set_global(GlobalAppUpdate(entity));
     }
 
@@ -98,15 +102,18 @@ impl AppUpdate {
             .map(|global| global.0.clone())
     }
 
-    fn new(data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(edge_url: String, data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let install = zeron_update::detect_install();
         let blocker = install
             .supports_desktop_update()
             .then(|| install.desktop_update_blocker())
             .flatten();
+        // The channel (update-channel.json) lives in the data dir, where the
+        // next interface installed here reads it too.
+        zeron_update::channel::set_data_dir(&data_dir);
         let checker = {
             let _runtime = Tokio::handle(cx).enter();
-            Updater::spawn_desktop()
+            Updater::spawn_desktop(edge_url.clone())
         };
         let mut statuses = checker.watch();
         let status_watch = cx.spawn(async move |this, cx| {
@@ -125,12 +132,14 @@ impl AppUpdate {
             install,
             blocker,
             automatic: zeron_update::desktop_auto_update_enabled(),
+            edge_url,
             data_dir,
             checker,
             status: None,
             flow: Flow::Idle,
             prompt: None,
             dismissed: None,
+            channel_note: None,
             _status_watch: status_watch,
             download: None,
             user_check: None,
@@ -159,6 +168,18 @@ impl AppUpdate {
             .as_ref()
             .filter(|status| status.update_available)
             .and_then(|status| status.latest_version.as_deref())
+    }
+
+    /// A release the last check found that can't be installed here, and why
+    /// (an older macOS; a beta's engine newer than stable's).
+    pub fn held(&self) -> Option<(&str, &str)> {
+        let status = self.status.as_ref()?;
+        Some((status.latest_version.as_deref()?, status.held.as_deref()?))
+    }
+
+    /// Whether installing [`Self::available`] leaves the beta for stable.
+    pub fn switching(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| status.switch && status.update_available)
     }
 
     /// Whether this app downloads and installs updates itself right now.
@@ -195,7 +216,9 @@ impl AppUpdate {
             Flow::Ready { version, .. } => Some(version),
             Flow::Idle | Flow::Failed { .. } => None,
         };
-        if current.is_some_and(|version| !zeron_update::version_newer(latest, version)) {
+        // Staged already: unless the offer changed (a newer release, or the
+        // other channel's after a switch, which may be older).
+        if current.is_some_and(|version| version == latest) {
             return;
         }
         self.start_download(cx);
@@ -208,21 +231,14 @@ impl AppUpdate {
         let Some(version) = self.available().map(str::to_owned) else {
             return;
         };
+        let edge_url = self.edge_url.clone();
         let data_dir = self.data_dir.clone();
         let install = self.install.clone();
         self.flow = Flow::Downloading {
             version: version.clone(),
         };
         let stage = Tokio::spawn(cx, async move {
-            // Re-read the manifest so a long-lived status still downloads the
-            // newest release, with that release's checksums.
-            let manifest = zeron_update::fetch_latest().await?;
-            anyhow::ensure!(
-                zeron_update::version_newer(&manifest.version, zeron_update::current_version()),
-                "the release feed no longer offers a newer version"
-            );
-            let staged = install.stage_desktop(&manifest, &data_dir).await?;
-            anyhow::Ok((manifest.version, staged))
+            zeron_update::desktop::stage_offer(&edge_url, &data_dir, &install).await
         });
         self.download = Some(cx.spawn(async move |this, cx| {
             let outcome = match stage.await {
@@ -347,6 +363,41 @@ impl AppUpdate {
             }
             Err(err) => tracing::warn!(error = %err, "installing the staged update on quit failed"),
         }
+    }
+
+    /// Whether this Mac follows the beta channel.
+    pub fn beta(&self) -> bool {
+        zeron_update::channel::read(&self.data_dir).channel == Channel::Beta
+    }
+
+    /// Whether the channel choice applies here (a macOS app install).
+    pub fn offers_channels(&self) -> bool {
+        matches!(self.install, InstallKind::MacApp { .. })
+    }
+
+    /// Why beta couldn't turn on, after a try.
+    pub fn channel_note(&self) -> Option<&SharedString> {
+        self.channel_note.as_ref()
+    }
+
+    /// "Get beta updates": follow the beta channel (or stable again), then
+    /// check at once. A beta needs macOS 13 (`BETA_MINIMUM_MACOS`); an older Mac is told so and
+    /// stays on stable. Leaving beta offers stable's release even when it's
+    /// older ([`zeron_update::Offer::Switch`]).
+    pub fn set_beta(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.channel_note = None;
+        if let Err(why) = zeron_update::desktop::choose_channel(&self.data_dir, on) {
+            tracing::warn!(%why, "update channel unchanged");
+            self.channel_note = Some(why.into());
+            cx.notify();
+            return;
+        }
+        // What's staged was the other channel's offer.
+        if matches!(self.flow, Flow::Ready { .. } | Flow::Failed { .. }) {
+            self.flow = Flow::Idle;
+        }
+        self.status = None;
+        self.check_for_updates(cx);
     }
 
     pub fn dismiss_advisory(&mut self, cx: &mut Context<Self>) {
