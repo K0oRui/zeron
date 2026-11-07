@@ -3939,7 +3939,7 @@ case "$1:$2" in
   update:--check)
     test ! -f "$root/fail-check" || exit 1
     printf '{"currentVersion":"%s","latestVersion":"2.0.0","updateAvailable":true,"error":null}\n' "$(cat "$root/version")" ;;
-  update::) printf '2.0.0\n' > "$root/version" ;;
+  update:) printf '2.0.0\n' > "$root/version" ;;
   *) exit 2 ;;
 esac
 "#,
