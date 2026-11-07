@@ -52,7 +52,8 @@ struct LiveTerminal {
     #[cfg(all(test, windows))]
     process_id: u32,
     /// The shell's process id: something else in the PTY's foreground is a
-    /// program running ([`Terminals::status`]).
+    /// program running ([`Terminals::status`]). Read only on unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     shell_pid: Option<u32>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,

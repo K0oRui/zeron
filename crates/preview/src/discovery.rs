@@ -254,6 +254,7 @@ impl Origins {
 }
 
 /// Whether a NUL-separated environment block sets `name`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn has_variable(environment: &[u8], name: &str) -> bool {
     let prefix = format!("{name}=");
     environment.split(|b| *b == 0).any(|entry| entry.starts_with(prefix.as_bytes()))
