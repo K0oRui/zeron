@@ -6444,7 +6444,7 @@ esac
 root="$(dirname "$0")/.."
 case "$1:$2" in
   version:) cat "$root/version" ;;
-  update:--check) printf '2.0.0\n' ;;
+  update:--check) printf '{"currentVersion":"%s","latestVersion":"2.0.0","updateAvailable":true,"error":null}\n' "$(cat "$root/version")" ;;
   update:)
     # Rewrites its own launcher, then fails, as a half-done npm install does.
     printf '\n# touched\n' >> "$0"
@@ -6918,7 +6918,7 @@ esac
         std::fs::write(
             &first,
             format!(
-                "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 1.0.0 ;;\n  update:--check) echo 2.0.0 ;;\n  update:) printf '#!/bin/sh\\necho 2.0.0\\n' > '{second}'; chmod +x '{second}'; echo '{second}' > '{which}' ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1:$2\" in\n  version:) echo 1.0.0 ;;\n  update:--check) echo '{\"currentVersion\":\"1.0.0\",\"latestVersion\":\"2.0.0\",\"updateAvailable\":true,\"error\":null}' ;;\n  update:) printf '#!/bin/sh\\necho 2.0.0\\n' > '{second}'; chmod +x '{second}'; echo '{second}' > '{which}' ;;\nesac\n",
                 second = second.display(),
                 which = which.display()
             ),
