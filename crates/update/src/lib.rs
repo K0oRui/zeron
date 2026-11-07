@@ -351,24 +351,24 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
 /// A configured feed (`ZERON_RELEASES_URL` or the Windows package's config)
 /// wins; otherwise this project's own GitHub Releases.
 pub async fn fetch_latest_on(edge_url: &str, channel: Channel) -> anyhow::Result<Manifest> {
-    if let Some(base) = configured_release_base()? {
+    if let Some(base) = configured_release_base(edge_url)? {
         let base = channel.base(&base);
         let mut manifest = fetch_latest_from(&base).await?;
         manifest.base = Some(base);
         manifest.channel = channel;
         return Ok(manifest);
     }
-    let _ = edge_url;
     let mut manifest = fetch_github_latest().await?;
     manifest.channel = channel;
     Ok(manifest)
 }
 
 /// A configured feed base, or `None` for the GitHub Releases feed: the
-/// `ZERON_RELEASES_URL` override, else the Windows package's
-/// `zeron-update.json`. Unlike [`release_base`] it does not fall back to the
-/// edge, so an unconfigured install reads this project's GitHub Releases.
-fn configured_release_base() -> anyhow::Result<Option<String>> {
+/// `ZERON_RELEASES_URL` override, the Windows package's `zeron-update.json`,
+/// or a loopback `edge_url` (a local feed or a test's server). The project's
+/// own edge is ignored in favour of GitHub Releases, which is this fork's
+/// feed.
+fn configured_release_base(edge_url: &str) -> anyhow::Result<Option<String>> {
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
     {
@@ -378,7 +378,25 @@ fn configured_release_base() -> anyhow::Result<Option<String>> {
     if let Some(url) = windows::release_url()? {
         return Ok(Some(url.trim_end_matches('/').to_owned()));
     }
+    if edge_is_loopback(edge_url) {
+        return Ok(Some(format!("{}/releases", edge_url.trim_end_matches('/'))));
+    }
     Ok(None)
+}
+
+/// Whether `edge_url` points at the local machine: a feed only it serves.
+fn edge_is_loopback(edge_url: &str) -> bool {
+    reqwest::Url::parse(edge_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
 }
 
 /// The GitHub REST view of a release — only the fields the updater reads.
