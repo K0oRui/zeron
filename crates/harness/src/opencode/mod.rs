@@ -85,7 +85,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice,
+    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ModelProvider,
     ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus, ToolCall,
     UserInputAnswer, UserInputQuestion,
 };
@@ -706,8 +706,10 @@ impl Harness for OpencodeHarness {
     fn fallback_models(&self) -> Vec<Model> {
         vec![
             Model {
+                default: false,
                 id: "opencode/beam-free".into(),
                 label: "Beam Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -719,8 +721,10 @@ impl Harness for OpencodeHarness {
                 options: vec![],
             },
             Model {
+                default: false,
                 id: "opencode/flint-40b-free".into(),
                 label: "Flint 40B Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -1838,8 +1842,13 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
                 levels.sort();
                 levels.dedup();
                 Model {
+                    default: false,
                     id: format!("{provider_id}/{model_id}"),
                     label,
+                    provider: Some(ModelProvider {
+                        id: provider_id.to_owned(),
+                        name: provider_name.to_owned(),
+                    }),
                     description: Some(provider_name.to_owned()),
                     reasoning_levels: levels,
                     options: Vec::new(),
@@ -1854,8 +1863,10 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
     if out.is_empty() {
         out = vec![
             Model {
+                default: false,
                 id: "opencode/beam-free".into(),
                 label: "Beam Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -1867,8 +1878,10 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
                 options: vec![],
             },
             Model {
+                default: false,
                 id: "opencode/flint-40b-free".into(),
                 label: "Flint 40B Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -4920,6 +4933,8 @@ fn part_snapshot_events(
                     is_error: status == "error",
                     output,
                     diff: None,
+                    preview_paths: Vec::new(),
+                    image_payloads: Vec::new(),
                     exit_code: None,
                 });
             }

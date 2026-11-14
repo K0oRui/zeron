@@ -511,10 +511,30 @@ pub struct Model {
     /// mirroring the Electron app's `ModelInfo.description`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Where the model is served from, for a harness that reaches models
+    /// through several providers (Pi signed in to both Codex and OpenCode
+    /// can list the same model twice). `None` for a harness with one source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelProvider>,
     #[serde(default)]
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
+    /// The harness's own default: what a chat that names no model runs. A
+    /// catalog lists its rows best-first, so the default need not lead it;
+    /// clients pick the marked row and fall back to the first row when none
+    /// is marked (catalogs from older engines mark none).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+/// A model's provider: its stable id as the harness names it (`openai-codex`,
+/// `opencode`) and its name as people say it (`Codex`, `OpenCode`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProvider {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -990,6 +1010,14 @@ pub struct SlashCommand {
     pub input_hint: Option<String>,
 }
 
+/// One image embedded in a tool result, held only until the engine stores
+/// a copy under the profile uploads directory. Never journaled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResultImage {
+    pub name: String,
+    pub data_base64: String,
+}
+
 /// A file modification carried inline on a tool result (ACP
 /// `ToolCallContent::Diff`). `old_text: None` means a new file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1096,6 +1124,13 @@ pub enum AgentEvent {
         /// Inline file diff for edit-shaped tools (ACP `Diff` content).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
+        /// Uploads paths of images that were embedded in this result. The
+        /// engine fills this before journaling; adapters leave it empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preview_paths: Vec<String>,
+        /// In-memory image bytes for the engine to store. Never serialized.
+        #[serde(skip)]
+        image_payloads: Vec<ToolResultImage>,
         /// A command's exit status, when the harness reported one (Claude
         /// Code's Bash, Codex's command execution). Absent for other tools,
         /// a command still running in the background, or one that never ran.

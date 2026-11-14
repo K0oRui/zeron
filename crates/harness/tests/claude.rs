@@ -171,6 +171,8 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
             is_error: false,
             output: None,
             diff: None,
+            preview_paths: Vec::new(),
+            image_payloads: Vec::new(),
             exit_code: Some(0),
         }),
     }));
@@ -200,6 +202,8 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         is_error: false,
         output: None,
         diff: None,
+        preview_paths: Vec::new(),
+        image_payloads: Vec::new(),
         exit_code: Some(0),
     }));
     assert!(events.contains(&AgentEvent::ToolResult {
@@ -207,6 +211,8 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         is_error: true,
         output: None,
         diff: None,
+        preview_paths: Vec::new(),
+        image_payloads: Vec::new(),
         exit_code: None,
     }));
 
