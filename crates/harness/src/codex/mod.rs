@@ -160,6 +160,13 @@ fn codex_mcp_overrides(mcp: &zeron_proto::McpServer) -> Vec<(String, Value)> {
         // access mode, so Codex neither rejects a call under `never` nor
         // asks about one under the others.
         (key("default_tools_approval_mode"), "approve".into()),
+        // Codex gives up on a tool call after 60 s by default, and a Zeron
+        // `wait_for_turn` (or a send that waits) may block for up to an hour
+        // while another chat works: past the longest wait, plus margin.
+        (key("tool_timeout_sec"), ZERON_TOOL_TIMEOUT_SECS.into()),
+        // A cold start (a fresh machine paging the binary in) can outlast
+        // the 10 s default before the server answers `initialize`.
+        (key("startup_timeout_sec"), 30.into()),
     ]
 }
 
@@ -180,6 +187,10 @@ fn codex_extra_mcp_overrides(extras: &[zeron_proto::McpServer]) -> Vec<(String, 
         })
         .collect()
 }
+
+/// The longest a Zeron MCP tool may take: its longest wait (an hour) plus
+/// margin for the reply.
+const ZERON_TOOL_TIMEOUT_SECS: u64 = 3600 + 120;
 
 /// A ready-to-spawn `codex login` command for the engine's account flow.
 ///
@@ -625,8 +636,10 @@ fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>)
         let options = model_service_tier(item).into_iter().collect();
         models.push((
             Model {
+                default: false,
                 id: id.to_owned(),
                 label,
+                provider: None,
                 description,
                 reasoning_levels,
                 options,
@@ -3057,6 +3070,14 @@ use crate::{Signal, send_signal, shutdown_child};
 mod tests {
     use super::*;
 
+    /// Codex takes a steer mid-command in its own turn, so a steer must not
+    /// interrupt: a backgrounded command's call stays open for the rest of
+    /// its turn, and the stop would abort a turn that was only writing.
+    #[test]
+    fn a_steer_stays_in_the_turn() {
+        assert!(!CodexHarness::new().steer_stops_tool());
+    }
+
     #[test]
     fn shown_commands_drop_the_login_shell() {
         assert_eq!(
@@ -3419,6 +3440,9 @@ mod mcp_injection_tests {
             overrides["mcp_servers.zeron.default_tools_approval_mode"],
             "approve"
         );
+        // Long Zeron waits must outlive Codex's 60 s default tool timeout.
+        assert!(overrides["mcp_servers.zeron.tool_timeout_sec"].as_u64().unwrap() > 3600);
+        assert_eq!(overrides["mcp_servers.zeron.startup_timeout_sec"], 30);
     }
     #[test]
     fn codex_extra_mcp_overrides_leave_approval_to_the_access_mode() {

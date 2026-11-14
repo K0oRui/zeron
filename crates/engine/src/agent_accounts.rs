@@ -20,6 +20,13 @@
 //! through it itself; zeron lists the pool and adds to it through Hermes'
 //! own CLI, but never rewrites it.
 //!
+//! ² Per model provider: these agents keep one login per provider in one
+//! store, and a run reads the entry of its model's provider. Each row
+//! carries its provider (`AgentAccount::provider`); rows sharing one form a
+//! group with at most one in use, and switching (or a new sign-in) rewrites
+//! that provider's entry alone — a ChatGPT switch never touches the Claude
+//! or Copilot login beside it.
+//!
 //! The original four providers each store exactly one live login:
 //!
 //! - **Claude Code** — credentials in `~/.claude/.credentials.json`
@@ -106,13 +113,16 @@ pub struct RelayedCallback {
     pub location: Option<String>,
 }
 
+mod api_keys;
 mod kilo;
 mod muse;
+mod pins;
 mod oauth;
 mod registry_login;
 #[cfg(test)]
 mod provider_tests;
 pub use muse::MuseRunEnvironment;
+pub use pins::{ChatPin, PinHook, PinRunEnvironment};
 mod stores;
 mod usage;
 
@@ -739,6 +749,12 @@ struct ProbeEndpoints {
     github_api: String,
     /// GitHub's OAuth root (`/login/device/code`, `/login/oauth/access_token`).
     github_login: String,
+    /// A Copilot session's API root (`/models`): `None` in production, where
+    /// it's read from the session token itself.
+    copilot_api: Option<String>,
+    /// Where API keys are checked: `None` in production (each provider's
+    /// own host, `api_keys::key_check`), a mock in tests.
+    api_key_check: Option<String>,
     /// OpenAI's OAuth root (`/oauth/authorize`, `/oauth/token`).
     openai_auth: String,
     /// The ChatGPT sign-in's loopback port — FIXED at 1455 by the client
@@ -767,6 +783,8 @@ impl Default for ProbeEndpoints {
             kilo_balance: kilo::KILO_BALANCE_URL.into(),
             github_api: "https://api.github.com".into(),
             github_login: "https://github.com".into(),
+            copilot_api: None,
+            api_key_check: None,
             openai_auth: oauth::OPENAI_AUTH.into(),
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
@@ -812,6 +830,15 @@ struct Inner {
     identities: Mutex<HashMap<String, IdentityLookup>>,
     /// Test seam: fixed CLI binaries per agent instead of PATH resolution.
     cli_overrides: Mutex<HashMap<HarnessId, PathBuf>>,
+    /// The last snapshot a list, switch or removal made, for whoever follows
+    /// them (plugins' usage and account events). Never holds a credential.
+    snapshots: tokio::sync::watch::Sender<Option<AgentAccountsSnapshot>>,
+    /// Chats pinned to an account of their own; mirrored to disk (see
+    /// [`pins`]).
+    pins: Mutex<pins::PinState>,
+    /// Asked for a chat's account at its first run (a plugin's
+    /// `run.preparing`).
+    pin_hook: Mutex<Option<PinHook>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -878,6 +905,7 @@ impl AgentAccounts {
                 }
             }
         }
+        let pins = pins::PinState::load(&config.root_dir().join(pins::PINS_FILE));
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -903,8 +931,42 @@ impl AgentAccounts {
                 callback_routes,
                 identities: Mutex::new(HashMap::new()),
                 cli_overrides: Mutex::new(HashMap::new()),
+                snapshots: tokio::sync::watch::channel(None).0,
+                pins: Mutex::new(pins),
+                pin_hook: Mutex::new(None),
             }),
         }
+    }
+
+    /// Each snapshot as lists, switches and removals make them (from
+    /// Settings, the composer's usage ring, a plugin): the current one at
+    /// once, then every change.
+    pub fn watch_snapshots(&self) -> tokio::sync::watch::Receiver<Option<AgentAccountsSnapshot>> {
+        self.inner.snapshots.subscribe()
+    }
+
+    fn published(
+        &self,
+        result: Result<AgentAccountsSnapshot, EngineError>,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        // (A live login is saved again at each list: when isn't a change.)
+        fn unstamped(s: &AgentAccountsSnapshot) -> AgentAccountsSnapshot {
+            let mut s = s.clone();
+            for a in &mut s.accounts {
+                a.saved_at = None;
+            }
+            s
+        }
+        if let Ok(snapshot) = &result {
+            self.inner.snapshots.send_if_modified(|last| {
+                let changed = last.as_ref().map(unstamped) != Some(unstamped(snapshot));
+                if changed {
+                    *last = Some(snapshot.clone());
+                }
+                changed
+            });
+        }
+        result
     }
 
     /// Test seam: run `harness`'s sign-in with the CLI at `path` instead of
@@ -940,7 +1002,8 @@ impl AgentAccounts {
     /// backoff window or probed in the last [`FORCED_MIN_INTERVAL`].
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         let _ops = self.inner.ops.lock().await;
-        self.list_locked(force_usage).await
+        let listed = self.list_locked(force_usage).await;
+        self.published(listed)
     }
 
     /// Caller holds [`Inner::ops`].
@@ -1007,6 +1070,15 @@ impl AgentAccounts {
         for (harness, detected) in &detected_more {
             live(*harness, detected);
             self.snapshot_detected(*harness, detected)?;
+        }
+        if self.opencode_keeps_its_own_store() {
+            warnings.push(AgentAccountWarning {
+                harness: HarnessId::Opencode,
+                message: "This OpenCode keeps its logins in its own database: switching or adding \
+                          them here doesn't reach it yet — use `opencode auth switch` / \
+                          `opencode auth login`."
+                    .into(),
+            });
         }
         if let Some(message) = stores::opencode_env_warning() {
             warnings.push(AgentAccountWarning {
@@ -1160,6 +1232,15 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let activated = self.activate_unpublished(harness, account_id).await;
+        self.published(activated)
+    }
+
+    async fn activate_unpublished(
+        &self,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
         if harness == HarnessId::Hermes {
             return Err(EngineError::Other(
                 "Hermes picks from its own credential pool — zeron doesn't reorder it. Use \
@@ -1204,7 +1285,7 @@ impl AgentAccounts {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;
-                self.write_keyed_entry(harness, key, Some(&slot.credentials))?;
+                self.swap_keyed(harness, key, &slot).await?;
             }
             other => {
                 return Err(EngineError::Other(format!(
@@ -1214,6 +1295,41 @@ impl AgentAccounts {
         }
         *lock(&self.inner.claude_credentials) = None;
         self.list_locked(false).await
+    }
+
+    /// Point OpenCode's / Pi's entry for `key` at `slot`'s login, under the
+    /// agent's own lock (Pi's is the one it refreshes under). The login in
+    /// use is identified first and saved into its slot with the tokens it
+    /// has NOW — the agent may have refreshed it since the last list, and
+    /// Claude's and ChatGPT's refresh tokens are single-use. If it can't be
+    /// identified (its profile call rate limited), or it changes between
+    /// that and the lock, the switch is refused rather than overwrite a
+    /// login no slot holds.
+    async fn swap_keyed(&self, harness: HarnessId, key: &str, slot: &Slot) -> Result<(), EngineError> {
+        let live = match self.detect_keyed_entry(harness, key).await {
+            None => None,
+            Some(Some(detected)) => Some(detected),
+            Some(None) => {
+                return Err(EngineError::Other(
+                    "Couldn't confirm the login in use — try again in a moment.".into(),
+                ));
+            }
+        };
+        if let Some(detected) = &live
+            && detected.account_key != slot.account_key
+        {
+            self.snapshot_detected(harness, detected)?;
+        }
+        let saved = live.as_ref().and_then(|d| d.credentials.clone());
+        self.swap_keyed_entry(harness, key, &slot.credentials, &mut |old| {
+            if old.cloned() == saved {
+                Ok(())
+            } else {
+                Err(EngineError::Other(
+                    "The login in use just changed — try again in a moment.".into(),
+                ))
+            }
+        })
     }
 
     /// Claude Code's own refresh lock (see
@@ -1491,6 +1607,15 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let forgotten = self.forget_unpublished(harness, account_id).await;
+        self.published(forgotten)
+    }
+
+    async fn forget_unpublished(
+        &self,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
         // Reject anything that isn't a slot id (16 lowercase hex) BEFORE touching
         // the filesystem: `account_id` is a raw RPC string that becomes a path,
         // so a crafted id (`../../…`) must never reach `remove_file`.
@@ -1589,8 +1714,12 @@ impl AgentAccounts {
 
     /// [`Self::start_login_for`] for one model provider of an agent that
     /// keeps a login per provider (`provider`: OpenCode's `openai` /
-    /// `github-copilot`, Pi's `openai-codex`, Hermes' `openai-codex` /
-    /// `nous`); `None` picks the agent's default.
+    /// `github-copilot`, Pi's `openai-codex` / `github-copilot`, Hermes'
+    /// `openai-codex` / `nous` / `xai-oauth` —
+    /// `zeron_proto::providers::login_options`); `None` picks the agent's
+    /// default. The new login joins its provider's group only: it takes
+    /// over that provider's live login when there is none (or it re-signs
+    /// that one in), and never touches another provider's.
     pub async fn start_login_with(
         &self,
         harness: HarnessId,
@@ -1629,6 +1758,8 @@ impl AgentAccounts {
                     self.start_openai_login(HarnessId::Pi, "openai-codex")
                         .await?
                 }
+                "github-copilot" => self.start_copilot_login(HarnessId::Pi).await?,
+                "anthropic" => self.start_pi_claude_login().await?,
                 other => return Err(stores::unsupported_login(harness, other)),
             },
             HarnessId::Hermes => {
@@ -3383,7 +3514,7 @@ impl AgentAccounts {
         )
         .await?;
         if let Some(account_id) = str_field(&body, "account_id")
-            && account_id != slot.account_key
+            && account_id != codex_workspace(&slot.account_key)
         {
             return Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,
@@ -4240,6 +4371,14 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+// account keys put the user id before "::" so team seats sharing a workspace
+// stay distinct (`parse_codex_auth`), but openai only ever reports the workspace
+fn codex_workspace(account_key: &str) -> &str {
+    account_key
+        .rsplit_once("::")
+        .map_or(account_key, |(_, workspace)| workspace)
+}
+
 fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     let detected = parse_codex_auth(slot.credentials.clone())
         .ok_or_else(|| EngineError::Other("This Codex login needs to be refreshed.".into()))?;
@@ -4253,7 +4392,7 @@ fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     match (account_id, access_token) {
         (Some(account_id), Some(access_token))
             if !access_token.is_empty()
-                && account_id == slot.account_key
+                && account_id == codex_workspace(&slot.account_key)
                 && detected.account_key == slot.account_key =>
         {
             Ok((access_token, account_id))
@@ -6348,7 +6487,11 @@ mod login_tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = vec![0u8; 16 * 1024];
                 let _ = socket.read(&mut request).await;
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // (A preview scan elsewhere in the test process probes every
+                // local listener with `HEAD /`: not counted.)
+                if !request.starts_with(b"HEAD ") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let _ = socket
                     .write_all(
                         http_response(status, &[("Content-Type", "application/json")], body)
@@ -6970,5 +7113,41 @@ mod login_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_watch_tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// Lists publish what they found (for plugins' events), once per change.
+    #[tokio::test]
+    async fn a_list_publishes_its_snapshot_once_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig::isolated(dir.path());
+        write(
+            &config.claude_config_file,
+            &serde_json::json!({ "oauthAccount": { "accountUuid": "u-1", "emailAddress": "one@example.com" } }).to_string(),
+        );
+        write(
+            &config.claude_creds_file(),
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 1 } }).to_string(),
+        );
+        let accounts = AgentAccounts::new(config);
+        let mut watch = accounts.watch_snapshots();
+        assert!(watch.borrow_and_update().is_none(), "nothing listed yet");
+        let listed = accounts.list(false).await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert_eq!(watch.borrow_and_update().as_ref(), Some(&listed));
+        let text = serde_json::to_string(&listed).unwrap();
+        assert!(!text.contains("\"at\"") && !text.contains("\"rt\""), "no credential in a snapshot: {text}");
+        // (A live login is saved again at each list: not a change.)
+        accounts.list(false).await.unwrap();
+        assert!(!watch.has_changed().unwrap(), "the same snapshot again isn't a change");
     }
 }

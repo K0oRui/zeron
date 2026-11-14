@@ -224,9 +224,19 @@ jobs:
     with:
       pass-key: ${{ fromJSON(needs.plan.outputs.keys).android || '' }}
 
+  # apps/zgx is upstream's interface, not this fork's app (apps/zeron). Its
+  # tests are upstream-specific and have no known-failures list for these
+  # runners, so they run only when a pull request carries the `ci:zgx` label.
+  zgx:
+    needs: [plan, admit]
+    if: fromJSON(needs.plan.outputs.suites).zgx && contains(github.event.pull_request.labels.*.name, 'ci:zgx')
+    uses: ./.github/workflows/zgx-tests.yml
+    with:
+      pass-key: ${{ fromJSON(needs.plan.outputs.keys).zgx || '' }}
+
   result:
     name: CI result
-    needs: [plan, admit, linux-core, linux-ui, cursor, edge, installer, voice, windows, macos, frame-source, ios, android]
+    needs: [plan, admit, linux-core, linux-ui, cursor, edge, installer, voice, windows, macos, frame-source, ios, android, zgx]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

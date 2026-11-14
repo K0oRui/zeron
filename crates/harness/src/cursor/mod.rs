@@ -616,8 +616,10 @@ fn map_model_items(items: &Value) -> Vec<Model> {
                 })
                 .collect();
             Some(Model {
+                default: false,
                 id,
                 label,
+                provider: None,
                 description: str_of(item, "description"),
                 reasoning_levels: Vec::new(),
                 options,
@@ -1119,6 +1121,8 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                             is_error,
                             output: None,
                             diff: None,
+                            preview_paths: Vec::new(),
+                            image_payloads: Vec::new(),
                             exit_code: None,
                         }),
                     ];
