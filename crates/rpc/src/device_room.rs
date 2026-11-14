@@ -697,14 +697,13 @@ async fn handle_host_frame(
             Ok(nudge) => {
                 // Acknowledge local durable admission, never mere receipt or
                 // successful socket send. Old edges omit token and need no ACK.
-                if on_nudge(nudge.chat_id.clone()) && nudge.token.is_some() {
-                    if let Ok(frame) = encode_device_frame(
+                if on_nudge(nudge.chat_id.clone()) && nudge.token.is_some()
+                    && let Ok(frame) = encode_device_frame(
                         &DeviceFrameHeader::new(&nudge.chat_id, "nudgeAck"),
                         &payload,
                     ) {
                         let _ = out_tx.send(frame).await;
                     }
-                }
             }
             Err(_) => tracing::warn!("device-room: malformed nudge — ignoring"),
         }

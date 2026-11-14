@@ -259,7 +259,7 @@ impl Model {
                         None => (0..positions.len()).collect(),
                     };
                     let material = primitive.material().index().unwrap_or(default_material);
-                    for tri in indices.chunks_exact(3) {
+                    for tri in indices.as_chunks::<3>().0 {
                         if tri.iter().any(|&i| i >= positions.len()) {
                             continue;
                         }

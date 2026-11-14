@@ -1933,8 +1933,8 @@ impl Actor {
                 }
                 match transport.push(push.batch_id, push.bytes).await {
                     Ok(ack) => {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack) {
-                            if let (Some(b), Some(seq)) = (v["batchId"].as_str(), v["seq"].as_u64())
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack)
+                            && let (Some(b), Some(seq)) = (v["batchId"].as_str(), v["seq"].as_u64())
                             {
                                 let mut sh = lock(&shared);
                                 if sink.acknowledge_update(b).is_ok() {
@@ -1953,7 +1953,6 @@ impl Actor {
                                 sink.advance_cursor(cursor);
                                 let _ = events.send(ChatEvent::Applied);
                             }
-                        }
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "chat2: http push failed; will retry");
@@ -2014,8 +2013,8 @@ impl Actor {
                 busy.store(false, Relaxed);
                 return;
             };
-            if state_frame.kind == frame_type::STATE {
-                if let Ok(state) =
+            if state_frame.kind == frame_type::STATE
+                && let Ok(state) =
                     serde_json::from_value::<wire::StateHeader>(state_frame.header.clone())
                 {
                     lock(&shared).server = Some(state);
@@ -2100,7 +2099,6 @@ impl Actor {
                         sh.needs_checkpoint = false;
                     }
                 }
-            }
             let mut applied = false;
             for frame in iter {
                 match frame.kind {
@@ -2345,11 +2343,10 @@ impl Actor {
                 shared.rows_req_outstanding = false;
             }
             frame_type::PROBE_OK => {
-                if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header) {
-                    if let Some(server) = &mut lock(&self.shared).server {
+                if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header)
+                    && let Some(server) = &mut lock(&self.shared).server {
                         server.head_seq = server.head_seq.max(probe.head_seq);
                     }
-                }
             }
             frame_type::STATE => {
                 // Late duplicate of a hello answer — refresh the server view.

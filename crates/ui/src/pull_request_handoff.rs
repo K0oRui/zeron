@@ -188,7 +188,7 @@ pub(super) fn prompt(
     for missing in &assessment.missing {
         prompt.push_str(&format!("Missing information: {}.\n", missing.label()));
     }
-    prompt.push_str("\n");
+    prompt.push('\n');
     match kind {
         Handoff::Review => prompt.push_str(&format!(
             "Review this pull request. Read the description with `gh pr view {number} --repo {repo}` and the diff with `gh pr diff {number} --repo {repo}`. Look for correctness bugs, regressions, and missing tests. Report findings by severity with file:line references. Don't push changes or post comments."

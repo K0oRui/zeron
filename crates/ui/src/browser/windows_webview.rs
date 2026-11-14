@@ -1154,7 +1154,7 @@ impl Host {
         };
         let event = match (kind, button) {
             (PointerKind::Move, _) => COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
-            (PointerKind::Down, Some(MouseButton::Left)) if click_count % 2 == 0 => {
+            (PointerKind::Down, Some(MouseButton::Left)) if click_count.is_multiple_of(2) => {
                 COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK
             }
             (PointerKind::Down, Some(MouseButton::Left)) => {

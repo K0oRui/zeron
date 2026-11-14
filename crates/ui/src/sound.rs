@@ -67,7 +67,6 @@ pub fn play_voice(start: bool) {
 /// The caller honors the dedicated capture sound setting.
 pub fn play_appshot() {
     if std::env::var_os(DISABLE_ENV).is_some() {
-        return;
     }
     #[cfg(target_os = "macos")]
     if macos_appshot::play() {

@@ -4999,8 +4999,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if anchored
-            && err <= OWN_SEND_GLIDE_SNAP_PX
-            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+            && (-(OWN_SEND_SCROLL_SLACK_PX + 2.0)..=OWN_SEND_GLIDE_SNAP_PX).contains(&err)
         {
             // At the hold — or resting inside the slack under it (a restick
             // that fired at the true bottom): land WITHOUT pulling the view
@@ -5541,7 +5540,7 @@ impl Transcript {
             if baseline_changed && historical_count == tools.len() {
                 reveal.header_started_at = None;
             }
-            let first_row_delay = is_new_group.then_some(TOOL_FIRST_ROW_DELAY_MS).unwrap_or(0);
+            let first_row_delay = if is_new_group { TOOL_FIRST_ROW_DELAY_MS } else { 0 };
             let mut arrival_ix = 0;
             if whole_group_historical {
                 reveal.starts.clear();
@@ -8030,7 +8029,7 @@ impl Transcript {
             if !live {
                 return None;
             }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000);
             (
                 false,
                 false,
@@ -8088,7 +8087,7 @@ impl Transcript {
                 // and keyed on it, so neither restarts when the machine's
                 // turn begins.
                 if let Some(sent) = state.cloud_setup_turn_started() {
-                    let elapsed = ((now.timestamp_millis() - sent).max(0) / 1000) as i64;
+                    let elapsed = ((now.timestamp_millis() - sent).max(0) / 1000);
                     // A woken machine installing a release says so under
                     // its steps, in place of the working word.
                     let updating = state.send_waits_on_update(&chat_id, now);
@@ -9285,8 +9284,8 @@ impl Transcript {
                     } else {
                         base_row_height
                     };
-                    if !cx.reduce_motion() {
-                        if let Some(at) = fold.toggled_at {
+                    if !cx.reduce_motion()
+                        && let Some(at) = fold.toggled_at {
                             let t = TOOL_FOLD
                                 .curve
                                 .eval(at.elapsed().as_secs_f32() / TOOL_FOLD.total().as_secs_f32());
@@ -9299,7 +9298,6 @@ impl Transcript {
                                 t,
                             );
                         }
-                    }
                     target
                 },
             )

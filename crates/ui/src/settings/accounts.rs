@@ -1013,7 +1013,7 @@ impl AccountsPage {
                     Err(err) => {
                         flow.step = LoginStep::ApiKey {
                             submitting: false,
-                            error: Some(format!("{err}").into()),
+                            error: Some(err.to_string().into()),
                         };
                     }
                 }

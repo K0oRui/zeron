@@ -111,7 +111,7 @@ fn ascii(s: &Source, light: bool) -> Vec<u8> {
 fn halftone(s: &Source, light: bool) -> Vec<u8> {
     let paper = if light { 255u8 } else { 0 };
     let mut out = vec![0u8; s.rgba.len()];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[paper, paper, paper, 255]);
     }
     for y in (0..s.h).step_by(4) {

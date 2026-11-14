@@ -323,8 +323,8 @@ impl FilesSurface {
             .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_millis(650))
         {
             self.tree_drag.hover_since = None;
-            if let Some(directory) = self.tree_drag.destination.clone().filter(|p| !p.is_empty()) {
-                if self.tree.expand(&directory) {
+            if let Some(directory) = self.tree_drag.destination.clone().filter(|p| !p.is_empty())
+                && self.tree.expand(&directory) {
                     self.sync_tree_list();
                     let needs_load = self
                         .tree
@@ -335,7 +335,6 @@ impl FilesSurface {
                     }
                     cx.notify();
                 }
-            }
         }
         true
     }

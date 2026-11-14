@@ -102,7 +102,7 @@ impl Geometry {
             return false;
         }
         let before = self.pan;
-        self.pan = self.pan + delta;
+        self.pan += delta;
         self.clamp_pan();
         self.pan != before
     }

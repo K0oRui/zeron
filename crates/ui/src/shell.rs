@@ -3563,14 +3563,14 @@ impl Shell {
                 // own last pick stands (`last_space_id` also follows opened
                 // chats, so it is only the fallback), unless opted out.
                 let exists = |id: &String| state.read(cx).space_row(id).is_some();
-                let filter = self.settings.space_filter.clone().filter(&exists);
+                let filter = self.settings.space_filter.clone().filter(exists);
                 let target = match filter {
                     Some(filter) => Some(filter),
                     None if !state.read(cx).no_project => {
                         crate::settings::composer::ComposerDefaults::load(&self.data_dir)
                             .project
-                            .filter(&exists)
-                            .or_else(|| self.settings.last_space_id.clone().filter(&exists))
+                            .filter(exists)
+                            .or_else(|| self.settings.last_space_id.clone().filter(exists))
                     }
                     None => None,
                 };
@@ -4543,7 +4543,7 @@ impl Shell {
             window,
             move |this: &mut Self, source, event, window, cx| {
                 if matches!(event, FilesEvent::OpenFile(_) | FilesEvent::RevealFile(_))
-                    && !this.accepts_file_navigation(&event_panel_key, &source, cx)
+                    && !this.accepts_file_navigation(&event_panel_key, source, cx)
                 {
                     return;
                 }
@@ -5758,17 +5758,15 @@ impl Shell {
         }
         let was_pull_requests = matches!(self.route, Route::PullRequests);
         let will_show_pull_requests = matches!(route, Route::PullRequests);
-        if was_pull_requests && !will_show_pull_requests {
-            if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+        if was_pull_requests && !will_show_pull_requests
+            && let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, _| page.on_hidden());
             }
-        }
         self.route = route;
-        if !was_pull_requests && will_show_pull_requests {
-            if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+        if !was_pull_requests && will_show_pull_requests
+            && let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, cx| page.on_visible(cx));
             }
-        }
     }
 
     /// Close the user menu through the exit animation (no-op when closed).
@@ -6884,7 +6882,6 @@ impl Shell {
             if changed {
                 self.schedule_save(cx);
             }
-            return;
         }
         // Remote pins come exclusively from per-pin registry records.
     }
@@ -7074,7 +7071,7 @@ impl Shell {
     /// name the key that opens it.
     fn jump_to_session(&mut self, slot: usize, cx: &mut Context<Self>) {
         let order = self.sidebar_visible_order(cx);
-        let Some(chat_id) = order.iter().nth(slot).cloned() else {
+        let Some(chat_id) = order.get(slot).cloned() else {
             return;
         };
         // Same path a click on that row takes.

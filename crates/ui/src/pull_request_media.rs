@@ -25,11 +25,10 @@ impl TokenSink for DescriptionHtml {
         match token {
             Token::TagToken(tag) => {
                 let name = tag.name.as_ref();
-                if let Some(hidden) = self.hidden.borrow().as_ref() {
-                    if tag.kind != TagKind::EndTag || name != hidden {
+                if let Some(hidden) = self.hidden.borrow().as_ref()
+                    && (tag.kind != TagKind::EndTag || name != hidden) {
                         return TokenSinkResult::Continue;
                     }
-                }
                 if matches!(name, "script" | "style" | "iframe") {
                     *self.hidden.borrow_mut() =
                         (tag.kind == TagKind::StartTag).then(|| name.to_owned());

@@ -456,8 +456,8 @@ pub fn decorations(text: &str, active: Range<usize>) -> Vec<(Range<usize>, Strin
     }
     let mut at = 0;
     for line in text.split('\n') {
-        if !is_thematic_break(line) {
-            if let Some(prefix) = list_prefix(line) {
+        if !is_thematic_break(line)
+            && let Some(prefix) = list_prefix(line) {
                 let marker = at + prefix.indent;
                 let code_index = code_ranges.partition_point(|range| range.end <= marker);
                 // A single '-' can be a setext underline, not a list item.
@@ -488,7 +488,6 @@ pub fn decorations(text: &str, active: Range<usize>) -> Vec<(Range<usize>, Strin
                     }
                 }
             }
-        }
         at += line.len() + 1;
     }
     edits.sort_by_key(|(r, _)| r.start);

@@ -286,7 +286,7 @@ fn change_message(before: &Snapshot, now: &Snapshot, status: &BillingStatus) -> 
 
 /// `$20` (whole dollars), `$12.50` otherwise.
 pub fn format_price(cents: u32) -> String {
-    if cents % 100 == 0 {
+    if cents.is_multiple_of(100) {
         format!("${}", cents / 100)
     } else {
         format!("${}.{:02}", cents / 100, cents % 100)

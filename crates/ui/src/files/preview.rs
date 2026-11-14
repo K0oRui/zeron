@@ -2459,11 +2459,10 @@ impl FilesSurface {
                         };
                         if let Some(document) = this.preview.documents.get_mut(&path) {
                             document.show_markdown = !document.show_markdown;
-                            if !document.show_markdown {
-                                if let Some(view) = &document.markdown {
+                            if !document.show_markdown
+                                && let Some(view) = &document.markdown {
                                     view.update(cx, |view, cx| view.suspend(cx));
                                 }
-                            }
                         }
                         if this
                             .preview

@@ -2089,11 +2089,10 @@ impl AppearancePage {
             // Only the closed state: once open, the card above owns these keys
             // and stops their propagation before they reach us.
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                if !this.font_menu(kind).is_open() {
-                    if this.on_font_key_down(kind, event, window, cx) {
+                if !this.font_menu(kind).is_open()
+                    && this.on_font_key_down(kind, event, window, cx) {
                         cx.stop_propagation();
                     }
-                }
             }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 window.focus(&this.font_focus(kind).clone(), cx);
@@ -2460,11 +2459,10 @@ impl AppearancePage {
                                         .on_click(cx.listener({
                                             let variant_id = variant_id.clone();
                                             move |this, _, _, cx| {
-                                                if let Some(dialog) = this.import_dialog.as_mut() {
-                                                    if !dialog.selected.remove(&variant_id) {
+                                                if let Some(dialog) = this.import_dialog.as_mut()
+                                                    && !dialog.selected.remove(&variant_id) {
                                                         dialog.selected.insert(variant_id.clone());
                                                     }
-                                                }
                                                 cx.notify();
                                             }
                                         })),

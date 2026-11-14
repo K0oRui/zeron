@@ -239,7 +239,7 @@ pub fn run_app(config: UiConfig) {
                 // opens the app on `zeron://notification/<target>`.
                 if let Some(target) = notify::link_target(&url) {
                     let target = target.to_owned();
-                    let _ = cx.update(|cx| open_notification_target(target, &url_state, cx));
+                    cx.update(|cx| open_notification_target(target, &url_state, cx));
                     continue;
                 }
                 url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
@@ -255,7 +255,7 @@ pub fn run_app(config: UiConfig) {
         let click_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(target) = click_rx.next().await {
-                let _ = cx.update(|cx| open_notification_target(target, &click_state, cx));
+                cx.update(|cx| open_notification_target(target, &click_state, cx));
             }
         })
         .detach();

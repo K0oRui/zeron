@@ -688,7 +688,7 @@ impl Driver {
             self.sink.relay_import(&blob, true);
             let _ = self.events.send(RelayEvent::Applied);
             self.round_finished(now);
-        } else if received % SYNC_WINDOW == 0 {
+        } else if received.is_multiple_of(SYNC_WINDOW) {
             self.direct(&from, frame_type::SYNC_REQ, json!({ "xfer": xfer, "offset": received }), &[]);
         }
     }

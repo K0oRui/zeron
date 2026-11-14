@@ -166,7 +166,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
-    (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+    (ms_since_activity / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 /// Auto-grow: content height for a wrapped-line count.
@@ -1473,11 +1473,10 @@ impl TextProjection {
 
     fn raw_to_display(&self, raw: usize) -> usize {
         let ix = self.mappings.partition_point(|(range, _)| range.end <= raw);
-        if let Some((range, display)) = self.mappings.get(ix) {
-            if raw > range.start {
+        if let Some((range, display)) = self.mappings.get(ix)
+            && raw > range.start {
                 return display.start;
             }
-        }
         let (raw_at, display_at) = ix
             .checked_sub(1)
             .map(|previous| (&self.mappings[previous].0, &self.mappings[previous].1))
@@ -1491,15 +1490,14 @@ impl TextProjection {
         let ix = self
             .mappings
             .partition_point(|(_, display)| display.end <= display_offset);
-        if let Some((range, display)) = self.mappings.get(ix) {
-            if display_offset > display.start {
+        if let Some((range, display)) = self.mappings.get(ix)
+            && display_offset > display.start {
                 return if display_offset - display.start < display.len() / 2 {
                     range.start
                 } else {
                     range.end
                 };
             }
-        }
         let (raw_at, display_at) = ix
             .checked_sub(1)
             .map(|previous| (&self.mappings[previous].0, &self.mappings[previous].1))
@@ -2980,11 +2978,10 @@ impl ComposerInput {
             return false;
         }
         // Repeated clicks/Enter only mark one pending send and end audio once.
-        if self.dictation.finish(send, Instant::now()) {
-            if let Some(transcriber) = &mut self.transcriber {
+        if self.dictation.finish(send, Instant::now())
+            && let Some(transcriber) = &mut self.transcriber {
                 transcriber.finish();
             }
-        }
         cx.emit(DictationInputEvent::Changed);
         cx.notify();
         true
@@ -3724,13 +3721,12 @@ impl ComposerInput {
             return;
         }
         if let Some(mut text) = item.text() {
-            if self.mentions_enabled {
-                if let Some(value) = item
+            if self.mentions_enabled
+                && let Some(value) = item
                     .metadata()
                     .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                {
-                    if value.get("text").and_then(|v| v.as_str()) == Some(text.as_str()) {
-                        if let Some(raw) = value.get("zeronComposerV1").and_then(|v| v.as_str()) {
+                    && value.get("text").and_then(|v| v.as_str()) == Some(text.as_str())
+                        && let Some(raw) = value.get("zeronComposerV1").and_then(|v| v.as_str()) {
                             // Chip numbers belong to one draft: chips copied from
                             // another chat would name the wrong attachment, so
                             // they paste as their plain labels instead.
@@ -3745,9 +3741,6 @@ impl ComposerInput {
                                 text = raw.to_owned();
                             }
                         }
-                    }
-                }
-            }
             // Clipboard operations remain separate undo steps, even a one-character paste.
             self.last_edit = None;
             self.replace_text_in_range(None, &text, window, cx);
@@ -3797,15 +3790,14 @@ impl ComposerInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none() {
-            if let Some((range, inserted)) =
+        if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none()
+            && let Some((range, inserted)) =
                 composer_markdown::newline_edit(&self.content, self.cursor_offset())
             {
                 let range = self.range_to_utf16(&range);
                 self.replace_text_in_range(Some(range), &inserted, window, cx);
                 return;
             }
-        }
         let line_end = self.line_range_at(self.cursor_offset()).end;
         let newline = if self.line_content_end_at(self.cursor_offset()) < line_end {
             "\r\n"
@@ -4655,8 +4647,8 @@ impl ComposerInput {
                 .next()
                 .unwrap_or_default();
             let mut indent = px(0.0);
-            if self.mentions_enabled && !is_placeholder {
-                if let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
+            if self.mentions_enabled && !is_placeholder
+                && let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
                     let marker_at = raw_at + prefix.indent;
                     let code_ix = code_ranges.partition_point(|range| range.end <= marker_at);
                     !code_ranges
@@ -4676,7 +4668,6 @@ impl ComposerInput {
                         .width
                         .min(width * 0.4);
                 }
-            }
             let end = display_at + text.len();
             let first_run = run_ranges.partition_point(|(r, _)| r.end <= display_at);
             let line_runs: Vec<TextRun> = run_ranges[first_run..]
@@ -4798,8 +4789,8 @@ impl ComposerInput {
             return self.scroll_left != previous;
         }
         let previous = self.scroll_top;
-        if self.follow_cursor {
-            if let Some(cursor) = self.cursor_point() {
+        if self.follow_cursor
+            && let Some(cursor) = self.cursor_point() {
                 self.scroll_top = input_scroll_offset_for_cursor(
                     self.scroll_top,
                     f32::from(cursor.y),
@@ -4809,7 +4800,6 @@ impl ComposerInput {
                     self.settled_viewport_height,
                 );
             }
-        }
         self.scroll_top = self.scroll_top.clamp(
             0.0,
             input_max_scroll(

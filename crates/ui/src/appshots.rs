@@ -751,13 +751,12 @@ pub(crate) fn restore_queued_appshots(
         let mut screenshot = attachments[index].clone();
         // Older captures may already have backing-surface padding stored in
         // their PNG. Normalize their bytes too, without changing attachment IDs.
-        if png_dimensions(screenshot.bytes()).is_some() {
-            if let Some(bytes) = trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())? {
+        if png_dimensions(screenshot.bytes()).is_some()
+            && let Some(bytes) = trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())? {
                 screenshot.content = crate::attachments::AttachmentContent::Image(Arc::new(
                     gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
                 ));
             }
-        }
         let content = node.text().unwrap_or_default();
         // Remove only the serializer's surrounding newlines, preserving content.
         let content = content.strip_prefix('\n').unwrap_or(content);

@@ -814,11 +814,10 @@ impl Actor {
                     }
                 }
                 at = self.presence_rx.recv() => {
-                    if let Some(at) = at {
-                        if !self.send_beat(&mut pipe, at).await {
+                    if let Some(at) = at
+                        && !self.send_beat(&mut pipe, at).await {
                             return SessionEnd::Reconnect;
                         }
-                    }
                 }
                 _ = self.probe_rx.recv() => {
                     if !self.send_probe(&mut pipe, &mut probe_deadline).await {

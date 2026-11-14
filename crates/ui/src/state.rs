@@ -4043,7 +4043,7 @@ impl AppState {
         tracing::warn!(?delay, ?reason, "lost the engine connection; reconnecting");
         self.reconnect_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let Some(state) = this.upgrade() else {
                     return;
                 };

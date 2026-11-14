@@ -1635,7 +1635,7 @@ impl PullRequestsPage {
             return;
         };
 
-        let target_name = selected_device_name(&self.state.read(cx), self.target_device.as_deref());
+        let target_name = selected_device_name(self.state.read(cx), self.target_device.as_deref());
         if let Some(target) = self.target_device.as_deref()
             && !self.state.read(cx).device_online(target, Utc::now())
         {
@@ -1775,7 +1775,7 @@ impl PullRequestsPage {
             cx.notify();
             return;
         };
-        let target_name = selected_device_name(&self.state.read(cx), self.target_device.as_deref());
+        let target_name = selected_device_name(self.state.read(cx), self.target_device.as_deref());
         let generation = self.generation;
         let mut params = params_for_target(self.target_device.as_deref());
         params["repository"] = self.repository.clone().unwrap().into();
@@ -2274,14 +2274,13 @@ impl Render for PullRequestsPage {
             !self.items.is_empty() && matches!(self.load_state, PullRequestsLoadState::Failed(_));
         // A failed refresh keeps the last results on screen and says so
         // once, as a toast.
-        if refresh_error && !self.refresh_error_shown {
-            if let PullRequestsLoadState::Failed(error) = &self.load_state {
+        if refresh_error && !self.refresh_error_shown
+            && let PullRequestsLoadState::Failed(error) = &self.load_state {
                 let error = error.clone();
                 cx.defer(move |cx| {
                     toast_page_error(&error, Some("Showing the last loaded results."), cx)
                 });
             }
-        }
         self.refresh_error_shown = refresh_error;
         let count = (!initial_loading
             && !matches!(self.load_state, PullRequestsLoadState::Failed(_))
@@ -3412,7 +3411,7 @@ fn recent_git_projects(state: &AppState, local: &str) -> Vec<ProjectRef> {
             )
         })
         .collect();
-    projects.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    projects.sort_by_key(|a| (a.0, a.1, a.2));
     let mut seen = HashSet::new();
     let (primary, alternatives): (Vec<_>, Vec<_>) = projects
         .into_iter()
@@ -3573,14 +3572,14 @@ fn format_compact_count(value: u64) -> String {
         value.to_string()
     } else if value < 1_000_000 {
         let tenths = value / 100;
-        if tenths % 10 == 0 {
+        if tenths.is_multiple_of(10) {
             format!("{}k", value / 1_000)
         } else {
             format!("{}.{:01}k", value / 1_000, tenths % 10)
         }
     } else {
         let tenths = value / 100_000;
-        if tenths % 10 == 0 {
+        if tenths.is_multiple_of(10) {
             format!("{}m", value / 1_000_000)
         } else {
             format!("{}.{:01}m", value / 1_000_000, tenths % 10)

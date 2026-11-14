@@ -49,12 +49,11 @@ impl RegistryDoc {
             if let (Some(ms), Some(counter)) = (
                 parts.next().and_then(|v| v.parse::<i64>().ok()),
                 parts.next().and_then(|v| v.parse::<u32>().ok()),
-            ) {
-                if (ms, counter) > (self.clock.last_ms, self.clock.counter) {
+            )
+                && (ms, counter) > (self.clock.last_ms, self.clock.counter) {
                     self.clock.last_ms = ms;
                     self.clock.counter = counter;
                 }
-            }
         }
     }
 

@@ -265,12 +265,11 @@ impl VoiceController {
             snapshot.muted = !muted;
         }
         cx.notify();
-        if let Some(controls) = &self.controls {
-            if controls.try_send(VoiceControl::Mute(!muted)).is_err() {
+        if let Some(controls) = &self.controls
+            && controls.try_send(VoiceControl::Mute(!muted)).is_err() {
                 self.cancel(cx);
                 self.reason = Some(VoiceRejection::Overflow);
             }
-        }
     }
 
     /// The utterance the caption shows (a speaker turn), if the provider names it.

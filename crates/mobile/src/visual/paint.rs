@@ -159,7 +159,7 @@ impl Paint {
                     *y += dy;
                 }
                 VisualShape::Path { points, .. } => {
-                    for xy in points.chunks_exact_mut(2) {
+                    for xy in points.as_chunks_mut::<2>().0 {
                         xy[0] += dx;
                         xy[1] += dy;
                     }

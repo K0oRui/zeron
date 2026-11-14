@@ -12,13 +12,12 @@ pub struct AnimationClock {
 
 impl AnimationClock {
     pub fn advance(&mut self, now: Instant, rate: f64, running: bool) {
-        if let Some(last) = self.last {
-            if self.running {
+        if let Some(last) = self.last
+            && self.running {
                 let dt = now.saturating_duration_since(last).as_secs_f64();
                 self.seconds += dt * self.rate;
                 self.active_seconds += dt;
             }
-        }
         self.last = Some(now);
         self.rate = rate;
         self.running = running;

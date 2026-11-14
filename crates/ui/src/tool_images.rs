@@ -589,7 +589,7 @@ fn decode_thumbnail(mime: &str, bytes: Vec<u8>) -> Option<(Arc<RenderImage>, f32
         decoded
     };
     let mut pixels = decoded.into_rgba8();
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some((

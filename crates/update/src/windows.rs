@@ -417,7 +417,7 @@ pub async fn complete_install(
     let manifest = super::fetch_latest_on(edge_url, super::Channel::of_version(version))
         .await
         .with_context(|| {
-            format!("reading the release feed (neither this version's own manifest nor the latest one could be read)")
+            "reading the release feed (neither this version's own manifest nor the latest one could be read)".to_string()
         })?;
     let latest = manifest.version.trim().to_owned();
     if latest != version && !super::version_newer(&latest, version) {
