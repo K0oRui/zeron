@@ -161,6 +161,7 @@ pub async fn is_http(address: SocketAddr) -> bool {
 
 /// One process in the scan: enough to walk ancestry and to key the origin
 /// cache by process identity (a recycled pid is a different process).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct Process {
     parent: u32,
@@ -181,9 +182,11 @@ pub struct Origins {
     /// [`Origins::owned`] reads failed this many times (a process mid-exec,
     /// a zombie). It gives up after [`UNREADABLE_TRIES`], so such a process
     /// can't cost a read every scan; [`Origins::resolve`] still retries.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     unreadable: HashMap<(u32, u64), u8>,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const UNREADABLE_TRIES: u8 = 3;
 
 /// What Zeron started here and still runs: each process whose own origin
@@ -193,6 +196,7 @@ const UNREADABLE_TRIES: u8 = 3;
 /// alive means there is nothing to scan for.
 #[derive(Default)]
 pub struct Owned {
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     processes: HashMap<u32, Process>,
     pids: HashSet<u32>,
 }
