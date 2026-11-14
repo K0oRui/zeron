@@ -85,9 +85,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ModelProvider,
-    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus, ToolCall,
-    UserInputAnswer, UserInputQuestion,
+    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice,
+    ModelProvider, ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus,
+    ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::process::{Child, Command, Stdio};
@@ -550,15 +550,9 @@ impl OpencodeHarness {
             });
         }
         let result = if let Some(restore) = files {
-            rewind::commit(
-                &server,
-                &session_id,
-                directory.as_deref(),
-                &target,
-                restore,
-            )
-            .await
-            .map(|()| None)
+            rewind::commit(&server, &session_id, directory.as_deref(), &target, restore)
+                .await
+                .map(|()| None)
         } else {
             rewind::preview(&server, &session_id, directory.as_deref(), &target)
                 .await
@@ -1128,9 +1122,13 @@ impl Server {
                 .get("OPENCODE_CONFIG_CONTENT")
                 .cloned()
                 .or_else(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok());
-            let mut inline =
-                inline_config(inherited.as_deref(), mcp_layer, extra_mcp, headroom.as_ref())
-                    .map_err(fatal)?;
+            let mut inline = inline_config(
+                inherited.as_deref(),
+                mcp_layer,
+                extra_mcp,
+                headroom.as_ref(),
+            )
+            .map_err(fatal)?;
             if restricted {
                 // A restricted run never starts without its rules: it would
                 // do unasked what the person chose to approve.
@@ -6314,7 +6312,16 @@ const ASKED_PERMISSIONS: [&str; 3] = ["bash", "webfetch", "websearch"];
 /// live on 1.19.4): looking around, the agent's own todo list and
 /// questions, and subagents, whose tools answer to the same rules.
 const UNASKED_PERMISSIONS: [&str; 10] = [
-    "read", "glob", "grep", "list", "lsp", "todoread", "todowrite", "question", "task", "skill",
+    "read",
+    "glob",
+    "grep",
+    "list",
+    "lsp",
+    "todoread",
+    "todowrite",
+    "question",
+    "task",
+    "skill",
 ];
 
 /// Where the `plan` agent writes its plan: `.opencode/plans/` in a
@@ -6919,7 +6926,8 @@ mod headroom_injection_tests {
         // plugin resolved for a proxy that never answered.
         assert!(HeadroomRoute::from_env(&env(&[("HEADROOM_PROXY_URL", "   ")])).is_none());
         assert!(
-            HeadroomRoute::from_env(&env(&[("ZERON_HEADROOM_OPENCODE_PLUGIN", "/p/nope")])).is_none()
+            HeadroomRoute::from_env(&env(&[("ZERON_HEADROOM_OPENCODE_PLUGIN", "/p/nope")]))
+                .is_none()
         );
     }
 }

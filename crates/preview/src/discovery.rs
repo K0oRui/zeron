@@ -239,7 +239,10 @@ impl Origins {
                 Some(marker) => marker.clone(),
                 None => match read(pid) {
                     Some(environment) => {
-                        let marker = (origin_marker(&environment), has_variable(&environment, SIGN_IN_ENV));
+                        let marker = (
+                            origin_marker(&environment),
+                            has_variable(&environment, SIGN_IN_ENV),
+                        );
                         self.markers.insert(key, marker.clone());
                         marker
                     }
@@ -280,7 +283,13 @@ impl Origins {
             let key = (pid, process.started_at);
             let marker = match self.markers.get(&key) {
                 Some((marker, _)) => marker.clone(),
-                None if self.unreadable.get(&key).is_some_and(|n| *n >= UNREADABLE_TRIES) => continue,
+                None if self
+                    .unreadable
+                    .get(&key)
+                    .is_some_and(|n| *n >= UNREADABLE_TRIES) =>
+                {
+                    continue;
+                }
                 None => match read(pid) {
                     Some(environment) => {
                         let marker = origin_marker(&environment);
@@ -361,7 +370,9 @@ impl Origins {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn has_variable(environment: &[u8], name: &str) -> bool {
     let prefix = format!("{name}=");
-    environment.split(|b| *b == 0).any(|entry| entry.starts_with(prefix.as_bytes()))
+    environment
+        .split(|b| *b == 0)
+        .any(|entry| entry.starts_with(prefix.as_bytes()))
 }
 
 /// The origin marker's value in a NUL-separated environment block.
@@ -452,7 +463,13 @@ pub fn owned(origins: &mut Origins, accept: &dyn Fn(&str) -> bool) -> Option<Own
         if fs::metadata(&path).is_ok_and(|m| m.uid() == uid) {
             mine.insert(pid);
         }
-        processes.insert(pid, Process { parent, started_at: linux_started_at(&fields, boot, ticks) });
+        processes.insert(
+            pid,
+            Process {
+                parent,
+                started_at: linux_started_at(&fields, boot, ticks),
+            },
+        );
     }
     Some(origins.owned(processes, &mine, accept, |pid| {
         fs::read(format!("/proc/{pid}/environ")).ok()
@@ -648,7 +665,9 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
 #[cfg(target_os = "macos")]
 pub fn owned(origins: &mut Origins, accept: &dyn Fn(&str) -> bool) -> Option<Owned> {
     let processes = libproc::process_table()?;
-    let mine: HashSet<u32> = libproc::pids(unsafe { libc::geteuid() }).into_iter().collect();
+    let mine: HashSet<u32> = libproc::pids(unsafe { libc::geteuid() })
+        .into_iter()
+        .collect();
     Some(origins.owned(processes, &mine, accept, environment))
 }
 
@@ -814,7 +833,12 @@ fn procargs_arguments(buffer: &[u8]) -> Option<Vec<String>> {
         .take(argc.max(0) as usize)
         .map(String::from_utf8_lossy)
         .collect();
-    Some(argv.join(" ").split_whitespace().map(str::to_owned).collect())
+    Some(
+        argv.join(" ")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// The envp section of a `KERN_PROCARGS2` buffer.
@@ -1000,8 +1024,9 @@ mod libproc {
                 if read as usize != SOCKET_FDINFO_SIZE {
                     return None;
                 }
-                let bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(record.as_ptr().cast(), SOCKET_FDINFO_SIZE) };
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(record.as_ptr().cast(), SOCKET_FDINFO_SIZE)
+                };
                 if let Some((ip, port)) = tcp_listener(bytes) {
                     sockets.push((pid, ip, port));
                 }
@@ -1041,21 +1066,42 @@ mod libproc {
         // (Room for a few started meanwhile.)
         let mut pids = vec![0 as c_int; needed as usize / 4 + 64];
         let read = unsafe {
-            libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), (pids.len() * 4) as c_int)
+            libc::proc_listpids(
+                PROC_UID_ONLY,
+                uid,
+                pids.as_mut_ptr().cast(),
+                (pids.len() * 4) as c_int,
+            )
         };
         pids.truncate(read.max(0) as usize / 4);
-        pids.into_iter().filter(|pid| *pid > 0).map(|pid| pid as u32).collect()
+        pids.into_iter()
+            .filter(|pid| *pid > 0)
+            .map(|pid| pid as u32)
+            .collect()
     }
 
     /// `pid`'s open sockets, by descriptor.
     fn socket_fds(pid: u32) -> Vec<c_int> {
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
-        let needed =
-            unsafe { libc::proc_pidinfo(pid as c_int, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        let needed = unsafe {
+            libc::proc_pidinfo(
+                pid as c_int,
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
         if needed <= 0 {
             return Vec::new();
         }
-        let mut fds = vec![libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; needed as usize / entry + 16];
+        let mut fds = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            needed as usize / entry + 16
+        ];
         let read = unsafe {
             libc::proc_pidinfo(
                 pid as c_int,
@@ -1080,7 +1126,14 @@ mod libproc {
         for _ in 0..3 {
             let mut size = 0;
             if unsafe {
-                libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
             } != 0
             {
                 return None;
@@ -1089,7 +1142,14 @@ mod libproc {
             let mut buffer = vec![0u64; size / 8 + 1];
             let mut size = buffer.len() * 8;
             if unsafe {
-                libc::sysctl(mib.as_mut_ptr(), 3, buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0)
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
             } != 0
             {
                 // (More processes than room: asked again.)
@@ -1104,7 +1164,11 @@ mod libproc {
             let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), size) };
             let mut table = HashMap::new();
             for record in bytes.as_chunks::<KINFO_PROC_SIZE>().0 {
-                let seconds = i64::from_ne_bytes(record[P_STARTTIME_SEC..P_STARTTIME_SEC + 8].try_into().ok()?);
+                let seconds = i64::from_ne_bytes(
+                    record[P_STARTTIME_SEC..P_STARTTIME_SEC + 8]
+                        .try_into()
+                        .ok()?,
+                );
                 let pid = i32_at(record, P_PID);
                 let parent = i32_at(record, E_PPID);
                 if pid < 0 {
@@ -1128,7 +1192,13 @@ mod libproc {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
         let read = unsafe {
-            libc::proc_pidinfo(pid as c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+            libc::proc_pidinfo(
+                pid as c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
         };
         (read == size).then_some(info.pbi_start_tvsec * 1000)
     }
@@ -1150,7 +1220,10 @@ mod libproc {
             return None;
         }
         let path: &[u8] = unsafe {
-            std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast(), std::mem::size_of_val(&info.pvi_cdir.vip_path))
+            std::slice::from_raw_parts(
+                info.pvi_cdir.vip_path.as_ptr().cast(),
+                std::mem::size_of_val(&info.pvi_cdir.vip_path),
+            )
         };
         let path = &path[..path.iter().position(|b| *b == 0)?];
         (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
@@ -1344,10 +1417,34 @@ mod tests {
         // A chat's engine (zeron-owned, chat:a) runs an agent's sign-in
         // (the marker on it); the agent's callback server is its child.
         let processes: HashMap<u32, Process> = [
-            (100, Process { parent: 1, started_at: 1 }),
-            (101, Process { parent: 100, started_at: 2 }),
-            (102, Process { parent: 101, started_at: 3 }),
-            (103, Process { parent: 100, started_at: 4 }),
+            (
+                100,
+                Process {
+                    parent: 1,
+                    started_at: 1,
+                },
+            ),
+            (
+                101,
+                Process {
+                    parent: 100,
+                    started_at: 2,
+                },
+            ),
+            (
+                102,
+                Process {
+                    parent: 101,
+                    started_at: 3,
+                },
+            ),
+            (
+                103,
+                Process {
+                    parent: 100,
+                    started_at: 4,
+                },
+            ),
         ]
         .into();
         let read = |pid: u32| {
@@ -1360,10 +1457,22 @@ mod tests {
         let mut origins = Origins::default();
         let mut listeners = vec![listener_of(102), listener_of(103)];
         origins.attribute(&mut listeners, &processes, read);
-        assert!(listeners[0].zeron_owned && listeners[0].signing_in, "the sign-in's callback");
-        assert!(listeners[1].zeron_owned && !listeners[1].signing_in, "a dev server beside it");
-        assert!(has_variable(&environment(&["A=1", "ZERON_LOGIN_URL_FILE="]), SIGN_IN_ENV));
-        assert!(!has_variable(&environment(&["XZERON_LOGIN_URL_FILE=1"]), SIGN_IN_ENV));
+        assert!(
+            listeners[0].zeron_owned && listeners[0].signing_in,
+            "the sign-in's callback"
+        );
+        assert!(
+            listeners[1].zeron_owned && !listeners[1].signing_in,
+            "a dev server beside it"
+        );
+        assert!(has_variable(
+            &environment(&["A=1", "ZERON_LOGIN_URL_FILE="]),
+            SIGN_IN_ENV
+        ));
+        assert!(!has_variable(
+            &environment(&["XZERON_LOGIN_URL_FILE=1"]),
+            SIGN_IN_ENV
+        ));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -1434,11 +1543,18 @@ mod tests {
             reads.borrow_mut().clear();
             let again = origins.owned(processes.clone(), &mine, &accept, read);
             assert_eq!(again.len(), 4);
-            assert!(reads.borrow().iter().all(|pid| *pid == 500), "{:?}", reads.borrow());
+            assert!(
+                reads.borrow().iter().all(|pid| *pid == 500),
+                "{:?}",
+                reads.borrow()
+            );
         }
         reads.borrow_mut().clear();
         origins.owned(processes.clone(), &mine, &accept, read);
-        assert!(reads.borrow().is_empty(), "gave up on the unreadable process");
+        assert!(
+            reads.borrow().is_empty(),
+            "gave up on the unreadable process"
+        );
         // With the agent and its leftovers gone, nothing is owned: the scan
         // has nothing to look for.
         let rest: HashMap<u32, Process> = processes
@@ -1449,7 +1565,11 @@ mod tests {
         // Other users' processes are never read.
         reads.borrow_mut().clear();
         let theirs: HashMap<u32, Process> = [(700, p(1, 10))].into();
-        assert!(origins.owned(theirs, &HashSet::new(), &accept, read).is_empty());
+        assert!(
+            origins
+                .owned(theirs, &HashSet::new(), &accept, read)
+                .is_empty()
+        );
         assert!(reads.borrow().is_empty());
     }
 
@@ -1583,7 +1703,15 @@ mod tests {
             .collect();
         ours.sort();
         let output = std::process::Command::new("/usr/sbin/lsof")
-            .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-F0pn"])
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &pid.to_string(),
+                "-iTCP",
+                "-sTCP:LISTEN",
+                "-F0pn",
+            ])
             .output()
             .unwrap();
         let mut theirs: Vec<String> = output
@@ -1591,7 +1719,10 @@ mod tests {
             .split(|b| *b == 0)
             .filter_map(|field| {
                 let field = String::from_utf8_lossy(field);
-                field.trim_start_matches('\n').strip_prefix('n').map(str::to_owned)
+                field
+                    .trim_start_matches('\n')
+                    .strip_prefix('n')
+                    .map(str::to_owned)
             })
             .collect();
         theirs.sort();
@@ -1601,14 +1732,19 @@ mod tests {
             .map(|l| format!(":{}", l.local_addr().unwrap().port()))
             .collect();
         let mine = |list: Vec<String>| -> Vec<String> {
-            list.into_iter().filter(|a| ports.iter().any(|p| a.ends_with(p))).collect()
+            list.into_iter()
+                .filter(|a| ports.iter().any(|p| a.ends_with(p)))
+                .collect()
         };
         let (ours, theirs) = (mine(ours), mine(theirs));
         assert_eq!(ours.len(), 3, "{ours:?}");
         assert_eq!(ours, theirs);
         assert_eq!(libproc::cwd(pid), std::env::current_dir().ok());
         let args = libproc::arguments(pid).unwrap();
-        assert_eq!(args.first().map(String::as_str), std::env::args().next().as_deref());
+        assert_eq!(
+            args.first().map(String::as_str),
+            std::env::args().next().as_deref()
+        );
     }
     #[cfg(target_os = "macos")]
     #[test]
@@ -1666,8 +1802,16 @@ mod tests {
         let (new, n) = time(&|| listeners(&mut Origins::default()).unwrap().len());
         let (old, m) = time(&|| lsof_listeners(&mut Origins::default()).unwrap().len());
         println!("listeners: libproc {new:?} ({n} found), lsof+ps {old:?} ({m} found)");
-        let a: Vec<_> = listeners(&mut Origins::default()).unwrap().into_iter().map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at)).collect();
-        let b: Vec<_> = lsof_listeners(&mut Origins::default()).unwrap().into_iter().map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at)).collect();
+        let a: Vec<_> = listeners(&mut Origins::default())
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at))
+            .collect();
+        let b: Vec<_> = lsof_listeners(&mut Origins::default())
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at))
+            .collect();
         assert_eq!(a, b);
     }
     #[tokio::test]

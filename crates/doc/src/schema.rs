@@ -434,7 +434,12 @@ pub struct ListCache<T> {
 
 impl<T> Default for ListCache<T> {
     fn default() -> Self {
-        Self { items: Default::default(), bytes: 0, read_at: None, reads: 0 }
+        Self {
+            items: Default::default(),
+            bytes: 0,
+            read_at: None,
+            reads: 0,
+        }
     }
 }
 
@@ -452,7 +457,12 @@ fn json_bytes(value: &serde_json::Value) -> usize {
     match value {
         Value::String(s) => 24 + s.len(),
         Value::Array(items) => 24 + items.iter().map(json_bytes).sum::<usize>(),
-        Value::Object(fields) => 48 + fields.iter().map(|(k, v)| 24 + k.len() + json_bytes(v)).sum::<usize>(),
+        Value::Object(fields) => {
+            48 + fields
+                .iter()
+                .map(|(k, v)| 24 + k.len() + json_bytes(v))
+                .sum::<usize>()
+        }
         _ => 16,
     }
 }
@@ -478,7 +488,11 @@ pub struct EntryChanges {
 
 impl EntryChanges {
     pub fn all() -> Self {
-        Self { ids: Default::default(), all: true, at: None }
+        Self {
+            ids: Default::default(),
+            all: true,
+            at: None,
+        }
     }
 
     /// Note the entries `event` touched. A change inside an entry has the
@@ -496,8 +510,7 @@ impl EntryChanges {
         }
         for change in &event.events {
             let path = change.path;
-            if !matches!(path.first(), Some((_, loro::Index::Key(key))) if key.as_str() == root)
-            {
+            if !matches!(path.first(), Some((_, loro::Index::Key(key))) if key.as_str() == root) {
                 continue;
             }
             if let Some((entry, _)) = path.get(1) {
@@ -682,7 +695,11 @@ impl SessionDoc {
     /// Changes made but not yet committed (none while this thread imports,
     /// where asking would wait on a lock this thread holds).
     fn pending_changes(&self) -> usize {
-        if Importing::here(self) { 0 } else { self.doc.get_pending_txn_len() }
+        if Importing::here(self) {
+            0
+        } else {
+            self.doc.get_pending_txn_len()
+        }
     }
 
     /// A single atomic value prevents tokens and capacity from tearing on sync.
@@ -755,7 +772,8 @@ impl SessionDoc {
     /// never in it (nothing shows it), the newest [`SENT_BY_KEPT`]. One
     /// atomic value so a synced reader never sees half a record.
     pub fn sent_by(&self) -> BTreeMap<String, serde_json::Value> {
-        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) = self.doc.get_map("meta").get("sentBy")
+        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
+            self.doc.get_map("meta").get("sentBy")
         else {
             return BTreeMap::new();
         };
@@ -803,9 +821,7 @@ impl SessionDoc {
 
     pub fn mark_session_reset(&self, harness: &str) -> Result<(), DocError> {
         if self.session_reset().as_deref() != Some(harness) {
-            self.doc
-                .get_map("meta")
-                .insert("sessionReset", harness)?;
+            self.doc.get_map("meta").insert("sessionReset", harness)?;
             self.doc.commit();
         }
         Ok(())
@@ -878,7 +894,11 @@ impl SessionDoc {
 
     /// [`push_message`](Self::push_message), but inserted before the last
     /// `from_end` entries of the messages list (clamped to its start).
-    pub fn insert_message_before_last(&self, from_end: usize, entry: &SessionMessageEntry) -> Result<(), DocError> {
+    pub fn insert_message_before_last(
+        &self,
+        from_end: usize,
+        entry: &SessionMessageEntry,
+    ) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
         let at = messages.len().saturating_sub(from_end);
         let map = messages.insert_container(at, LoroMap::new())?;
@@ -903,7 +923,11 @@ impl SessionDoc {
     /// ([`Self::read_entries_cached`]); [`Self::read_entries_whole`] reads
     /// them all.
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
-        Ok(self.read_entries_shared()?.iter().map(|e| (**e).clone()).collect())
+        Ok(self
+            .read_entries_shared()?
+            .iter()
+            .map(|e| (**e).clone())
+            .collect())
     }
 
     /// [`Self::read_entries`], each entry shared with the cache rather than
@@ -913,10 +937,12 @@ impl SessionDoc {
     ) -> Result<Vec<std::sync::Arc<SessionMessageEntry>>, DocError> {
         let mut cache = self.entry_cache.lock().unwrap_or_else(|e| e.into_inner());
         let keep = self.keep_entries.load(std::sync::atomic::Ordering::Acquire);
-        let read = self.read_list_cached("messages", &mut cache, &self.entry_changes, keep, |value| {
-            self.parse_entry(value).map(std::sync::Arc::new)
-        });
-        self.entry_bytes.store(cache.bytes, std::sync::atomic::Ordering::Relaxed);
+        let read =
+            self.read_list_cached("messages", &mut cache, &self.entry_changes, keep, |value| {
+                self.parse_entry(value).map(std::sync::Arc::new)
+            });
+        self.entry_bytes
+            .store(cache.bytes, std::sync::atomic::Ordering::Relaxed);
         Ok(read)
     }
 
@@ -924,7 +950,8 @@ impl SessionDoc {
     /// for a chat someone is showing (its every commit reads them), and not
     /// for one nobody is, so its transcript isn't held for nothing.
     pub fn set_keep_read_cache(&self, keep: bool) {
-        self.keep_entries.store(keep, std::sync::atomic::Ordering::Release);
+        self.keep_entries
+            .store(keep, std::sync::atomic::Ordering::Release);
         if !keep {
             self.forget_cached_entries();
         }
@@ -934,20 +961,29 @@ impl SessionDoc {
     pub fn forget_cached_entries(&self) {
         let mut cache = self.entry_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
-        self.entry_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.entry_changes.lock().unwrap_or_else(|e| e.into_inner()).all = true;
+        self.entry_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.entry_changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .all = true;
     }
 
     /// What the kept entries and commands hold, roughly, in bytes.
     pub fn cached_bytes(&self) -> usize {
         self.entry_bytes.load(std::sync::atomic::Ordering::Relaxed)
-            + self.command_bytes.load(std::sync::atomic::Ordering::Relaxed)
+            + self
+                .command_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Entries this doc's [`Self::read_entries`] has read from the doc (not
     /// its cache), all told.
     pub fn entries_read(&self) -> usize {
-        self.entry_cache.lock().unwrap_or_else(|e| e.into_inner()).reads
+        self.entry_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reads
     }
 
     /// Lets go of the entries [`Self::read_entries`] keeps: the next read
@@ -959,7 +995,11 @@ impl SessionDoc {
 
     /// Entries [`Self::read_entries`] keeps now.
     pub fn entries_cached(&self) -> usize {
-        self.entry_cache.lock().unwrap_or_else(|e| e.into_inner()).items.len()
+        self.entry_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items
+            .len()
     }
 
     /// Every entry, read from the doc whole (no cache).
@@ -1085,7 +1125,10 @@ impl SessionDoc {
         let LoroValue::List(items) = self.doc.get_list(root).get_deep_value() else {
             return Vec::new();
         };
-        items.iter().filter_map(|item| parse(item.to_json_value())).collect()
+        items
+            .iter()
+            .filter_map(|item| parse(item.to_json_value()))
+            .collect()
     }
 
     fn read_items<T: Clone>(
@@ -1207,16 +1250,21 @@ impl SessionDoc {
         // Each command read from the doc once, then again only when it
         // changes (`read_entries`' cache, for the ledger).
         let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let read = self.read_list_cached("commands", &mut cache, &self.command_changes, true, |value| {
-            match serde_json::from_value(value) {
+        let read = self.read_list_cached(
+            "commands",
+            &mut cache,
+            &self.command_changes,
+            true,
+            |value| match serde_json::from_value(value) {
                 Ok(entry) => Some(entry),
                 Err(err) => {
                     tracing::warn!(error = %err, "skipping malformed command entry");
                     None
                 }
-            }
-        });
-        self.command_bytes.store(cache.bytes, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        self.command_bytes
+            .store(cache.bytes, std::sync::atomic::Ordering::Relaxed);
         Ok(read)
     }
 
@@ -2293,12 +2341,17 @@ mod tests {
         // reach the cache's observer only after the change already shows,
         // the window a reader on another thread can fall into.
         let loro = LoroDoc::new();
-        let _slow = loro.subscribe_root(Arc::new(|_| std::thread::sleep(std::time::Duration::from_millis(3))));
+        let _slow = loro.subscribe_root(Arc::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(3))
+        }));
         let doc = Arc::new(SessionDoc::from_doc(loro));
         let entry = |id: &str| SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
-            parts: vec![MessagePart::Text { id: format!("{id}-text"), text: "words".into() }],
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: "words".into(),
+            }],
             created_at: 1,
             device_id: "dev".into(),
             status: None,
@@ -2317,9 +2370,15 @@ mod tests {
                 for n in 1..=ROUNDS {
                     // Earlier rows changed in place, and rows added.
                     let at = format!("row-{}", n % 200);
-                    doc.append_error_part(&at, &format!("{at}-note-{n}"), "again").unwrap();
-                    let status = if n % 2 == 0 { MessageStatus::Aborted } else { MessageStatus::Complete };
-                    doc.set_message_status(&format!("row-{}", (n * 7) % 200), status).unwrap();
+                    doc.append_error_part(&at, &format!("{at}-note-{n}"), "again")
+                        .unwrap();
+                    let status = if n % 2 == 0 {
+                        MessageStatus::Aborted
+                    } else {
+                        MessageStatus::Complete
+                    };
+                    doc.set_message_status(&format!("row-{}", (n * 7) % 200), status)
+                        .unwrap();
                     if n % 5 == 0 {
                         doc.push_message(&entry(&format!("new-{n}"))).unwrap();
                     }
@@ -2351,14 +2410,20 @@ mod tests {
                     }
                     mid_round += 1;
                 } else {
-                    assert!(!paused, "the doc changed while the writer waited (round {n})");
+                    assert!(
+                        !paused,
+                        "the doc changed while the writer waited (round {n})"
+                    );
                 }
             }
             next.wait();
         }
         writer.join().unwrap();
         eprintln!("{ROUNDS} rounds compared at rest, {mid_round} comparisons mid-round");
-        assert_eq!(doc.read_entries().unwrap(), doc.read_entries_whole().unwrap());
+        assert_eq!(
+            doc.read_entries().unwrap(),
+            doc.read_entries_whole().unwrap()
+        );
     }
 
     /// While importing into one doc, a read of ANOTHER doc still sees its
@@ -2370,7 +2435,10 @@ mod tests {
         let entry = |id: &str| SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
-            parts: vec![MessagePart::Text { id: format!("{id}-text"), text: "words".into() }],
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: "words".into(),
+            }],
             created_at: 1,
             device_id: "dev".into(),
             status: None,
@@ -2383,7 +2451,15 @@ mod tests {
         }
         assert_eq!(b.read_entries().unwrap().len(), 5);
         // B changed, not yet committed: shows in a whole read.
-        let row = b.doc().get_list("messages").get(2).unwrap().into_container().unwrap().into_map().unwrap();
+        let row = b
+            .doc()
+            .get_list("messages")
+            .get(2)
+            .unwrap()
+            .into_container()
+            .unwrap()
+            .into_map()
+            .unwrap();
         row.insert("status", "aborted").unwrap();
         assert!(b.doc().get_pending_txn_len() > 0);
         // A read of B from inside an import's events into A.
@@ -2406,7 +2482,11 @@ mod tests {
         let other = SessionDoc::init("a").unwrap();
         other.push_message(&entry("a-0")).unwrap();
         a.import(&other.export_snapshot().unwrap()).unwrap();
-        assert_eq!(*seen.lock().unwrap(), Some(true), "B's uncommitted change was read");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "B's uncommitted change was read"
+        );
         b.commit();
         assert_eq!(b.read_entries().unwrap(), b.read_entries_whole().unwrap());
     }
@@ -2425,7 +2505,10 @@ mod tests {
         let entry = |id: &str| SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
-            parts: vec![MessagePart::Text { id: format!("{id}-text"), text: "words".into() }],
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: "words".into(),
+            }],
             created_at: 1,
             device_id: "dev".into(),
             status: None,
@@ -2439,16 +2522,22 @@ mod tests {
         let reader: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
         let loro = LoroDoc::new();
         let _probe = {
-            let (shared, update, importer, seen, reader) =
-                (shared.clone(), update.clone(), importer.clone(), seen.clone(), reader.clone());
+            let (shared, update, importer, seen, reader) = (
+                shared.clone(),
+                update.clone(),
+                importer.clone(),
+                seen.clone(),
+                reader.clone(),
+            );
             loro.subscribe_root(Arc::new(move |event| {
                 let Some(doc) = shared.get() else { return };
                 match event.triggered_by {
                     loro::EventTriggerKind::Local => {
                         if let Some(bytes) = update.lock().unwrap().take() {
                             let doc = doc.clone();
-                            *importer.lock().unwrap() =
-                                Some(std::thread::spawn(move || drop(doc.import(&bytes).unwrap())));
+                            *importer.lock().unwrap() = Some(std::thread::spawn(move || {
+                                drop(doc.import(&bytes).unwrap())
+                            }));
                             // (Time for the import to land, if it can.)
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
@@ -2459,7 +2548,9 @@ mod tests {
                         let (doc, seen) = (doc.clone(), seen.clone());
                         *reader.lock().unwrap() = Some(std::thread::spawn(move || {
                             let cached = doc.read_entries().unwrap();
-                            seen.lock().unwrap().push(cached == doc.read_entries_whole().unwrap());
+                            seen.lock()
+                                .unwrap()
+                                .push(cached == doc.read_entries_whole().unwrap());
                         }));
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
@@ -2476,16 +2567,26 @@ mod tests {
         remote.doc().set_peer_id(7).unwrap();
         remote.import(&doc.export_snapshot().unwrap()).unwrap();
         let before = remote.doc().oplog_vv();
-        remote.append_error_part("row-3", "row-3-remote", "from afar").unwrap();
+        remote
+            .append_error_part("row-3", "row-3-remote", "from afar")
+            .unwrap();
         *update.lock().unwrap() = Some(remote.doc().export(ExportMode::updates(&before)).unwrap());
         assert_eq!(doc.read_entries().unwrap().len(), 20);
         let _ = shared.set(doc.clone());
         // The local commit, during whose events the import comes.
-        doc.set_message_status("row-11", MessageStatus::Aborted).unwrap();
+        doc.set_message_status("row-11", MessageStatus::Aborted)
+            .unwrap();
         importer.lock().unwrap().take().unwrap().join().unwrap();
         reader.lock().unwrap().take().unwrap().join().unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![true], "the read in the gap was whole");
-        assert_eq!(doc.read_entries().unwrap(), doc.read_entries_whole().unwrap());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true],
+            "the read in the gap was whole"
+        );
+        assert_eq!(
+            doc.read_entries().unwrap(),
+            doc.read_entries_whole().unwrap()
+        );
     }
 
     /// The doc's own cached reads never go stale, however the doc moves:
@@ -2496,13 +2597,24 @@ mod tests {
     fn cached_reads_follow_undo_revert_checkout_fork_and_concurrent_edits() {
         use crate::queue::QueuedMessage;
         let same = |doc: &SessionDoc, what: &str| {
-            assert_eq!(doc.read_entries().unwrap(), doc.read_entries_whole().unwrap(), "entries, after {what}");
-            assert_eq!(doc.read_commands().unwrap(), doc.read_commands_whole().unwrap(), "commands, after {what}");
+            assert_eq!(
+                doc.read_entries().unwrap(),
+                doc.read_entries_whole().unwrap(),
+                "entries, after {what}"
+            );
+            assert_eq!(
+                doc.read_commands().unwrap(),
+                doc.read_commands_whole().unwrap(),
+                "commands, after {what}"
+            );
         };
         let entry = |id: &str, words: &str| SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
-            parts: vec![MessagePart::Text { id: format!("{id}-text"), text: words.into() }],
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: words.into(),
+            }],
             created_at: 1,
             device_id: "dev".into(),
             status: None,
@@ -2511,7 +2623,8 @@ mod tests {
         };
         let a = SessionDoc::init("moves").unwrap();
         for i in 0..20 {
-            a.push_message(&entry(&format!("row-{i}"), "words")).unwrap();
+            a.push_message(&entry(&format!("row-{i}"), "words"))
+                .unwrap();
         }
         same(&a, "first rows");
 
@@ -2534,7 +2647,8 @@ mod tests {
 
         // Undo: an earlier entry's change, then a new entry, undone.
         let mut undo = loro::UndoManager::new(a.doc());
-        a.append_error_part("row-4", "row-4-note", "stopped").unwrap();
+        a.append_error_part("row-4", "row-4-note", "stopped")
+            .unwrap();
         same(&a, "earlier entry changed");
         a.push_message(&entry("undone", "soon gone")).unwrap();
         same(&a, "pushed");
@@ -2547,7 +2661,8 @@ mod tests {
 
         // Revert to an earlier version, as a new change.
         let before = a.doc().state_frontiers();
-        a.set_message_status("row-2", MessageStatus::Aborted).unwrap();
+        a.set_message_status("row-2", MessageStatus::Aborted)
+            .unwrap();
         a.push_message(&entry("reverted", "soon gone")).unwrap();
         same(&a, "before revert");
         a.doc().revert_to(&before).unwrap();
@@ -2573,9 +2688,11 @@ mod tests {
         same(&b, "b joined");
         let (va, vb) = (a.doc().oplog_vv(), b.doc().oplog_vv());
         a.append_error_part("row-9", "row-9-a", "from a").unwrap();
-        a.set_message_status("row-9", MessageStatus::Complete).unwrap();
+        a.set_message_status("row-9", MessageStatus::Complete)
+            .unwrap();
         b.append_error_part("row-9", "row-9-b", "from b").unwrap();
-        b.set_message_status("row-9", MessageStatus::Aborted).unwrap();
+        b.set_message_status("row-9", MessageStatus::Aborted)
+            .unwrap();
         b.push_message(&entry("from-b", "b's")).unwrap();
         same(&a, "a's edit");
         same(&b, "b's edit");
@@ -2606,23 +2723,41 @@ mod tests {
         let mut check = |doc: &SessionDoc, what: &str| -> usize {
             let before = cache.reads;
             let changed = std::mem::take(&mut *changes.lock().unwrap());
-            let cached: Vec<_> =
-                doc.read_entries_cached(&mut cache, changed).into_iter().map(|e| (*e).clone()).collect();
+            let cached: Vec<_> = doc
+                .read_entries_cached(&mut cache, changed)
+                .into_iter()
+                .map(|e| (*e).clone())
+                .collect();
             let whole = doc.read_entries_whole().unwrap();
             assert_eq!(cached, whole, "after {what}");
-            assert_eq!(doc.read_commands().unwrap(), doc.read_commands_whole().unwrap(), "commands, after {what}");
-            assert_eq!(doc.read_entries().unwrap(), whole, "the doc's own cache, after {what}");
+            assert_eq!(
+                doc.read_commands().unwrap(),
+                doc.read_commands_whole().unwrap(),
+                "commands, after {what}"
+            );
+            assert_eq!(
+                doc.read_entries().unwrap(),
+                whole,
+                "the doc's own cache, after {what}"
+            );
             let joined: Vec<_> = join_continuation_shared(doc.read_entries_shared().unwrap())
                 .into_iter()
                 .map(|e| (*e).clone())
                 .collect();
-            assert_eq!(joined, join_continuation_entries(whole.clone()), "joined, after {what}");
+            assert_eq!(
+                joined,
+                join_continuation_entries(whole.clone()),
+                "joined, after {what}"
+            );
             cache.reads - before
         };
         let entry = |id: &str, continuation_of: Option<&str>| SessionMessageEntry {
             id: id.into(),
             role: MessageRole::User,
-            parts: vec![MessagePart::Text { id: format!("{id}-text"), text: format!("{id} words") }],
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-text"),
+                text: format!("{id} words"),
+            }],
             created_at: 1,
             device_id: "dev".into(),
             status: None,
@@ -2638,10 +2773,16 @@ mod tests {
         // A reply streaming: text growing, a tool call, then finished.
         let mut writer = SegmentWriter::begin(&doc, "reply", "dev", 2).unwrap();
         assert_eq!(check(&doc, "reply begun"), 1);
-        let mut folded = vec![MessagePart::Text { id: "t".into(), text: "Hel".into() }];
+        let mut folded = vec![MessagePart::Text {
+            id: "t".into(),
+            text: "Hel".into(),
+        }];
         writer.sync(&folded).unwrap();
         assert_eq!(check(&doc, "first words"), 1);
-        folded[0] = MessagePart::Text { id: "t".into(), text: "Hello there".into() };
+        folded[0] = MessagePart::Text {
+            id: "t".into(),
+            text: "Hello there".into(),
+        };
         writer.sync(&folded).unwrap();
         assert_eq!(check(&doc, "more words"), 1);
         writer.finish(&folded, MessageStatus::Complete).unwrap();
@@ -2652,18 +2793,23 @@ mod tests {
         assert_eq!(check(&doc, "continuation"), 1);
         doc.push_message(&entry("reply-3", Some("reply"))).unwrap();
         assert_eq!(check(&doc, "second continuation"), 1);
-        doc.insert_message_before_last(1, &entry("steer", None)).unwrap();
+        doc.insert_message_before_last(1, &entry("steer", None))
+            .unwrap();
         assert_eq!(check(&doc, "insert before last"), 1);
-        doc.append_error_part("row-3", "row-3-note", "stopped").unwrap();
+        doc.append_error_part("row-3", "row-3-note", "stopped")
+            .unwrap();
         assert_eq!(check(&doc, "old row changed"), 1);
-        doc.set_message_status("row-7", MessageStatus::Aborted).unwrap();
+        doc.set_message_status("row-7", MessageStatus::Aborted)
+            .unwrap();
         assert_eq!(check(&doc, "old row status"), 1);
 
         // Another device's edits, imported: one old row, one new.
         let other = SessionDoc::from_doc(LoroDoc::new());
         other.doc().import(&doc.export_snapshot().unwrap()).unwrap();
         let version = doc.doc().oplog_vv();
-        other.append_error_part("row-10", "row-10-note", "elsewhere").unwrap();
+        other
+            .append_error_part("row-10", "row-10-note", "elsewhere")
+            .unwrap();
         other.push_message(&entry("remote", None)).unwrap();
         doc.doc()
             .import(&other.doc().export(ExportMode::updates(&version)).unwrap())
@@ -2675,7 +2821,10 @@ mod tests {
         for n in 0..3 {
             doc.queue_command(&SessionCommandEntry {
                 id: format!("c{n}"),
-                payload: SessionCommandPayload::Steer { prompt: "focus".into(), message_id: None },
+                payload: SessionCommandPayload::Steer {
+                    prompt: "focus".into(),
+                    message_id: None,
+                },
                 issued_by: "dev".into(),
                 issued_at: n,
                 based_on: None,
@@ -2686,7 +2835,8 @@ mod tests {
             .unwrap();
             assert_eq!(check(&doc, "a command"), 0);
         }
-        doc.set_command_status("c1", SessionCommandStatus::Applied, Some("done")).unwrap();
+        doc.set_command_status("c1", SessionCommandStatus::Applied, Some("done"))
+            .unwrap();
         assert_eq!(check(&doc, "a command settled"), 0);
 
         // A row removed.
@@ -2729,10 +2879,17 @@ mod tests {
         let by = serde_json::json!({ "plugin": "relay", "name": "Relay", "kind": "run", "at": 1 });
         doc.mark_sent_by("m1", by.clone()).unwrap();
         assert_eq!(doc.sent_by().get("m1"), Some(&by));
-        assert!(doc.read_entries().unwrap().is_empty(), "no entry of its own");
+        assert!(
+            doc.read_entries().unwrap().is_empty(),
+            "no entry of its own"
+        );
         // Kept to the newest SENT_BY_KEPT.
         for i in 0..(SENT_BY_KEPT + 5) {
-            doc.mark_sent_by(&format!("n{i}"), serde_json::json!({ "plugin": "relay", "at": 10 + i })).unwrap();
+            doc.mark_sent_by(
+                &format!("n{i}"),
+                serde_json::json!({ "plugin": "relay", "at": 10 + i }),
+            )
+            .unwrap();
         }
         let all = doc.sent_by();
         assert_eq!(all.len(), SENT_BY_KEPT);
@@ -2970,7 +3127,11 @@ mod tests {
         w.count_duration_from(now - 1_000);
         w.finish(&[], MessageStatus::Complete).unwrap();
         let entry = &doc.read_entries().unwrap()[0];
-        assert_eq!(entry.created_at, now - 5_000, "the entry's own time is kept");
+        assert_eq!(
+            entry.created_at,
+            now - 5_000,
+            "the entry's own time is kept"
+        );
         let duration = entry.duration_ms.unwrap();
         assert!((60_000..65_000).contains(&duration), "{duration}");
     }

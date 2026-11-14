@@ -56,11 +56,11 @@ mod git_tree;
 pub mod harness_updates;
 pub mod headroom;
 pub(crate) mod home_index;
+mod hosted_models;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
 pub mod managed;
-mod hosted_models;
 mod model_catalogs;
 mod plugin_agents;
 pub mod plugins;
@@ -72,8 +72,6 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod runner;
-pub mod wake_trace;
-pub mod wake_update;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
@@ -84,15 +82,15 @@ mod transcript_history;
 mod update_trial;
 pub mod uploads;
 pub mod voice;
+pub mod wake_trace;
+pub mod wake_update;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_search;
 mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
-pub use auth::{
-    Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions,
-};
+pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership, ScreenHint, SignInOptions};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot, TurnSnapshot,
@@ -328,7 +326,12 @@ impl EngineCore {
                     .into_iter()
                     .filter(|c| c.device_id == device_id)
                     .filter_map(|c| c.cwd)
-                    .chain(spaces.into_iter().filter(|s| s.device_id == device_id).map(|s| s.path))
+                    .chain(
+                        spaces
+                            .into_iter()
+                            .filter(|s| s.device_id == device_id)
+                            .map(|s| s.path),
+                    )
                     .filter(|f| !f.is_empty())
                     .collect();
                 folders.sort();
@@ -341,8 +344,16 @@ impl EngineCore {
         {
             let (data_dir, focus) = (data_dir.to_path_buf(), viewport_focus.clone());
             plugins.set_notifier(move |source, title, body, session| {
-                let title: String = title.lines().next().unwrap_or_default().trim().chars().take(120).collect();
-                desktop_notify::post_for(&data_dir, &focus, source, &title, body, session).to_owned()
+                let title: String = title
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect();
+                desktop_notify::post_for(&data_dir, &focus, source, &title, body, session)
+                    .to_owned()
             });
         }
         // A Cloud machine's token isn't admitted there (edge/src/runner-policy.ts):
@@ -451,15 +462,17 @@ impl EngineCore {
         }
         // Plugins' agent ops (usage, accounts, models: plugins/agents) reach
         // the engine as Settings and the composer do, and hear what changes.
-        plugins.agents().set_host(Arc::new(plugin_agents::EngineAgentHost {
-            accounts: agent_accounts.clone(),
-            registry: registry.clone(),
-            data_dir: repos.data_dir().to_path_buf(),
-            workspace: workspace.clone(),
-            sessions: sessions.clone(),
-            doc_host: doc_host.clone(),
-            default_harness,
-        }));
+        plugins
+            .agents()
+            .set_host(Arc::new(plugin_agents::EngineAgentHost {
+                accounts: agent_accounts.clone(),
+                registry: registry.clone(),
+                data_dir: repos.data_dir().to_path_buf(),
+                workspace: workspace.clone(),
+                sessions: sessions.clone(),
+                doc_host: doc_host.clone(),
+                default_harness,
+            }));
         plugins.follow_agents(
             agent_accounts.watch_snapshots(),
             sessions.watch_sessions(),
@@ -1211,7 +1224,9 @@ impl Engine {
                 .borrow()
                 .iter()
                 .filter(|chat| chat.device_id == preview_device)
-                .filter_map(|chat| Some((chat.id.clone(), std::path::PathBuf::from(chat.cwd.clone()?))))
+                .filter_map(|chat| {
+                    Some((chat.id.clone(), std::path::PathBuf::from(chat.cwd.clone()?)))
+                })
                 .collect(),
             terminals: preview_terminals.chats(),
             reserved_ports: zeron_harness::agent_ports::reserved(),
@@ -1285,9 +1300,10 @@ impl Engine {
         zeron_update::set_before_restart(move || {
             // Only this process's live engine restarts it: with its graph
             // gone there is nothing left to prepare.
-            let (Some(version_change_docs), Some(version_change_registry)) =
-                (version_change_docs.upgrade(), version_change_registry.upgrade())
-            else {
+            let (Some(version_change_docs), Some(version_change_registry)) = (
+                version_change_docs.upgrade(),
+                version_change_registry.upgrade(),
+            ) else {
                 return;
             };
             // No more deltas from here (a debounced registry save is whole
@@ -1329,11 +1345,16 @@ impl Engine {
             // peer's edge stamps it and the peer knows who's asking
             // (`Caller::Peer{device}`); without a key, dials go unstamped.
             let (proof_dir, proof_device) = (config.data_dir.clone(), core.device_id.clone());
-            link_config.caller_proof = Some(Arc::new(move |target: &str, conn_id: &str, ts: i64| {
-                let (key, signature) =
-                    plugins::signing::device_link_proof(&proof_dir, target, conn_id, ts)?;
-                Some(zeron_rpc::CallerProof { device: proof_device.clone(), key, signature })
-            }));
+            link_config.caller_proof =
+                Some(Arc::new(move |target: &str, conn_id: &str, ts: i64| {
+                    let (key, signature) =
+                        plugins::signing::device_link_proof(&proof_dir, target, conn_id, ts)?;
+                    Some(zeron_rpc::CallerProof {
+                        device: proof_device.clone(),
+                        key,
+                        signature,
+                    })
+                }));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace

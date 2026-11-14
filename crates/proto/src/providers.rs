@@ -57,7 +57,10 @@ pub fn keeps_one_login(harness: HarnessId) -> bool {
 /// Whether zeron switches this agent's logins. Hermes rotates through its
 /// own credential pool (listed, never reordered); Antigravity keeps one.
 pub fn switches_accounts(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity | HarnessId::Fx)
+    !matches!(
+        harness,
+        HarnessId::Hermes | HarnessId::Antigravity | HarnessId::Fx
+    )
 }
 
 /// A standing note under a provider's Accounts label, for an agent whose

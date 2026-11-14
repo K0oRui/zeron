@@ -29,10 +29,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use zeron_doc::{
-    CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry,
-    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
-    evaluate_command,
+    CommandBasedOn, CommandDisposition, DocError, EvaluationContext, MessagePart, MessageRole,
+    MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry, SessionCommandPayload,
+    SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus, evaluate_command,
 };
 use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
@@ -799,7 +798,9 @@ impl Drop for DocHostInner {
 }
 
 /// The next change of a followed watch; never resolves while unset.
-async fn changed<T>(rx: &mut Option<watch::Receiver<T>>) -> Option<Result<(), watch::error::RecvError>> {
+async fn changed<T>(
+    rx: &mut Option<watch::Receiver<T>>,
+) -> Option<Result<(), watch::error::RecvError>> {
     match rx {
         Some(rx) => Some(rx.changed().await),
         None => std::future::pending().await,
@@ -836,7 +837,10 @@ pub(crate) fn latest_switch(
 
 impl ChatDocHandle {
     /// The outbox entries a join should upload. With the relay layer off, all.
-    pub(crate) fn uploadable_updates(&self, pending: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    pub(crate) fn uploadable_updates(
+        &self,
+        pending: Vec<(String, Vec<u8>)>,
+    ) -> Vec<(String, Vec<u8>)> {
         match &*lock(&self.relay) {
             Some(state) => state.uploadable(pending),
             None => pending,
@@ -845,7 +849,9 @@ impl ChatDocHandle {
 
     /// This host is storing a chat: what it imports must go into rows as well.
     pub(crate) fn republishes_imports(&self) -> bool {
-        lock(&self.relay).as_ref().is_some_and(|state| state.republishes_queue_rows())
+        lock(&self.relay)
+            .as_ref()
+            .is_some_and(|state| state.republishes_queue_rows())
     }
 
     pub(crate) fn republish(&self, bytes: Vec<u8>) {
@@ -1086,7 +1092,12 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
     ) -> Result<(), DocError> {
-        if self.doc.read_entries_shared()?.iter().any(|e| e.id == message_id) {
+        if self
+            .doc
+            .read_entries_shared()?
+            .iter()
+            .any(|e| e.id == message_id)
+        {
             return Ok(());
         }
         self.doc.push_message(&SessionMessageEntry {
@@ -1128,23 +1139,30 @@ impl ChatDocHandle {
         // The send that switches wrote its message first: the seam goes
         // before it (and any other unanswered message), so it reads as the
         // new provider's question, not the old one's.
-        let unanswered = entries.iter().rev().take_while(|entry| entry.role == MessageRole::User).count();
-        self.doc.insert_message_before_last(unanswered, &SessionMessageEntry {
-            id: id.clone(),
-            role: MessageRole::System,
-            parts: vec![MessagePart::Switch {
-                id,
-                from: from.to_string(),
-                to: to.to_string(),
-                from_harness: Some(from_id.as_str().to_owned()),
-                to_harness: Some(to_id.as_str().to_owned()),
-            }],
-            created_at,
-            device_id: self.device_id.clone(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-            duration_ms: None,
-        })?;
+        let unanswered = entries
+            .iter()
+            .rev()
+            .take_while(|entry| entry.role == MessageRole::User)
+            .count();
+        self.doc.insert_message_before_last(
+            unanswered,
+            &SessionMessageEntry {
+                id: id.clone(),
+                role: MessageRole::System,
+                parts: vec![MessagePart::Switch {
+                    id,
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    from_harness: Some(from_id.as_str().to_owned()),
+                    to_harness: Some(to_id.as_str().to_owned()),
+                }],
+                created_at,
+                device_id: self.device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            },
+        )?;
         self.doc.mark_provider_switched()?;
         Ok(true)
     }
@@ -1198,7 +1216,12 @@ impl ChatDocHandle {
     /// the chat doesn't just stop at the user's message. Idempotent per `key`.
     pub fn note_turn_failure(&self, key: &str, note: &str) -> Result<(), DocError> {
         let id = format!("{key}-interrupted");
-        if self.doc.read_entries_shared()?.iter().any(|entry| entry.id == id) {
+        if self
+            .doc
+            .read_entries_shared()?
+            .iter()
+            .any(|entry| entry.id == id)
+        {
             return Ok(());
         }
         self.doc.push_message(&SessionMessageEntry {
@@ -1457,7 +1480,9 @@ impl DocHost {
     /// End a quiesce and run everything that queued meanwhile. A boot that held
     /// work has done its recovery by now, whatever it was holding for.
     pub fn lift_quiesce(&self) {
-        self.inner.boot_recovery_finished.store(true, Ordering::Release);
+        self.inner
+            .boot_recovery_finished
+            .store(true, Ordering::Release);
         if !self.inner.quiesced.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -1528,7 +1553,10 @@ impl DocHost {
         let Ok(entries) = handle.doc.read_entries_shared() else {
             return;
         };
-        let Some(last) = entries.last().filter(|entry| entry.role == MessageRole::User) else {
+        let Some(last) = entries
+            .last()
+            .filter(|entry| entry.role == MessageRole::User)
+        else {
             return;
         };
         let lost = commands.iter().any(|c| {
@@ -1683,7 +1711,9 @@ impl DocHost {
     /// to pick back up is marked: queues it restored can go now, or after those
     /// turns.
     pub fn boot_recovery_finished(&self) {
-        self.inner.boot_recovery_finished.store(true, Ordering::Release);
+        self.inner
+            .boot_recovery_finished
+            .store(true, Ordering::Release);
         self.kick_drains();
     }
 
@@ -1700,7 +1730,10 @@ impl DocHost {
         {
             return;
         }
-        if handle.queue_frozen_by_recovery.swap(false, Ordering::AcqRel) {
+        if handle
+            .queue_frozen_by_recovery
+            .swap(false, Ordering::AcqRel)
+        {
             handle.queue_paused.store(false, Ordering::Release);
         }
     }
@@ -2103,7 +2136,9 @@ impl DocHost {
                 for bytes in &parked {
                     match doc.import(bytes) {
                         Ok(status) => waiting |= status.pending.is_some(),
-                        Err(err) => tracing::warn!(chat = %chat_id, error = %err, "chat relay: couldn't replay a parked update"),
+                        Err(err) => {
+                            tracing::warn!(chat = %chat_id, error = %err, "chat relay: couldn't replay a parked update")
+                        }
                     }
                 }
                 // Retired only once a save holds them (below): until then
@@ -2134,7 +2169,9 @@ impl DocHost {
                         self.inner.store.retire_chat_inbox(&parked_key, newest)?;
                     }
                 }
-                None => tracing::info!(chat = %chat_id, "parked updates replayed; kept until a chat2 save holds them"),
+                None => {
+                    tracing::info!(chat = %chat_id, "parked updates replayed; kept until a chat2 save holds them")
+                }
             }
         }
         let changed_persistence = persistence.clone();
@@ -3606,7 +3643,10 @@ impl DocHost {
         }
         // Relaying: no stored rows to trim. A device-hosted chat isn't stored at
         // all, and a Cloud host's checkpoints follow their own policy.
-        if lock(&handle.relay).as_ref().is_some_and(|state| state.relaying()) {
+        if lock(&handle.relay)
+            .as_ref()
+            .is_some_and(|state| state.relaying())
+        {
             return;
         }
         let stats = match &*lock(&handle.chat2) {
@@ -3657,10 +3697,12 @@ impl DocHost {
             });
         }
         // Threshold checkpoint, one in flight at a time (review H1).
-        let snapshot = handle
-            .snapshot_bytes
-            .load(Ordering::Relaxed)
-            .max(handle.persistence.as_ref().map_or(0, |p| p.snapshot_bytes()));
+        let snapshot = handle.snapshot_bytes.load(Ordering::Relaxed).max(
+            handle
+                .persistence
+                .as_ref()
+                .map_or(0, |p| p.snapshot_bytes()),
+        );
         if !threshold_checkpoint_due(stats.row_bytes, stats.row_count, snapshot as u64) {
             return;
         }
@@ -3683,7 +3725,11 @@ impl DocHost {
         // the host's as often as not, and the room may hold nothing else.
         if let Some(workspace) = self.workspace()
             && let Ok(Some(chat)) = workspace.chat(&handle.chat_id)
-            && !relay::posts_checkpoint(reason, chat.room_gen.unwrap_or(1), workspace.is_host(&handle.chat_id))
+            && !relay::posts_checkpoint(
+                reason,
+                chat.room_gen.unwrap_or(1),
+                workspace.is_host(&handle.chat_id),
+            )
         {
             return;
         }
@@ -3720,7 +3766,11 @@ impl DocHost {
         // Sampled before the export below, so a mode change after this makes the
         // result too old to count as the checkpoint that change owes.
         let at_floor = relay_era;
-        let seq_covered = if at_floor { stats.seq_floor } else { stats.cursor };
+        let seq_covered = if at_floor {
+            stats.seq_floor
+        } else {
+            stats.cursor
+        };
         let mode_epoch = relay_state.as_ref().map_or(0, |state| state.mode_epoch());
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
@@ -3881,7 +3931,10 @@ impl DocHost {
         }
         let handles = lock(&self.inner.handles);
         handles.len() > WARM_DOC_CAP
-            || handles.values().map(|h| h.resident_estimate()).sum::<usize>()
+            || handles
+                .values()
+                .map(|h| h.resident_estimate())
+                .sum::<usize>()
                 > zeron_doc::DOC_LRU_BYTE_BUDGET
     }
 
@@ -4267,16 +4320,29 @@ impl DocHost {
     pub(crate) fn pending_input(&self, chat_id: &str) -> Result<Option<String>, EngineError> {
         let handle = self.open(chat_id)?;
         let entries = handle.doc.read_entries_shared()?;
-        Ok(entries.iter().rev().flat_map(|e| e.parts.iter().rev()).find_map(|part| match part {
-            zeron_doc::MessagePart::Input { request_id, resolved: false, .. } => Some(request_id.clone()),
-            _ => None,
-        }))
+        Ok(entries
+            .iter()
+            .rev()
+            .flat_map(|e| e.parts.iter().rev())
+            .find_map(|part| match part {
+                zeron_doc::MessagePart::Input {
+                    request_id,
+                    resolved: false,
+                    ..
+                } => Some(request_id.clone()),
+                _ => None,
+            }))
     }
 
     /// Record who sent message (or queued row) `id` of `chat_id`, beside
     /// its transcript (`SessionDoc::sent_by`; synced with the chat, shown
     /// nowhere).
-    pub(crate) fn mark_sent_by(&self, chat_id: &str, id: &str, by: serde_json::Value) -> Result<(), EngineError> {
+    pub(crate) fn mark_sent_by(
+        &self,
+        chat_id: &str,
+        id: &str,
+        by: serde_json::Value,
+    ) -> Result<(), EngineError> {
         self.open(chat_id)?.doc.mark_sent_by(id, by)?;
         Ok(())
     }
@@ -4300,10 +4366,14 @@ impl DocHost {
         }
         let id = new_id();
         let now = now_ms();
-        let based_on = handle.doc.read_entries_shared()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
-            frontier: None,
-        });
+        let based_on = handle
+            .doc
+            .read_entries_shared()?
+            .last()
+            .map(|m| CommandBasedOn {
+                turn_id: Some(m.id.clone()),
+                frontier: None,
+            });
         let is_message = matches!(
             payload,
             SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
@@ -4370,13 +4440,7 @@ impl DocHost {
         attachments: Vec<String>,
         hold_for_turn_end: bool,
     ) -> Result<String, EngineError> {
-        self.queue_message_with_transfers(
-            chat_id,
-            text,
-            attachments,
-            hold_for_turn_end,
-            Vec::new(),
-        )
+        self.queue_message_with_transfers(chat_id, text, attachments, hold_for_turn_end, Vec::new())
     }
 
     /// [`Self::queue_message_with_behavior`] plus the row's `pending://` bytes,
@@ -5137,7 +5201,9 @@ impl DocHost {
         {
             return Ok(false);
         }
-        handle.queue_frozen_by_recovery.store(false, Ordering::Release);
+        handle
+            .queue_frozen_by_recovery
+            .store(false, Ordering::Release);
         handle.queue_paused.store(true, Ordering::Release);
         self.cancel_held_sends(handle);
         match sessions.interrupt(&handle.chat_id).await {
@@ -6475,7 +6541,9 @@ impl DocHost {
                 // A run on another provider than the live turn's (a stale
                 // client, another device's switch) waits for the turn: the
                 // provider never changes by killing a turn mid-flight.
-                let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
+                let other_provider = sessions
+                    .live_harness(chat_id)
+                    .is_some_and(|live| live != harness);
                 // Sent before the turn now running had started: the sender never
                 // saw that turn, so it can't be a steer into it. Two messages sent
                 // to a sleeping Cloud machine (or an offline host) start one turn
@@ -7270,12 +7338,16 @@ mod transfer_progress_tests {
         let attach = start.elapsed();
         assert_eq!(rx.borrow().entries.len(), 3000);
 
-        let mut writer = zeron_doc::SegmentWriter::begin(handle.doc(), "reply", "dev-test", 1).unwrap();
+        let mut writer =
+            zeron_doc::SegmentWriter::begin(handle.doc(), "reply", "dev-test", 1).unwrap();
         let mut commits = std::time::Duration::ZERO;
         for n in 1..=5 {
             let words = "streamed ".repeat(n);
             writer
-                .sync(&[zeron_doc::MessagePart::Text { id: "t".into(), text: words.clone() }])
+                .sync(&[zeron_doc::MessagePart::Text {
+                    id: "t".into(),
+                    text: words.clone(),
+                }])
                 .unwrap();
             let start = std::time::Instant::now();
             handle.publish_messages_if_watched();
@@ -7284,7 +7356,10 @@ mod transfer_progress_tests {
             assert_eq!(published.len(), 3001);
             assert_eq!(
                 published.last().unwrap().parts,
-                vec![zeron_doc::MessagePart::Text { id: "t".into(), text: words }],
+                vec![zeron_doc::MessagePart::Text {
+                    id: "t".into(),
+                    text: words
+                }],
             );
         }
         let commit = commits / 5;
@@ -7338,7 +7413,10 @@ mod transfer_progress_tests {
         }
         let each = start.elapsed() / 5;
         eprintln!("waiting whale: whole read {read:?}, waiting_messages {each:?}");
-        assert!(each * 5 < read, "waiting_messages ({each:?}) should cost far less than a whole read ({read:?})");
+        assert!(
+            each * 5 < read,
+            "waiting_messages ({each:?}) should cost far less than a whole read ({read:?})"
+        );
     }
 
     #[tokio::test]
@@ -7774,12 +7852,17 @@ mod publication_eviction_tests {
         let edit = |round: usize| {
             for handle in &handles {
                 let text = handle.doc.doc().get_text("body");
-                text.insert(text.len_unicode(), &format!("round {round} ")).unwrap();
+                text.insert(text.len_unicode(), &format!("round {round} "))
+                    .unwrap();
                 handle.doc.doc().commit();
                 handle.persistence.as_ref().unwrap().flush_sync();
             }
         };
-        let deltas = || ids.iter().map(|id| store.snapshot_delta_stats(id).unwrap().0).sum::<u64>();
+        let deltas = || {
+            ids.iter()
+                .map(|id| store.snapshot_delta_stats(id).unwrap().0)
+                .sum::<u64>()
+        };
         for round in 0..3 {
             edit(round);
         }
@@ -7787,15 +7870,25 @@ mod publication_eviction_tests {
         host.flush_all();
         assert_eq!(deltas(), 0, "a clean stop left deltas behind");
         for handle in &handles {
-            let (bytes, _, _) = store.load_snapshot_with_cursor(&handle.chat_id).unwrap().unwrap();
+            let (bytes, _, _) = store
+                .load_snapshot_with_cursor(&handle.chat_id)
+                .unwrap()
+                .unwrap();
             let loaded = loro::LoroDoc::new();
             loaded.import(&bytes).unwrap();
             assert_eq!(loaded.get_deep_value(), handle.doc.doc().get_deep_value());
         }
         edit(3);
-        assert!(deltas() > 0, "deltas resume after a clean stop that didn't end the process");
+        assert!(
+            deltas() > 0,
+            "deltas resume after a clean stop that didn't end the process"
+        );
         host.prepare_for_version_change();
-        assert_eq!(deltas(), 0, "a restart into another version left deltas behind");
+        assert_eq!(
+            deltas(),
+            0,
+            "a restart into another version left deltas behind"
+        );
         // Its last moments save whole: nothing new lands in the table.
         edit(4);
         edit(5);
@@ -7869,7 +7962,11 @@ mod publication_eviction_tests {
         let before = persistence.saves();
         for _ in 0..3 {
             let _ = host.wakeup_is_durable(&handle);
-            assert_eq!(persistence.saves(), before, "the check saved on the caller's thread");
+            assert_eq!(
+                persistence.saves(),
+                before,
+                "the check saved on the caller's thread"
+            );
         }
         // Streaming goes on; the receipt still follows the persister's save.
         text.insert(text.len_unicode(), " more").unwrap();
@@ -8051,8 +8148,14 @@ mod publication_eviction_tests {
         );
         assert!(host.open("").is_err());
         assert!(host.open_local("").is_err());
-        let steer = SessionCommandPayload::Steer { prompt: "hi".into(), message_id: None };
-        assert!(host.queue_command_with_transfers("", steer, Vec::new()).is_err());
+        let steer = SessionCommandPayload::Steer {
+            prompt: "hi".into(),
+            message_id: None,
+        };
+        assert!(
+            host.queue_command_with_transfers("", steer, Vec::new())
+                .is_err()
+        );
         assert!(lock(&host.inner.handles).is_empty());
         host.shutdown_workers().await;
     }
@@ -8099,12 +8202,20 @@ mod publication_eviction_tests {
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
             store,
-            DocHostConfig { device_id: "here".into(), default_harness: HarnessId::Mock, edge: None },
+            DocHostConfig {
+                device_id: "here".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
         );
-        let handles: Vec<_> = (0..12).map(|i| host.open(&format!("chat-{i}")).unwrap()).collect();
+        let handles: Vec<_> = (0..12)
+            .map(|i| host.open(&format!("chat-{i}")).unwrap())
+            .collect();
         for handle in &handles {
             for m in 0..100 {
-                handle.write_user_message(&format!("m{m}"), &"words ".repeat(40), m).unwrap();
+                handle
+                    .write_user_message(&format!("m{m}"), &"words ".repeat(40), m)
+                    .unwrap();
             }
         }
         let watch = handles[0].watch_messages();
@@ -8114,17 +8225,33 @@ mod publication_eviction_tests {
             handle.publish_messages_if_watched();
             assert_eq!(handle.doc().read_entries().unwrap().len(), 101);
         }
-        assert_eq!(handles[0].doc().entries_cached(), 101, "the watched chat keeps its entries");
+        assert_eq!(
+            handles[0].doc().entries_cached(),
+            101,
+            "the watched chat keeps its entries"
+        );
         let watched = handles[0].doc().cached_bytes();
-        assert!(watched > 100 * 240, "its entries' bytes are counted: {watched}");
+        assert!(
+            watched > 100 * 240,
+            "its entries' bytes are counted: {watched}"
+        );
         for handle in &handles[1..] {
-            assert_eq!(handle.doc().entries_cached(), 0, "an unwatched chat keeps no entries");
+            assert_eq!(
+                handle.doc().entries_cached(),
+                0,
+                "an unwatched chat keeps no entries"
+            );
         }
         let floor = handles[1].resident_estimate();
-        assert!(handles[0].resident_estimate() >= floor + watched, "the budget counts the watched chat's cache");
+        assert!(
+            handles[0].resident_estimate() >= floor + watched,
+            "the budget counts the watched chat's cache"
+        );
         // Let go of: on its next change it keeps nothing either.
         drop(watch);
-        handles[0].write_user_message("after", "a change", 600).unwrap();
+        handles[0]
+            .write_user_message("after", "a change", 600)
+            .unwrap();
         handles[0].publish_messages_if_watched();
         assert_eq!(handles[0].doc().entries_cached(), 0);
         drop(handles);
@@ -8140,11 +8267,17 @@ mod publication_eviction_tests {
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
             store,
-            DocHostConfig { device_id: "here".into(), default_harness: HarnessId::Mock, edge: None },
+            DocHostConfig {
+                device_id: "here".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
         );
         let handle = host.open("big").unwrap();
         for i in 0..200 {
-            handle.write_user_message(&format!("m{i}"), "words", i).unwrap();
+            handle
+                .write_user_message(&format!("m{i}"), "words", i)
+                .unwrap();
         }
         // Watched and read, as a chat looked at, then let go.
         let watch = handle.watch_messages();
@@ -8152,9 +8285,15 @@ mod publication_eviction_tests {
         assert_eq!(handle.doc().entries_cached(), 200);
         drop(watch);
         // A change while nobody watches lets the read cache go.
-        handle.write_user_message("unwatched", "words", 999).unwrap();
+        handle
+            .write_user_message("unwatched", "words", 999)
+            .unwrap();
         handle.publish_messages_if_watched();
-        assert_eq!(handle.doc().entries_cached(), 0, "an unwatched chat keeps no second copy");
+        assert_eq!(
+            handle.doc().entries_cached(),
+            0,
+            "an unwatched chat keeps no second copy"
+        );
         let doc = Arc::downgrade(&handle.doc_arc());
         drop(handle);
         for i in 0..WARM_DOC_CAP {

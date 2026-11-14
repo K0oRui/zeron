@@ -110,7 +110,12 @@ pub struct CommandTail {
 /// The cut starts on a line where it can: a single line longer than the
 /// byte budget keeps its end. `None` when nothing but whitespace is left.
 pub fn command_output_tail(command: &str, text: &str) -> Option<CommandTail> {
-    command_output_end(command, text, COMMAND_TAIL_MAX_LINES, COMMAND_TAIL_MAX_BYTES)
+    command_output_end(
+        command,
+        text,
+        COMMAND_TAIL_MAX_LINES,
+        COMMAND_TAIL_MAX_BYTES,
+    )
 }
 
 /// The end of `command`'s output, at most `max_lines` lines and `max_bytes`

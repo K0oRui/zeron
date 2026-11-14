@@ -454,7 +454,10 @@ async fn forgetting_a_live_login_signs_out_only_that_login() {
     let not_key = |a: &AgentAccount| a.auth_kind != Some(AgentAuthKind::ApiKey);
     let snapshot = accounts.list(false).await.unwrap();
     for harness in [HarnessId::Grok, HarnessId::Opencode, HarnessId::Devin] {
-        let live: Vec<_> = rows(&snapshot, harness).into_iter().filter(not_key).collect();
+        let live: Vec<_> = rows(&snapshot, harness)
+            .into_iter()
+            .filter(not_key)
+            .collect();
         assert_eq!(live.len(), 1, "{harness:?}");
         assert!(live[0].active);
         let left: Vec<_> = rows(
@@ -466,7 +469,10 @@ async fn forgetting_a_live_login_signs_out_only_that_login() {
         .collect();
         assert!(left.is_empty(), "{harness:?}: {left:?}");
         assert!(
-            accounts.read_slots(harness).iter().all(|s| s.profile.auth_kind == AgentAuthKind::ApiKey),
+            accounts
+                .read_slots(harness)
+                .iter()
+                .all(|s| s.profile.auth_kind == AgentAuthKind::ApiKey),
             "{harness:?}"
         );
     }
@@ -487,7 +493,11 @@ async fn forgetting_a_live_login_signs_out_only_that_login() {
     let snapshot = accounts.list(false).await.unwrap();
     for harness in [HarnessId::Grok, HarnessId::Opencode, HarnessId::Devin] {
         assert!(
-            rows(&snapshot, harness).into_iter().filter(not_key).next().is_none(),
+            rows(&snapshot, harness)
+                .into_iter()
+                .filter(not_key)
+                .next()
+                .is_none(),
             "{harness:?}"
         );
     }
@@ -2250,12 +2260,19 @@ async fn codex_usage_loads_for_a_login_whose_key_carries_the_user_id() {
 
     let codex = rows(&accounts.list(true).await.unwrap(), HarnessId::Codex);
     assert_eq!(codex.len(), 1);
-    let fractions: Vec<f32> = codex[0].usage_windows.iter().map(|w| w.used_fraction).collect();
+    let fractions: Vec<f32> = codex[0]
+        .usage_windows
+        .iter()
+        .map(|w| w.used_fraction)
+        .collect();
     assert_eq!(fractions.len(), 2, "{:?}", codex[0].usage_windows);
     assert!((fractions[0] - 0.12).abs() < 1e-6);
     assert!((fractions[1] - 0.40).abs() < 1e-6);
     assert_eq!(
-        codex[0].codex_reset_credits.as_ref().map(|c| c.available_count),
+        codex[0]
+            .codex_reset_credits
+            .as_ref()
+            .map(|c| c.available_count),
         Some(1)
     );
 }
@@ -2299,12 +2316,18 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
-    write(&config.codex_home.join("auth.json"), &codex_auth("ada@example.com", "acct-ada"));
+    write(
+        &config.codex_home.join("auth.json"),
+        &codex_auth("ada@example.com", "acct-ada"),
+    );
 
     // The probe loads the credits alongside the usage.
     let codex = rows(&accounts.list(true).await.unwrap(), HarnessId::Codex);
     assert_eq!(codex.len(), 1);
-    let credits = codex[0].codex_reset_credits.clone().expect("credits listed");
+    let credits = codex[0]
+        .codex_reset_credits
+        .clone()
+        .expect("credits listed");
     assert_eq!(credits.available_count, 2);
     assert_eq!(credits.credits[0].id, "credit-1");
     assert!((codex[0].usage_windows[0].used_fraction - 1.0).abs() < 1e-6);
@@ -2314,7 +2337,13 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
     // before it probes again.
     let (restarted, _) = accounts_with(tmp.path(), mocked(&server.base));
     let cold = rows(&restarted.list(false).await.unwrap(), HarnessId::Codex);
-    assert_eq!(cold[0].codex_reset_credits.as_ref().map(|c| c.available_count), Some(2));
+    assert_eq!(
+        cold[0]
+            .codex_reset_credits
+            .as_ref()
+            .map(|c| c.available_count),
+        Some(2)
+    );
 
     // Redeeming checks the account, then sends Codex's own request.
     let outcome = accounts
@@ -2333,19 +2362,38 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
         .consume_codex_reset_credit(&account, "credit-2", "key-2")
         .await
         .unwrap_err();
-    assert!(refused.to_string().contains("different account"), "{refused}");
-    assert_eq!(server.hits("POST /backend-api/wham/rate-limit-reset-credits/consume"), 1);
+    assert!(
+        refused.to_string().contains("different account"),
+        "{refused}"
+    );
+    assert_eq!(
+        server.hits("POST /backend-api/wham/rate-limit-reset-credits/consume"),
+        1
+    );
     // ...and a fresh engine's probe shows no numbers for it.
     let fresh = tempfile::tempdir().unwrap();
     let (other, config) = accounts_with(fresh.path(), mocked(&server.base));
-    write(&config.codex_home.join("auth.json"), &codex_auth("ada@example.com", "acct-ada"));
+    write(
+        &config.codex_home.join("auth.json"),
+        &codex_auth("ada@example.com", "acct-ada"),
+    );
     let refused = rows(&other.list(true).await.unwrap(), HarnessId::Codex);
     assert!(refused[0].usage_windows.is_empty());
     assert!(refused[0].codex_reset_credits.is_none());
 
     // Nothing to redeem with: refused before any request.
-    assert!(accounts.consume_codex_reset_credit(&account, "", "key-3").await.is_err());
-    assert!(accounts.consume_codex_reset_credit("no-such-account", "credit-2", "key-4").await.is_err());
+    assert!(
+        accounts
+            .consume_codex_reset_credit(&account, "", "key-3")
+            .await
+            .is_err()
+    );
+    assert!(
+        accounts
+            .consume_codex_reset_credit("no-such-account", "credit-2", "key-4")
+            .await
+            .is_err()
+    );
 }
 
 // ── per-provider accounts (Pi, OpenCode, Hermes) ────────────────────────────
@@ -2674,16 +2722,23 @@ async fn a_pi_api_key_is_checked_then_stored_as_pi_stores_it_and_never_shown_or_
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
     let file = config.pi_agent_dir.join("auth.json");
     let chatgpt = openai_entry("a@example.com", "acct-a");
-    write(&file, &serde_json::json!({ "openai-codex": chatgpt }).to_string());
+    write(
+        &file,
+        &serde_json::json!({ "openai-codex": chatgpt }).to_string(),
+    );
 
-    let (snapshot, log) = logged(accounts.add_api_key(HarnessId::Pi, "openrouter", OR_KEY, None)).await;
+    let (snapshot, log) =
+        logged(accounts.add_api_key(HarnessId::Pi, "openrouter", OR_KEY, None)).await;
     let snapshot = snapshot.unwrap();
     // Checked with the provider, once, before anything was written.
     assert_eq!(server.hits("GET /api/v1/key"), 1);
     // Pi's own shape, beside the untouched ChatGPT login, owner-only.
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(live["openrouter"], serde_json::json!({ "type": "api_key", "key": OR_KEY }));
+    assert_eq!(
+        live["openrouter"],
+        serde_json::json!({ "type": "api_key", "key": OR_KEY })
+    );
     assert_eq!(live["openai-codex"], chatgpt);
     #[cfg(unix)]
     assert_eq!(mode(&file), 0o600);
@@ -2699,8 +2754,14 @@ async fn a_pi_api_key_is_checked_then_stored_as_pi_stores_it_and_never_shown_or_
     assert!(key_row.active && key_row.switchable);
     // Never in what the UI gets, never logged, never in its slot's id.
     let wire = serde_json::to_string(&snapshot).unwrap();
-    assert!(!wire.contains(OR_KEY) && !wire.contains("ZEROTESTkey"), "{wire}");
-    assert!(!log.contains(OR_KEY) && !log.contains("ZEROTESTkey"), "{log}");
+    assert!(
+        !wire.contains(OR_KEY) && !wire.contains("ZEROTESTkey"),
+        "{wire}"
+    );
+    assert!(
+        !log.contains(OR_KEY) && !log.contains("ZEROTESTkey"),
+        "{log}"
+    );
     // Its slot (for switching back) is the device's own, owner-only.
     let slot = accounts
         .read_slots(HarnessId::Pi)
@@ -2710,7 +2771,10 @@ async fn a_pi_api_key_is_checked_then_stored_as_pi_stores_it_and_never_shown_or_
     assert!(!slot.account_key.contains(OR_KEY));
     #[cfg(unix)]
     {
-        let slot_file = accounts.slots_dir(HarnessId::Pi).unwrap().join(format!("{}.json", slot.id));
+        let slot_file = accounts
+            .slots_dir(HarnessId::Pi)
+            .unwrap()
+            .join(format!("{}.json", slot.id));
         assert_eq!(mode(&slot_file), 0o600);
     }
     // Usage is never probed with a key (no request carries it but the check).
@@ -2718,13 +2782,21 @@ async fn a_pi_api_key_is_checked_then_stored_as_pi_stores_it_and_never_shown_or_
     // (Only the ChatGPT login's usage was asked after.)
     assert_eq!(server.hits("GET /api/v1/key"), 1);
     assert!(
-        lock(&server.hits).iter().all(|h| h == "GET /api/v1/key" || h == "GET /backend-api/wham/usage"),
+        lock(&server.hits)
+            .iter()
+            .all(|h| h == "GET /api/v1/key" || h == "GET /backend-api/wham/usage"),
         "{:?}",
         lock(&server.hits)
     );
     // Removed like any login: the entry goes, the rest stays.
-    let left = rows(&accounts.forget(HarnessId::Pi, &key_row.id).await.unwrap(), HarnessId::Pi);
-    assert!(left.iter().all(|a| a.provider.as_deref() != Some("openrouter")));
+    let left = rows(
+        &accounts.forget(HarnessId::Pi, &key_row.id).await.unwrap(),
+        HarnessId::Pi,
+    );
+    assert!(
+        left.iter()
+            .all(|a| a.provider.as_deref() != Some("openrouter"))
+    );
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert!(live.get("openrouter").is_none());
@@ -2738,7 +2810,16 @@ async fn a_refused_or_malformed_key_is_never_stored_echoed_or_sent_on() {
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
     // The provider refuses it: said plainly, the key nowhere in the words.
     let wrong = "sk-or-v1-WRONGwrongWRONGwrong0000";
-    let mocked_refusal = MockServer::start(|_, _, _| (401, format!(r#"{{"error":"bad key {}"}}"#, "sk-or-v1-WRONGwrongWRONGwrong0000"))).await;
+    let mocked_refusal = MockServer::start(|_, _, _| {
+        (
+            401,
+            format!(
+                r#"{{"error":"bad key {}"}}"#,
+                "sk-or-v1-WRONGwrongWRONGwrong0000"
+            ),
+        )
+    })
+    .await;
     let (refusing, _) = accounts_with(tmp.path(), mocked(&mocked_refusal.base));
     let err = refusing
         .add_api_key(HarnessId::Pi, "openrouter", wrong, None)
@@ -2749,7 +2830,13 @@ async fn a_refused_or_malformed_key_is_never_stored_echoed_or_sent_on() {
     assert!(!err.contains(wrong) && !err.contains("WRONG"), "{err}");
     // Not a key at all (a Pi command, a variable, a sentence): refused
     // before any request.
-    for bad in ["!rm -rf ~", "$OPENROUTER_API_KEY", "sk-or v1 two words", "short", "-sk-or-flaglike"] {
+    for bad in [
+        "!rm -rf ~",
+        "$OPENROUTER_API_KEY",
+        "sk-or v1 two words",
+        "short",
+        "-sk-or-flaglike",
+    ] {
         let err = accounts
             .add_api_key(HarnessId::Pi, "openrouter", bad, None)
             .await
@@ -2759,8 +2846,18 @@ async fn a_refused_or_malformed_key_is_never_stored_echoed_or_sent_on() {
     }
     assert_eq!(server.hits("GET"), 0);
     // A provider Zeron doesn't add keys for.
-    assert!(accounts.add_api_key(HarnessId::Pi, "acme", OR_KEY, None).await.is_err());
-    assert!(accounts.add_api_key(HarnessId::ClaudeCode, "anthropic", OR_KEY, None).await.is_err());
+    assert!(
+        accounts
+            .add_api_key(HarnessId::Pi, "acme", OR_KEY, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        accounts
+            .add_api_key(HarnessId::ClaudeCode, "anthropic", OR_KEY, None)
+            .await
+            .is_err()
+    );
     assert!(!config.pi_agent_dir.join("auth.json").exists());
     assert!(accounts.read_slots(HarnessId::Pi).is_empty());
     assert!(!every_file(tmp.path()).contains("WRONG"));
@@ -2778,7 +2875,10 @@ async fn opencode_keys_use_its_shape_and_opencode_2s_own_database_is_left_alone(
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config.opencode_auth_file).unwrap())
             .unwrap();
-    assert_eq!(live["openrouter"], serde_json::json!({ "type": "api", "key": OR_KEY }));
+    assert_eq!(
+        live["openrouter"],
+        serde_json::json!({ "type": "api", "key": OR_KEY })
+    );
     #[cfg(unix)]
     assert_eq!(mode(&config.opencode_auth_file), 0o600);
 
@@ -2800,7 +2900,12 @@ async fn opencode_keys_use_its_shape_and_opencode_2s_own_database_is_left_alone(
     assert!(!config2.opencode_auth_file.exists());
     assert_eq!(server.hits("GET"), 1, "only the first add was checked");
     let warned = accounts2.list(false).await.unwrap();
-    assert!(warned.warnings.iter().any(|w| w.harness == HarnessId::Opencode && w.message.contains("own database")));
+    assert!(
+        warned
+            .warnings
+            .iter()
+            .any(|w| w.harness == HarnessId::Opencode && w.message.contains("own database"))
+    );
 }
 
 #[cfg(unix)]
@@ -2829,9 +2934,14 @@ echo 'Added openrouter credential #1: "api-key-1"'
         ),
     );
     accounts.override_cli(HarnessId::Hermes, cli.clone());
-    let (snapshot, log) = logged(accounts.add_api_key(HarnessId::Hermes, "openrouter", OR_KEY, None)).await;
+    let (snapshot, log) =
+        logged(accounts.add_api_key(HarnessId::Hermes, "openrouter", OR_KEY, None)).await;
     let snapshot = snapshot.unwrap();
-    assert_eq!(std::fs::read_to_string(&seen).unwrap(), OR_KEY, "read from stdin");
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        OR_KEY,
+        "read from stdin"
+    );
     let hermes = rows(&snapshot, HarnessId::Hermes);
     assert_eq!(hermes.len(), 1);
     // (Hermes' "api-key-1" is no name: it reads as an unnamed key.)
@@ -2879,11 +2989,18 @@ async fn a_key_and_a_sign_in_of_one_provider_switch_between_each_other() {
     let tmp = tempfile::tempdir().unwrap();
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
     let file = config.pi_agent_dir.join("auth.json");
-    let claude = serde_json::json!({ "type": "oauth", "refresh": "rt-1", "access": "at-1", "expires": 1 });
-    write(&file, &serde_json::json!({ "anthropic": claude }).to_string());
+    let claude =
+        serde_json::json!({ "type": "oauth", "refresh": "rt-1", "access": "at-1", "expires": 1 });
+    write(
+        &file,
+        &serde_json::json!({ "anthropic": claude }).to_string(),
+    );
     let key = "sk-ant-api03-ZEROTESTanthropicKEYabcd";
     // A Claude login is live: the key is saved beside it, not swapped in.
-    let snapshot = accounts.add_api_key(HarnessId::Pi, "anthropic", key, None).await.unwrap();
+    let snapshot = accounts
+        .add_api_key(HarnessId::Pi, "anthropic", key, None)
+        .await
+        .unwrap();
     let anthropic: Vec<_> = rows(&snapshot, HarnessId::Pi)
         .into_iter()
         .filter(|a| a.provider.as_deref() == Some("anthropic"))
@@ -2892,15 +3009,27 @@ async fn a_key_and_a_sign_in_of_one_provider_switch_between_each_other() {
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(live["anthropic"], claude);
-    let key_row = anthropic.iter().find(|a| a.auth_kind == Some(AgentAuthKind::ApiKey)).unwrap();
+    let key_row = anthropic
+        .iter()
+        .find(|a| a.auth_kind == Some(AgentAuthKind::ApiKey))
+        .unwrap();
     assert!(!key_row.active);
     // Switched to: the key is the entry; and back: the Claude login again.
     accounts.activate(HarnessId::Pi, &key_row.id).await.unwrap();
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(live["anthropic"], serde_json::json!({ "type": "api_key", "key": key }));
-    let claude_row = anthropic.iter().find(|a| a.auth_kind != Some(AgentAuthKind::ApiKey)).unwrap();
-    accounts.activate(HarnessId::Pi, &claude_row.id).await.unwrap();
+    assert_eq!(
+        live["anthropic"],
+        serde_json::json!({ "type": "api_key", "key": key })
+    );
+    let claude_row = anthropic
+        .iter()
+        .find(|a| a.auth_kind != Some(AgentAuthKind::ApiKey))
+        .unwrap();
+    accounts
+        .activate(HarnessId::Pi, &claude_row.id)
+        .await
+        .unwrap();
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(live["anthropic"]["refresh"], "rt-1");
@@ -2919,12 +3048,20 @@ async fn a_refresh_the_agent_made_since_the_last_list_is_kept_when_switching_awa
         &serde_json::json!({ "openai-codex": openai_entry("b@example.com", "acct-b") }).to_string(),
     );
     let pi = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
-    let a_id = pi.iter().find(|r| r.email.as_deref() == Some("a@example.com")).unwrap().id.clone();
+    let a_id = pi
+        .iter()
+        .find(|r| r.email.as_deref() == Some("a@example.com"))
+        .unwrap()
+        .id
+        .clone();
     // Pi refreshes b's login (a single-use refresh token, rotated) — and
     // zeron switches before any list sees it.
     let mut rotated = openai_entry("b@example.com", "acct-b");
     rotated["refresh"] = serde_json::json!("refresh-acct-b-ROTATED");
-    write(&file, &serde_json::json!({ "openai-codex": rotated }).to_string());
+    write(
+        &file,
+        &serde_json::json!({ "openai-codex": rotated }).to_string(),
+    );
     accounts.activate(HarnessId::Pi, &a_id).await.unwrap();
     // b's slot holds the rotated token, not the spent one.
     let b_slot = accounts
@@ -2957,29 +3094,45 @@ async fn claude_for_pi_signs_in_as_pis_own_login_on_this_device_or_for_another()
     let tmp = tempfile::tempdir().unwrap();
     let routes = zeron_preview::login::CallbackRoutes::default();
     let config = AgentAccountsConfig::isolated(tmp.path());
-    let accounts = AgentAccounts::with_endpoints(config.clone(), mocked(&server.base), routes.clone());
+    let accounts =
+        AgentAccounts::with_endpoints(config.clone(), mocked(&server.base), routes.clone());
     let file = config.pi_agent_dir.join("auth.json");
     let chatgpt = openai_entry("a@example.com", "acct-a");
-    write(&file, &serde_json::json!({ "openai-codex": chatgpt }).to_string());
+    write(
+        &file,
+        &serde_json::json!({ "openai-codex": chatgpt }).to_string(),
+    );
     // Started for another device (its browser finishes it): its callback is
     // served to that device alone, and the provider rode with the request.
     let start = accounts
         .start_login_with(HarnessId::Pi, Some("anthropic"), Some("device-a"))
         .await
         .unwrap();
-    assert!(start.url.starts_with("https://claude.ai/oauth/authorize?"), "{}", start.url);
+    assert!(
+        start.url.starts_with("https://claude.ai/oauth/authorize?"),
+        "{}",
+        start.url
+    );
     let port = start.callback_port.expect("a loopback port");
     assert_eq!(loopback_port(&start.url), Some(port));
     assert!(routes.is_registered(&start.login_id));
     let state = query_param(&start.url, "state");
     // The device that caught the browser's redirect replays it here.
     let relayed = accounts
-        .relay_callback(&start.login_id, "device-a", &format!("/callback?code=c-1&state={state}"))
+        .relay_callback(
+            &start.login_id,
+            "device-a",
+            &format!("/callback?code=c-1&state={state}"),
+        )
         .await
         .unwrap();
     assert_eq!(relayed.status, 200);
     let polls = settle(&accounts, &start.login_id).await;
-    assert_eq!(polls.last().unwrap().status, AgentLoginStatus::Done, "{polls:?}");
+    assert_eq!(
+        polls.last().unwrap().status,
+        AgentLoginStatus::Done,
+        "{polls:?}"
+    );
     // Pi's own entry shape; the ChatGPT login beside it untouched.
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -2989,11 +3142,20 @@ async fn claude_for_pi_signs_in_as_pis_own_login_on_this_device_or_for_another()
     assert!(live["anthropic"]["expires"].as_i64().unwrap() > now_ms());
     assert_eq!(live["openai-codex"], chatgpt);
     let pi = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
-    let claude = pi.iter().find(|a| a.provider.as_deref() == Some("anthropic")).unwrap();
+    let claude = pi
+        .iter()
+        .find(|a| a.provider.as_deref() == Some("anthropic"))
+        .unwrap();
     assert_eq!(claude.email.as_deref(), Some("ada@claude.test"));
     assert!(claude.active);
     // Another device can't replay a login that isn't its own.
-    assert!(!routes.is_registered(&start.login_id) || accounts.relay_callback(&start.login_id, "device-b", "/callback").await.is_err());
+    assert!(
+        !routes.is_registered(&start.login_id)
+            || accounts
+                .relay_callback(&start.login_id, "device-b", "/callback")
+                .await
+                .is_err()
+    );
 }
 
 /// Anthropic's profile endpoint rate limited (a 429, as it answered on a
@@ -3013,25 +3175,37 @@ async fn claude_for_pi_signs_in_when_the_profile_is_rate_limited() {
     let tmp = tempfile::tempdir().unwrap();
     let routes = zeron_preview::login::CallbackRoutes::default();
     let config = AgentAccountsConfig::isolated(tmp.path());
-    let accounts = AgentAccounts::with_endpoints(config.clone(), mocked(&server.base), routes.clone());
+    let accounts =
+        AgentAccounts::with_endpoints(config.clone(), mocked(&server.base), routes.clone());
     let start = accounts
         .start_login_with(HarnessId::Pi, Some("anthropic"), Some("device-a"))
         .await
         .unwrap();
     let state = query_param(&start.url, "state");
     accounts
-        .relay_callback(&start.login_id, "device-a", &format!("/callback?code=c-1&state={state}"))
+        .relay_callback(
+            &start.login_id,
+            "device-a",
+            &format!("/callback?code=c-1&state={state}"),
+        )
         .await
         .unwrap();
     let polls = settle(&accounts, &start.login_id).await;
-    assert_eq!(polls.last().unwrap().status, AgentLoginStatus::Done, "{polls:?}");
+    assert_eq!(
+        polls.last().unwrap().status,
+        AgentLoginStatus::Done,
+        "{polls:?}"
+    );
     let live: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(config.pi_agent_dir.join("auth.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(live["anthropic"]["refresh"], "rt-pi");
     let pi = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
-    let claude: Vec<_> = pi.iter().filter(|a| a.provider.as_deref() == Some("anthropic")).collect();
+    let claude: Vec<_> = pi
+        .iter()
+        .filter(|a| a.provider.as_deref() == Some("anthropic"))
+        .collect();
     assert_eq!(claude.len(), 1, "{claude:?}");
     assert_eq!(claude[0].email.as_deref(), Some("ada@claude.test"));
     assert!(claude[0].active);
@@ -3044,7 +3218,10 @@ async fn keys_are_named_by_default_or_as_asked_renamed_and_two_keys_stay_two_row
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
     let second = "sk-or-v1-9876543210fedcbaZEROTESTkeyA1B2";
     // The first unnamed: its provider and last four. The second named.
-    accounts.add_api_key(HarnessId::Pi, "openrouter", OR_KEY, None).await.unwrap();
+    accounts
+        .add_api_key(HarnessId::Pi, "openrouter", OR_KEY, None)
+        .await
+        .unwrap();
     let snapshot = accounts
         .add_api_key(HarnessId::Pi, "openrouter", second, Some("  Work  "))
         .await
@@ -3054,38 +3231,80 @@ async fn keys_are_named_by_default_or_as_asked_renamed_and_two_keys_stay_two_row
         .filter(|a| a.provider.as_deref() == Some("openrouter"))
         .collect();
     assert_eq!(keys.len(), 2, "two keys of one provider are two rows");
-    let first = keys.iter().find(|a| a.email.as_deref() == Some("API key ···WXYZ")).unwrap();
+    let first = keys
+        .iter()
+        .find(|a| a.email.as_deref() == Some("API key ···WXYZ"))
+        .unwrap();
     assert_eq!(first.plan_label.as_deref(), Some("OpenRouter"));
-    let work = keys.iter().find(|a| a.email.as_deref() == Some("Work")).unwrap();
+    let work = keys
+        .iter()
+        .find(|a| a.email.as_deref() == Some("Work"))
+        .unwrap();
     // Named: the last four nowhere (the name tells it apart).
     assert_eq!(work.plan_label.as_deref(), Some("OpenRouter · API key"));
     // One in use for the provider (the first: the second came beside it).
     assert!(first.active && !work.active);
     // Live, the second is still the first's (the name changes nothing live).
-    let live: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config.pi_agent_dir.join("auth.json")).unwrap()).unwrap();
+    let live: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.pi_agent_dir.join("auth.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(live["openrouter"]["key"], OR_KEY);
 
     // Renamed, no key asked; kept across lists (the agent's store has no
     // name, the slot does).
-    let renamed = accounts.rename_account(HarnessId::Pi, &first.id, "Personal").await.unwrap();
-    assert!(rows(&renamed, HarnessId::Pi).iter().any(|a| a.id == first.id && a.email.as_deref() == Some("Personal")));
+    let renamed = accounts
+        .rename_account(HarnessId::Pi, &first.id, "Personal")
+        .await
+        .unwrap();
+    assert!(
+        rows(&renamed, HarnessId::Pi)
+            .iter()
+            .any(|a| a.id == first.id && a.email.as_deref() == Some("Personal"))
+    );
     let again = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
-    assert!(again.iter().any(|a| a.id == first.id && a.email.as_deref() == Some("Personal")));
+    assert!(
+        again
+            .iter()
+            .any(|a| a.id == first.id && a.email.as_deref() == Some("Personal"))
+    );
     // A name never looks like a key — whichever key (the check never reads
     // this one: a refusal must say nothing about it).
-    for keylike in ["my sk-or-v1-0123 key", "ZEROTESTkeyWXYZ0123456", OR_KEY, "AIzaSyB", "work xai-123"] {
-        let err = accounts.rename_account(HarnessId::Pi, &first.id, keylike).await.unwrap_err();
-        assert!(err.to_string().contains("looks like a key"), "{keylike}: {err}");
+    for keylike in [
+        "my sk-or-v1-0123 key",
+        "ZEROTESTkeyWXYZ0123456",
+        OR_KEY,
+        "AIzaSyB",
+        "work xai-123",
+    ] {
+        let err = accounts
+            .rename_account(HarnessId::Pi, &first.id, keylike)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("looks like a key"),
+            "{keylike}: {err}"
+        );
     }
-    assert!(accounts.add_api_key(HarnessId::Pi, "openrouter", OR_KEY, Some("sk-or-test")).await.is_err());
+    assert!(
+        accounts
+            .add_api_key(HarnessId::Pi, "openrouter", OR_KEY, Some("sk-or-test"))
+            .await
+            .is_err()
+    );
     // A short run that happens to be in the key is just a name: no answer
     // depends on the key's contents.
     for short in ["0123", "v1-0123", "WXYZ team"] {
-        accounts.rename_account(HarnessId::Pi, &first.id, short).await.unwrap();
+        accounts
+            .rename_account(HarnessId::Pi, &first.id, short)
+            .await
+            .unwrap();
     }
     // Emptied: its default name again.
-    let reset = accounts.rename_account(HarnessId::Pi, &first.id, "  ").await.unwrap();
+    let reset = accounts
+        .rename_account(HarnessId::Pi, &first.id, "  ")
+        .await
+        .unwrap();
     assert!(rows(&reset, HarnessId::Pi).iter().any(|a| a.id == first.id
         && a.email.as_deref() == Some("API key ···WXYZ")
         && a.plan_label.as_deref() == Some("OpenRouter")));
@@ -3096,9 +3315,22 @@ async fn keys_are_named_by_default_or_as_asked_renamed_and_two_keys_stay_two_row
         &serde_json::json!({ "openai-codex": openai_entry("a@example.com", "acct-a"), "openrouter": { "type": "api_key", "key": OR_KEY } }).to_string(),
     );
     let pi = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
-    let login = pi.iter().find(|a| a.provider.as_deref() == Some("openai-codex")).unwrap();
-    assert!(accounts.rename_account(HarnessId::Pi, &login.id, "Mine").await.is_err());
-    assert!(accounts.rename_account(HarnessId::Pi, "../../etc/passwd", "x").await.is_err());
+    let login = pi
+        .iter()
+        .find(|a| a.provider.as_deref() == Some("openai-codex"))
+        .unwrap();
+    assert!(
+        accounts
+            .rename_account(HarnessId::Pi, &login.id, "Mine")
+            .await
+            .is_err()
+    );
+    assert!(
+        accounts
+            .rename_account(HarnessId::Pi, "../../etc/passwd", "x")
+            .await
+            .is_err()
+    );
     // The names travel in the list; no key ever does.
     let wire = serde_json::to_string(&accounts.list(false).await.unwrap()).unwrap();
     assert!(!wire.contains("ZEROTESTkey"), "{wire}");
@@ -3128,7 +3360,12 @@ printf '{"credential_pool":{"openrouter":[{"id":"k9","label":"Work","auth_type":
     let hermes = rows(&snapshot, HarnessId::Hermes);
     assert_eq!(hermes[0].email.as_deref(), Some("Work"));
     // Hermes names its own: not renamed here.
-    assert!(accounts.rename_account(HarnessId::Hermes, &hermes[0].id, "Other").await.is_err());
+    assert!(
+        accounts
+            .rename_account(HarnessId::Hermes, &hermes[0].id, "Other")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -3163,7 +3400,10 @@ async fn hermes_lists_only_what_hermes_itself_would_use() {
         })
         .to_string(),
     );
-    write(&config.hermes_home.join(".env"), "ZERON_TEST_HERMES_DEEPSEEK=sk-live\nZERON_TEST_HERMES_GONE=\n");
+    write(
+        &config.hermes_home.join(".env"),
+        "ZERON_TEST_HERMES_DEEPSEEK=sk-live\nZERON_TEST_HERMES_GONE=\n",
+    );
     let hermes = rows(&accounts.list(false).await.unwrap(), HarnessId::Hermes);
     let providers: Vec<_> = hermes.iter().map(|a| a.provider.clone().unwrap()).collect();
     assert_eq!(providers, ["openai-codex", "deepseek"]);
@@ -3184,7 +3424,10 @@ fn a_keys_last_four_show_once_and_an_environment_variable_never() {
     );
     assert_eq!(
         key_rows("OpenRouter", Some(key), Some("OPENROUTER_API_KEY"), true),
-        ("API key ···WXYZ".to_string(), "OpenRouter · from environment".to_string())
+        (
+            "API key ···WXYZ".to_string(),
+            "OpenRouter · from environment".to_string()
+        )
     );
 }
 
@@ -3200,10 +3443,16 @@ async fn a_hermes_key_from_the_environment_never_shows_its_variable() {
         ]}})
         .to_string(),
     );
-    write(&config.hermes_home.join(".env"), "OPENROUTER_API_KEY=sk-or-v1-envKEY0000ab12\n");
+    write(
+        &config.hermes_home.join(".env"),
+        "OPENROUTER_API_KEY=sk-or-v1-envKEY0000ab12\n",
+    );
     let hermes = rows(&accounts.list(false).await.unwrap(), HarnessId::Hermes);
     assert_eq!(hermes[0].email.as_deref(), Some("API key ···ab12"));
-    assert_eq!(hermes[0].plan_label.as_deref(), Some("OpenRouter · from environment"));
+    assert_eq!(
+        hermes[0].plan_label.as_deref(),
+        Some("OpenRouter · from environment")
+    );
 }
 
 #[test]
@@ -3211,7 +3460,13 @@ fn a_keys_name_is_judged_without_the_key() {
     use super::api_keys::key_name;
     assert_eq!(key_name("  Work ").unwrap().as_deref(), Some("Work"));
     assert_eq!(key_name("").unwrap(), None);
-    for keylike in ["sk-ant-api03", "Personal SK-OR-xyz", "abcdefghijklmnop", "ghp_abc", "a_b-c_d-e_f-g_h-i"] {
+    for keylike in [
+        "sk-ant-api03",
+        "Personal SK-OR-xyz",
+        "abcdefghijklmnop",
+        "ghp_abc",
+        "a_b-c_d-e_f-g_h-i",
+    ] {
         assert!(key_name(keylike).is_err(), "{keylike}");
     }
     for fine in ["Work", "Personal 2", "OpenRouter team", "my-org/prod key"] {
@@ -3232,17 +3487,32 @@ async fn a_switch_over_a_login_it_cant_identify_is_refused_and_the_login_kept() 
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
     let file = config.pi_agent_dir.join("auth.json");
     let claude = serde_json::json!({ "type": "oauth", "refresh": "rt-only-here", "access": "at-1", "expires": 1 });
-    write(&file, &serde_json::json!({ "anthropic": claude }).to_string());
+    write(
+        &file,
+        &serde_json::json!({ "anthropic": claude }).to_string(),
+    );
     let snapshot = accounts
-        .add_api_key(HarnessId::Pi, "anthropic", "sk-ant-api03-ZEROTESTkeyLOCK0000", None)
+        .add_api_key(
+            HarnessId::Pi,
+            "anthropic",
+            "sk-ant-api03-ZEROTESTkeyLOCK0000",
+            None,
+        )
         .await
         .unwrap();
     let key_row = rows(&snapshot, HarnessId::Pi)
         .into_iter()
         .find(|a| a.auth_kind == Some(AgentAuthKind::ApiKey))
         .unwrap();
-    let err = accounts.activate(HarnessId::Pi, &key_row.id).await.unwrap_err();
-    assert!(err.to_string().contains("Couldn't confirm the login in use"), "{err}");
+    let err = accounts
+        .activate(HarnessId::Pi, &key_row.id)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Couldn't confirm the login in use"),
+        "{err}"
+    );
     // The login no slot holds is still Pi's, untouched.
     let live: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();

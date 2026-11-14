@@ -116,11 +116,11 @@ pub struct RelayedCallback {
 mod api_keys;
 mod kilo;
 mod muse;
-mod pins;
 mod oauth;
-mod registry_login;
+mod pins;
 #[cfg(test)]
 mod provider_tests;
+mod registry_login;
 pub use muse::MuseRunEnvironment;
 pub use pins::{ChatPin, PinHook, PinRunEnvironment};
 mod stores;
@@ -1305,7 +1305,12 @@ impl AgentAccounts {
     /// identified (its profile call rate limited), or it changes between
     /// that and the lock, the switch is refused rather than overwrite a
     /// login no slot holds.
-    async fn swap_keyed(&self, harness: HarnessId, key: &str, slot: &Slot) -> Result<(), EngineError> {
+    async fn swap_keyed(
+        &self,
+        harness: HarnessId,
+        key: &str,
+        slot: &Slot,
+    ) -> Result<(), EngineError> {
         let live = match self.detect_keyed_entry(harness, key).await {
             None => None,
             Some(Some(detected)) => Some(detected),
@@ -2295,9 +2300,7 @@ impl AgentAccounts {
         let browser = None;
         let sign_in_env: Vec<(String, std::ffi::OsString)> = url_file
             .clone()
-            .map(|file| {
-                vec![("ZERON_LOGIN_URL_FILE".to_string(), file.into_os_string())]
-            })
+            .map(|file| vec![("ZERON_LOGIN_URL_FILE".to_string(), file.into_os_string())])
             .unwrap_or_default();
         let home = self.inner.config.antigravity_home.clone();
         let keychain = self.inner.config.antigravity_keychain;
@@ -2495,10 +2498,8 @@ impl AgentAccounts {
     ) -> Result<AgentAccountsSnapshot, EngineError> {
         let key = validate_codex_api_key(raw_key)?;
         let credentials = serde_json::json!({ "OPENAI_API_KEY": key });
-        let detected =
-            parse_codex_auth(credentials.clone()).ok_or_else(|| {
-                EngineError::Other("That key could not be saved — try again.".into())
-            })?;
+        let detected = parse_codex_auth(credentials.clone())
+            .ok_or_else(|| EngineError::Other("That key could not be saved — try again.".into()))?;
         let _ops = self.inner.ops.lock().await;
         self.snapshot_detected(HarnessId::Codex, &detected)?;
         let id = slot_id_for(HarnessId::Codex, &detected.account_key);
@@ -2694,7 +2695,7 @@ impl AgentAccounts {
                 }
                 Some(LoginFlow::Claude { .. } | LoginFlow::ApiKey { .. }) => {
                     return Ok(AgentLoginPoll {
-                code: None,
+                        code: None,
                         status: AgentLoginStatus::Pending,
                         message: None,
                         url: None,
@@ -2809,7 +2810,7 @@ impl AgentAccounts {
                 .register(login_id, port, requester, FLOW_TTL);
         }
         Ok(AgentLoginPoll {
-                code: None,
+            code: None,
             status: AgentLoginStatus::Pending,
             message: message.map(|code| format!("Enter the code {code} when asked.")),
             url,
@@ -2846,14 +2847,14 @@ impl AgentAccounts {
                     });
                 }
                 Some(Ok(())) => AgentLoginPoll {
-                code: None,
+                    code: None,
                     status: AgentLoginStatus::Done,
                     message: None,
                     url: None,
                     callback_port: None,
                 },
                 Some(Err(message)) => AgentLoginPoll {
-                code: None,
+                    code: None,
                     status: AgentLoginStatus::Error,
                     message: Some(zeron_harness::redact::redact_output(message)),
                     url: None,
@@ -2956,7 +2957,10 @@ impl AgentAccounts {
                 let _ = std::fs::remove_dir_all(&home);
             }
             Some(LoginFlow::Task {
-                handle, home, harness, ..
+                handle,
+                home,
+                harness,
+                ..
             }) => {
                 tracing::info!(%login_id, ?harness, "agent sign-in cancelled");
                 handle.abort();
@@ -5564,7 +5568,12 @@ mod tests {
     fn codex_api_key_validation_rejects_junk_without_echoing_it() {
         assert!(validate_codex_api_key("sk-test-12345678abcd").is_ok());
         assert!(validate_codex_api_key("  sk-test-12345678abcd  ").is_ok());
-        for bad in ["sk-short", "not-a-key", "sk-abc def", "pk-test-12345678abcd"] {
+        for bad in [
+            "sk-short",
+            "not-a-key",
+            "sk-abc def",
+            "pk-test-12345678abcd",
+        ] {
             let err = validate_codex_api_key(bad).expect_err("rejects junk");
             let msg = err.to_string();
             assert!(!msg.contains(bad.trim()), "error must not echo the key");
@@ -5599,10 +5608,7 @@ mod tests {
         let accounts = AgentAccounts::new(config.clone());
         // Pin the server to a path that cannot resolve, so the outcome is
         // a fast failure whatever the machine has installed.
-        accounts.override_cli(
-            HarnessId::Antigravity,
-            dir.path().join("no-such-server"),
-        );
+        accounts.override_cli(HarnessId::Antigravity, dir.path().join("no-such-server"));
         let start = accounts
             .start_login(HarnessId::Antigravity)
             .await
@@ -5622,7 +5628,10 @@ mod tests {
                 assert!(poll.message.is_some());
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "sign-in never failed");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sign-in never failed"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!home.exists(), "throwaway login home is reaped");
@@ -7145,9 +7154,15 @@ mod snapshot_watch_tests {
         assert!(watch.has_changed().unwrap());
         assert_eq!(watch.borrow_and_update().as_ref(), Some(&listed));
         let text = serde_json::to_string(&listed).unwrap();
-        assert!(!text.contains("\"at\"") && !text.contains("\"rt\""), "no credential in a snapshot: {text}");
+        assert!(
+            !text.contains("\"at\"") && !text.contains("\"rt\""),
+            "no credential in a snapshot: {text}"
+        );
         // (A live login is saved again at each list: not a change.)
         accounts.list(false).await.unwrap();
-        assert!(!watch.has_changed().unwrap(), "the same snapshot again isn't a change");
+        assert!(
+            !watch.has_changed().unwrap(),
+            "the same snapshot again isn't a change"
+        );
     }
 }

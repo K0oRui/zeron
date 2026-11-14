@@ -1717,7 +1717,7 @@ impl EngineRpc {
                         {
                             self.cancel_remote_login(target, &login_id).await;
                             return RpcReply::value(&AgentLoginPoll {
-            code: None,
+                                code: None,
                                 status: AgentLoginStatus::Error,
                                 message: Some(error.to_string()),
                                 url: None,
@@ -1768,7 +1768,10 @@ impl EngineRpc {
     ) -> Result<RpcReply, RpcError> {
         const RETRY: std::time::Duration = std::time::Duration::from_millis(500);
         const ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
-        let first = match self.forward(&target, methods::UPDATE_STATUS, params.clone()).await? {
+        let first = match self
+            .forward(&target, methods::UPDATE_STATUS, params.clone())
+            .await?
+        {
             RpcReply::Stream(stream) => stream,
             value @ RpcReply::Value(_) => return Ok(value),
         };
@@ -1796,8 +1799,9 @@ impl EngineRpc {
                     } else {
                         tokio::time::sleep(RETRY).await;
                     }
-                    if let Ok(RpcReply::Stream(stream)) =
-                        rpc.forward(&target, methods::UPDATE_STATUS, params.clone()).await
+                    if let Ok(RpcReply::Stream(stream)) = rpc
+                        .forward(&target, methods::UPDATE_STATUS, params.clone())
+                        .await
                     {
                         current = Some(stream);
                     }
@@ -2239,7 +2243,9 @@ impl EngineRpc {
                     self.doc_host.purge_chat(child);
                 }
                 if on_cloud {
-                    self.delete_cloud_machines(std::iter::once(chat_id).chain(cloud_children).collect());
+                    self.delete_cloud_machines(
+                        std::iter::once(chat_id).chain(cloud_children).collect(),
+                    );
                 }
                 Ok(())
             }
@@ -2263,7 +2269,8 @@ impl EngineRpc {
                     || row.as_ref().is_some_and(|d| {
                         zeron_proto::is_cloud_device(&d.id, &d.platform)
                             || d.capabilities.iter().any(|c| {
-                                c == zeron_proto::CLOUD_SESSION_CAPABILITY || c == zeron_proto::CLOUD_ACCOUNT_CAPABILITY
+                                c == zeron_proto::CLOUD_SESSION_CAPABILITY
+                                    || c == zeron_proto::CLOUD_ACCOUNT_CAPABILITY
                             })
                     });
                 if cloud {
@@ -2711,11 +2718,17 @@ where
 /// Whether a watch asked for changes only (`{"changes": true}`): opt-in,
 /// so older viewports keep the whole list on every change.
 fn wants_changes(params: &serde_json::Value) -> bool {
-    params.get("changes").and_then(|v| v.as_bool()).unwrap_or(false)
+    params
+        .get("changes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// What a keyed list stream last sent: its keys in order, and each row.
-type SentRows = (Vec<String>, std::collections::HashMap<String, serde_json::Value>);
+type SentRows = (
+    Vec<String>,
+    std::collections::HashMap<String, serde_json::Value>,
+);
 
 /// A list of rows keyed by `key` (`id`, or a session's `chatId`) as change
 /// frames: the whole list first, as [`watch_stream`] sends it; then, per
@@ -2728,35 +2741,53 @@ type SentRows = (Vec<String>, std::collections::HashMap<String, serde_json::Valu
 /// The whole chat list is ~0.4 MB with a few hundred chats, and one field
 /// of one row (a seen mark, a heartbeat) changing sent and parsed it all,
 /// in every window on every device.
-fn keyed_changes_stream<T>(rx: watch::Receiver<Vec<T>>, key: &'static str) -> BoxStream<'static, serde_json::Value>
+fn keyed_changes_stream<T>(
+    rx: watch::Receiver<Vec<T>>,
+    key: &'static str,
+) -> BoxStream<'static, serde_json::Value>
 where
     T: serde::Serialize + Send + Sync + 'static,
 {
-    futures::stream::unfold((rx, None::<SentRows>), move |(mut rx, mut last)| async move {
-        loop {
-            if last.is_some() {
-                rx.changed().await.ok()?;
+    futures::stream::unfold(
+        (rx, None::<SentRows>),
+        move |(mut rx, mut last)| async move {
+            loop {
+                if last.is_some() {
+                    rx.changed().await.ok()?;
+                }
+                let rows: Vec<serde_json::Value> = {
+                    let borrowed = rx.borrow_and_update();
+                    borrowed
+                        .iter()
+                        .filter_map(|row| serde_json::to_value(row).ok())
+                        .collect()
+                };
+                let (frame, sent) = keyed_frame(rows, key, last.take());
+                last = Some(sent);
+                if let Some(frame) = frame {
+                    return Some((frame, (rx, last)));
+                }
             }
-            let rows: Vec<serde_json::Value> = {
-                let borrowed = rx.borrow_and_update();
-                borrowed.iter().filter_map(|row| serde_json::to_value(row).ok()).collect()
-            };
-            let (frame, sent) = keyed_frame(rows, key, last.take());
-            last = Some(sent);
-            if let Some(frame) = frame {
-                return Some((frame, (rx, last)));
-            }
-        }
-    })
+        },
+    )
     .boxed()
 }
 
 /// `rows` as the frame that follows `last` (`None`: nothing changed), and
 /// what's been sent once it is. No `last`: the whole list.
-fn keyed_frame(rows: Vec<serde_json::Value>, key: &str, last: Option<SentRows>) -> (Option<serde_json::Value>, SentRows) {
+fn keyed_frame(
+    rows: Vec<serde_json::Value>,
+    key: &str,
+    last: Option<SentRows>,
+) -> (Option<serde_json::Value>, SentRows) {
     let keys: Vec<String> = rows
         .iter()
-        .map(|row| row.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_owned())
+        .map(|row| {
+            row.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
         .collect();
     let Some((last_keys, mut last_rows)) = last else {
         let by_key = keys.iter().cloned().zip(rows.iter().cloned()).collect();
@@ -2770,7 +2801,10 @@ fn keyed_frame(rows: Vec<serde_json::Value>, key: &str, last: Option<SentRows>) 
         }
         now_rows.insert(k.clone(), row);
     }
-    let removed: Vec<&String> = last_keys.iter().filter(|k| !now_rows.contains_key(*k)).collect();
+    let removed: Vec<&String> = last_keys
+        .iter()
+        .filter(|k| !now_rows.contains_key(*k))
+        .collect();
     // (The order applying the rest gives: the rows kept where they were,
     // new ones after. Sent only when the list's isn't that.)
     let kept = last_keys.iter().filter(|k| now_rows.contains_key(*k));
@@ -2806,7 +2840,10 @@ fn doc_messages_stream_from(
     rx: watch::Receiver<crate::doc_host::TranscriptSnapshot>,
     doc: std::sync::Arc<zeron_doc::SessionDoc>,
     options: zeron_doc::DiffOptions,
-    start: Option<(crate::doc_host::TranscriptSnapshot, zeron_doc::TranscriptBaseline)>,
+    start: Option<(
+        crate::doc_host::TranscriptSnapshot,
+        zeron_doc::TranscriptBaseline,
+    )>,
 ) -> BoxStream<'static, serde_json::Value> {
     use zeron_doc::transcript_delta::{TranscriptFrame, diff_transcript_with};
     let (prev, baseline) = match start {
@@ -3112,7 +3149,11 @@ impl RpcService for AuthRpc {
                             "error": error.code(),
                             "message": error.to_string(),
                         });
-                        if let crate::auth::DeleteAccountError::Refused { organization: Some(org), .. } = &error {
+                        if let crate::auth::DeleteAccountError::Refused {
+                            organization: Some(org),
+                            ..
+                        } = &error
+                        {
                             reply["organization"] = serde_json::json!(org);
                         }
                         RpcReply::value(&reply)
@@ -3223,9 +3264,11 @@ impl RpcService for EngineRpc {
             let target = target.to_string();
             // A file on this device can't be read there: another device
             // installs from a link.
-            if method == methods::INSTALL_PLUGIN && params.get("path").is_some_and(|p| !p.is_null()) {
+            if method == methods::INSTALL_PLUGIN && params.get("path").is_some_and(|p| !p.is_null())
+            {
                 return Err(RpcError::BadParams(
-                    "Another device installs a plugin from a link (url), not a file on this one".into(),
+                    "Another device installs a plugin from a link (url), not a file on this one"
+                        .into(),
                 ));
             }
             // What only that device may answer for itself (credentials,
@@ -3240,7 +3283,9 @@ impl RpcService for EngineRpc {
             // agent's token (which can't call them here either).
             if zeron_rpc::app_forward_only(method, &params) {
                 if !zeron_rpc::caller().is_local() {
-                    return Err(crate::plugins::reviews::needed("Allowing a plugin on another device"));
+                    return Err(crate::plugins::reviews::needed(
+                        "Allowing a plugin on another device",
+                    ));
                 }
                 let reply = self.forward(&target, method, params).await;
                 return reply.map_err(|error| remote_plugins::older_engine(&target, method, error));
@@ -3457,7 +3502,9 @@ impl RpcService for EngineRpc {
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let context = if p.harness == HarnessId::Kilo {
-                    harness.model_context().map_err(|e| RpcError::Failed(e.to_string()))?
+                    harness
+                        .model_context()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
                 } else {
                     None
                 };
@@ -3792,9 +3839,19 @@ impl RpcService for EngineRpc {
                     session: Option<String>,
                 }
                 let p: Params = parse_params(params)?;
-                let title: String = p.title.lines().next().unwrap_or_default().trim().chars().take(120).collect();
+                let title: String = p
+                    .title
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(120)
+                    .collect();
                 if title.is_empty() || p.source.is_empty() {
-                    return Err(RpcError::BadParams("A notification needs a title and who asked".into()));
+                    return Err(RpcError::BadParams(
+                        "A notification needs a title and who asked".into(),
+                    ));
                 }
                 let outcome = crate::desktop_notify::post_for(
                     self.repos.data_dir(),
@@ -3865,7 +3922,8 @@ impl RpcService for EngineRpc {
                 let open_started = std::time::Instant::now();
                 let chat_for_log = p.chat_id.clone();
                 let stream = if let Some(known) = known {
-                    since_doc_messages_stream(self.doc_host.clone(), p.chat_id, options, known).await?
+                    since_doc_messages_stream(self.doc_host.clone(), p.chat_id, options, known)
+                        .await?
                 } else if opening_tail {
                     opening_doc_messages_stream(self.doc_host.clone(), p.chat_id, options).await?
                 } else {
@@ -4018,10 +4076,11 @@ impl RpcService for EngineRpc {
                 if p.task_ids.is_empty() || p.task_ids.len() > 20 {
                     return Err(RpcError::BadParams("name 1 to 20 task ids".into()));
                 }
-                match self
-                    .sessions
-                    .await_background(&p.chat_id, &p.task_ids, p.waiting.unwrap_or(true))
-                {
+                match self.sessions.await_background(
+                    &p.chat_id,
+                    &p.task_ids,
+                    p.waiting.unwrap_or(true),
+                ) {
                     Ok(outcome) => RpcReply::value(&serde_json::json!({
                         "matched": outcome.matched,
                         "unmatched": outcome.unmatched,
@@ -4611,7 +4670,9 @@ impl RpcService for EngineRpc {
                     ));
                 }
                 if !crate::source_control::valid_comment_body(&p.body) {
-                    return Err(RpcError::BadParams("Comment must contain 1–60000 bytes".into()));
+                    return Err(RpcError::BadParams(
+                        "Comment must contain 1–60000 bytes".into(),
+                    ));
                 }
                 let comment = self
                     .github
@@ -4636,7 +4697,9 @@ impl RpcService for EngineRpc {
                 }
                 if method == methods::REPLY_CHANGE_REQUEST_THREAD {
                     if !crate::source_control::valid_comment_body(&p.body) {
-                        return Err(RpcError::BadParams("Comment must contain 1–60000 bytes".into()));
+                        return Err(RpcError::BadParams(
+                            "Comment must contain 1–60000 bytes".into(),
+                        ));
                     }
                     let comment = self
                         .github
@@ -4645,7 +4708,9 @@ impl RpcService for EngineRpc {
                         .map_err(change_request_rpc_error)?;
                     return RpcReply::value(&comment);
                 }
-                let resolved = p.resolved.ok_or_else(|| RpcError::BadParams("resolved: true or false".into()))?;
+                let resolved = p
+                    .resolved
+                    .ok_or_else(|| RpcError::BadParams("resolved: true or false".into()))?;
                 let now = self
                     .github
                     .set_thread_resolved(&p.url, &p.thread, resolved)
@@ -5710,8 +5775,7 @@ impl RpcService for EngineRpc {
                 // (Never `parse_params`'s error: it can quote the input.)
                 let p: AddAgentApiKeyParams = serde_json::from_value(params)
                     .map_err(|_| RpcError::BadParams("expected {harness, provider, key}".into()))?;
-                if p
-                    .target_device_id
+                if p.target_device_id
                     .as_deref()
                     .is_some_and(|target| !target.is_empty() && target != self.doc_host.device_id())
                 {
@@ -5886,12 +5950,12 @@ impl RpcService for EngineRpc {
                     .map_err(|e| match e {
                         E::NotACommand | E::BadOffset => RpcError::BadParams(e.to_string()),
                         // Stable codes: a client words these for its reader.
-                        E::NotAvailable => RpcError::Capability(
-                            capability_errors::TOOL_OUTPUT_UNAVAILABLE.into(),
-                        ),
-                        E::NotFinished => RpcError::Capability(
-                            capability_errors::TOOL_OUTPUT_NOT_FINISHED.into(),
-                        ),
+                        E::NotAvailable => {
+                            RpcError::Capability(capability_errors::TOOL_OUTPUT_UNAVAILABLE.into())
+                        }
+                        E::NotFinished => {
+                            RpcError::Capability(capability_errors::TOOL_OUTPUT_NOT_FINISHED.into())
+                        }
                         E::Journal(err) => RpcError::Failed(err.to_string()),
                     })?;
                 RpcReply::value(&chunk)
@@ -6027,13 +6091,26 @@ mod tests {
     use super::*;
 
     /// What a viewport does with a keyed list frame: the list it shows after.
-    fn apply_frame(list: &[serde_json::Value], frame: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
+    fn apply_frame(
+        list: &[serde_json::Value],
+        frame: &serde_json::Value,
+        key: &str,
+    ) -> Vec<serde_json::Value> {
         if let Some(whole) = frame.as_array() {
             return whole.clone();
         }
         let id = |row: &serde_json::Value| row[key].as_str().unwrap_or_default().to_owned();
-        let removed: Vec<&str> = frame["removed"].as_array().unwrap().iter().filter_map(|k| k.as_str()).collect();
-        let mut rows: Vec<serde_json::Value> = list.iter().filter(|row| !removed.contains(&id(row).as_str())).cloned().collect();
+        let removed: Vec<&str> = frame["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k.as_str())
+            .collect();
+        let mut rows: Vec<serde_json::Value> = list
+            .iter()
+            .filter(|row| !removed.contains(&id(row).as_str()))
+            .cloned()
+            .collect();
         for row in frame["changed"].as_array().unwrap() {
             match rows.iter_mut().find(|r| id(r) == id(row)) {
                 Some(slot) => *slot = row.clone(),
@@ -6041,7 +6118,10 @@ mod tests {
             }
         }
         if let Some(order) = frame["order"].as_array() {
-            rows = order.iter().filter_map(|k| rows.iter().find(|r| id(r) == k.as_str().unwrap()).cloned()).collect();
+            rows = order
+                .iter()
+                .filter_map(|k| rows.iter().find(|r| id(r) == k.as_str().unwrap()).cloned())
+                .collect();
         }
         rows
     }
@@ -6073,14 +6153,25 @@ mod tests {
             assert_eq!(&serde_json::Value::Array(shown.clone()), list);
             frames.push(frame);
         }
-        assert!(frames[0].as_ref().unwrap().is_array(), "the whole list first");
-        assert_eq!(frames[1], Some(json!({ "changed": [{ "id": "b", "seen": 2 }], "removed": [] })));
+        assert!(
+            frames[0].as_ref().unwrap().is_array(),
+            "the whole list first"
+        );
+        assert_eq!(
+            frames[1],
+            Some(json!({ "changed": [{ "id": "b", "seen": 2 }], "removed": [] }))
+        );
         assert_eq!(frames[2], None, "nothing changed: nothing sent");
         assert_eq!(
             frames[3],
-            Some(json!({ "changed": [{ "id": "d", "seen": 0 }], "removed": ["b"], "order": ["c", "a", "d"] }))
+            Some(
+                json!({ "changed": [{ "id": "d", "seen": 0 }], "removed": ["b"], "order": ["c", "a", "d"] })
+            )
         );
-        assert_eq!(frames[4], Some(json!({ "changed": [], "removed": ["c", "a", "d"] })));
+        assert_eq!(
+            frames[4],
+            Some(json!({ "changed": [], "removed": ["c", "a", "d"] }))
+        );
     }
 
     /// Without asking, a watch is the whole list, as older viewports read it.
@@ -6158,7 +6249,12 @@ mod tests {
         let rpc = core.rpc_service();
         use zeron_proto::ChildKind;
         for (chat, parent, kind, expected) in [
-            ("sub", Some("main"), Some("subagent"), Some(ChildKind::Subagent)),
+            (
+                "sub",
+                Some("main"),
+                Some("subagent"),
+                Some(ChildKind::Subagent),
+            ),
             ("side", Some("main"), Some("side"), Some(ChildKind::Side)),
             // A person's side chat names none; a newer peer's kind reads as none.
             ("plain-side", Some("main"), None, None),
@@ -6498,26 +6594,44 @@ mod tests {
         let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
             store,
-            DocHostConfig { device_id: "viewer".into(), default_harness: zeron_proto::HarnessId::Mock, edge: None },
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
         );
         let handle = host.open("kept").unwrap();
         for i in 0..300 {
-            handle.write_user_message(&format!("m{i}"), &format!("words {i}"), i).unwrap();
+            handle
+                .write_user_message(&format!("m{i}"), &format!("words {i}"), i)
+                .unwrap();
         }
         // What the reader holds: the whole copy as sent, summed as it holds it.
-        let mut whole = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut whole = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         let sent = whole.next().await.unwrap();
         drop(whole);
         let held: Vec<serde_json::Value> = sent["reset"].as_array().unwrap().clone();
         let known: Vec<(String, u64)> = held
             .iter()
-            .map(|e| (e["id"].as_str().unwrap().to_owned(), zeron_doc::entry_sum(e)))
+            .map(|e| {
+                (
+                    e["id"].as_str().unwrap().to_owned(),
+                    zeron_doc::entry_sum(e),
+                )
+            })
             .collect();
         // While it was away: one more message.
-        handle.write_user_message("away", "while away", 400).unwrap();
-        let mut stream = since_doc_messages_stream(host.clone(), "kept".into(), Default::default(), known)
-            .await
+        handle
+            .write_user_message("away", "while away", 400)
             .unwrap();
+        let mut stream =
+            since_doc_messages_stream(host.clone(), "kept".into(), Default::default(), known)
+                .await
+                .unwrap();
         let first = stream.next().await.unwrap();
         assert_eq!(first["since"], true);
         assert!(first.get("reset").is_none(), "a delta, not the whole copy");
@@ -6525,7 +6639,13 @@ mod tests {
         assert_eq!(upserts.len(), 1);
         assert_eq!(upserts[0]["entry"]["id"], "away");
         assert_eq!(first["count"], 301);
-        let ids: Vec<String> = handle.doc().read_entries().unwrap().into_iter().map(|e| e.id).collect();
+        let ids: Vec<String> = handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
         assert_eq!(
             first["orderSum"].as_u64(),
             Some(zeron_doc::order_sum(ids.iter().map(String::as_str))),
@@ -6534,7 +6654,10 @@ mod tests {
         assert!(serde_json::to_string(&first).unwrap().len() < 4_000);
         // Then live changes, as deltas.
         handle.write_user_message("next", "after", 500).unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(5), stream.next()).await.unwrap().unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(next["upsert"][0]["entry"]["id"], "next");
         assert_eq!(next["count"], 302);
     }
@@ -6691,7 +6814,10 @@ mod tests {
         // not served to a peer through the relay, not an agent's to call.
         assert!(!forwardable(methods::ADD_AGENT_API_KEY));
         assert!(zeron_rpc::local_only(methods::ADD_AGENT_API_KEY));
-        assert!(zeron_rpc::peer_refused(methods::ADD_AGENT_API_KEY, &serde_json::json!({})));
+        assert!(zeron_rpc::peer_refused(
+            methods::ADD_AGENT_API_KEY,
+            &serde_json::json!({})
+        ));
         assert!(!zeron_rpc::agent_allowed(methods::ADD_AGENT_API_KEY));
         // Per-provider account actions do travel, provider and all.
         assert!(forwardable(methods::START_AGENT_LOGIN));
@@ -7003,7 +7129,11 @@ mod context_usage_tests {
         let handle = host.open("replay-chat").unwrap();
         let sink = crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "replay-chat")
             .with_handle(Arc::downgrade(&handle));
-        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut stream = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         let first: zeron_doc::TranscriptUpdate =
             serde_json::from_value(stream.next().await.unwrap()).unwrap();
         assert!(first.replay_baseline.unwrap().entries.is_empty());
@@ -7099,7 +7229,11 @@ mod context_usage_tests {
             update.replay_baseline.is_none(),
             "live updates must not resend the history watermark"
         );
-        let mut reopened = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut reopened = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         let opening: zeron_doc::TranscriptUpdate =
             serde_json::from_value(reopened.next().await.unwrap()).unwrap();
         assert_eq!(
@@ -7127,7 +7261,11 @@ mod context_usage_tests {
         let handle = host.open("interleaved").unwrap();
         let sink = crate::chat2_host::EngineChatSink::new(&handle.doc_arc(), store, "interleaved")
             .with_handle(Arc::downgrade(&handle));
-        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut stream = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         stream.next().await.unwrap();
         let source = zeron_doc::SessionDoc::init("interleaved").unwrap();
         sink.apply_checkpoint(&source.export_snapshot().unwrap(), 0)
@@ -7218,7 +7356,11 @@ mod context_usage_tests {
             .unwrap();
         // Cached content exists before the first watcher and never enters
         // the changed-parts tracker. It may not have been painted yet.
-        let mut first = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut first = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         let opening: zeron_doc::TranscriptUpdate =
             serde_json::from_value(first.next().await.unwrap()).unwrap();
         assert_eq!(
@@ -7239,7 +7381,11 @@ mod context_usage_tests {
         assert!(update.replay_baseline.is_none());
         // A later subscriber sees a longer historical prefix, but must not
         // change the first subscriber's ongoing live animation.
-        let mut second = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut second = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         let opening: zeron_doc::TranscriptUpdate =
             serde_json::from_value(second.next().await.unwrap()).unwrap();
         assert_eq!(
@@ -7303,7 +7449,11 @@ mod context_usage_tests {
             id: "body".into(),
             text: text.into(),
         };
-        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut stream = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         stream.next().await.unwrap();
         writer.sync(&[part("live")]).unwrap();
         sink.apply_row(&source.export_snapshot().unwrap(), 1);
@@ -7314,7 +7464,11 @@ mod context_usage_tests {
                 .unwrap();
         drop(stream);
         // No unwatched commit clears provenance before the new attach.
-        let mut stream = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut stream = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         stream.next().await.unwrap();
         writer.sync(&[part("live plus recovered")]).unwrap();
         sink.apply_replay_row(&source.export_snapshot().unwrap(), 2);
@@ -7368,14 +7522,20 @@ mod context_usage_tests {
         sink.apply_row(&source.export_snapshot().unwrap(), 1);
         let options = zeron_doc::DiffOptions { part_patches: true };
         let mut patched = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), options);
-        let mut whole = doc_messages_stream(handle.watch_messages(), handle.doc_arc(), Default::default());
+        let mut whole = doc_messages_stream(
+            handle.watch_messages(),
+            handle.doc_arc(),
+            Default::default(),
+        );
         async fn next(stream: &mut BoxStream<'static, serde_json::Value>) -> serde_json::Value {
             tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
                 .await
                 .unwrap()
                 .unwrap()
         }
-        let read = |value: serde_json::Value| serde_json::from_value::<zeron_doc::TranscriptUpdate>(value).unwrap();
+        let read = |value: serde_json::Value| {
+            serde_json::from_value::<zeron_doc::TranscriptUpdate>(value).unwrap()
+        };
         let (mut a, mut b) = (vec![], vec![]);
         zeron_doc::apply_transcript_frame(&mut a, read(next(&mut patched).await).frame).unwrap();
         zeron_doc::apply_transcript_frame(&mut b, read(next(&mut whole).await).frame).unwrap();
@@ -7385,8 +7545,18 @@ mod context_usage_tests {
         writer.sync(&calls).unwrap();
         sink.apply_row(&source.export_snapshot().unwrap(), 2);
         let value = next(&mut patched).await;
-        assert!(value.get("upsert").is_none_or(|u| u.as_array().is_some_and(Vec::is_empty)), "{value}");
-        let ids: Vec<_> = value["parts"].as_array().unwrap().iter().map(|p| p["part"]["id"].as_str().unwrap().to_owned()).collect();
+        assert!(
+            value
+                .get("upsert")
+                .is_none_or(|u| u.as_array().is_some_and(Vec::is_empty)),
+            "{value}"
+        );
+        let ids: Vec<_> = value["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["part"]["id"].as_str().unwrap().to_owned())
+            .collect();
         assert_eq!(ids, ["t40", "t41"]);
         zeron_doc::apply_transcript_frame(&mut a, read(value).frame).unwrap();
         let value = next(&mut whole).await;

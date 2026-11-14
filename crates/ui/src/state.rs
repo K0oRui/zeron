@@ -613,7 +613,8 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces, sort_tabs,
+    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces,
+    sort_tabs,
 };
 
 /// What a session row shows that ticks with the clock rather than with its
@@ -2277,7 +2278,12 @@ impl AppState {
             .iter()
             .rev()
             .find(|entry| entry.role == user)
-            .or_else(|| self.transcript.iter().rev().find(|entry| entry.role == user))?;
+            .or_else(|| {
+                self.transcript
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.role == user)
+            })?;
         let setup_id = zeron_proto::cloud_setup_entry_id(&message.id);
         let setup = self
             .pending_echoes()
@@ -2442,7 +2448,10 @@ impl AppState {
             let Some(message_id) = send.message_id.as_deref() else {
                 continue;
             };
-            if self.echoes.get(&send.chat_id).is_some_and(|e| e.iter().any(|e| e.id == message_id))
+            if self
+                .echoes
+                .get(&send.chat_id)
+                .is_some_and(|e| e.iter().any(|e| e.id == message_id))
             {
                 continue;
             }
@@ -2487,7 +2496,10 @@ impl AppState {
     /// The chat's send the engine still holds (its files uploading, or failed),
     /// which Remove applies to: a failed one first, then the oldest.
     pub fn removable_held_send(&self, chat_id: &str) -> Option<&zeron_proto::HeldSendStatus> {
-        let mut held = self.held_sends.iter().filter(|send| send.chat_id == chat_id);
+        let mut held = self
+            .held_sends
+            .iter()
+            .filter(|send| send.chat_id == chat_id);
         held.clone()
             .find(|send| send.failure.is_some())
             .or_else(|| held.next())
@@ -3078,9 +3090,10 @@ impl AppState {
 
     pub fn cloud_enabled(&self) -> bool {
         self.cloud_offered()
-            && (self.cloud_status
-            .as_ref()
-            .is_some_and(crate::cloud::account_enabled)
+            && (self
+                .cloud_status
+                .as_ref()
+                .is_some_and(crate::cloud::account_enabled)
                 || self.cloud_account_device().is_some())
     }
 
@@ -5413,7 +5426,9 @@ mod row_model_key {
             self.harness_session_cwd.hash(hasher);
             self.harness_session_harness.hash(hasher);
             self.space_id.hash(hasher);
-            self.last_seen_at.map(|at| at.timestamp_micros()).hash(hasher);
+            self.last_seen_at
+                .map(|at| at.timestamp_micros())
+                .hash(hasher);
             self.room_gen.hash(hasher);
             self.parent_chat_id.hash(hasher);
         }
@@ -6108,9 +6123,12 @@ mod tests {
         // The app's onboarding wait sees it as still waiting, not failed.
         let mut deferred = handle.deferred_state().expect("embedded lifecycle");
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), wait_for_deferred_engine(&mut deferred))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                wait_for_deferred_engine(&mut deferred)
+            )
+            .await
+            .is_err(),
             "onboarding is a wait, never an error"
         );
 
@@ -6134,7 +6152,12 @@ mod tests {
         // What this app asks during onboarding waits, never errors: its
         // watch streams and data calls. Only plugin and template calls (which
         // this app never makes) answer `setup_incomplete` at once.
-        for method in [methods::WATCH_CHATS, methods::WATCH_DEVICES, methods::WATCH_SPACES, methods::WATCH_SESSIONS] {
+        for method in [
+            methods::WATCH_CHATS,
+            methods::WATCH_DEVICES,
+            methods::WATCH_SPACES,
+            methods::WATCH_SESSIONS,
+        ] {
             assert!(
                 tokio::time::timeout(
                     std::time::Duration::from_millis(100),
@@ -6147,12 +6170,17 @@ mod tests {
         }
         let auth = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            handle.client().subscribe(methods::AUTH_STATUS, serde_json::json!({})),
+            handle
+                .client()
+                .subscribe(methods::AUTH_STATUS, serde_json::json!({})),
         )
         .await
         .expect("AuthStatus answers during onboarding");
         assert!(auth.is_ok(), "{:?}", auth.err());
-        let plugins = handle.client().call(methods::LIST_PLUGINS, serde_json::json!({})).await;
+        let plugins = handle
+            .client()
+            .call(methods::LIST_PLUGINS, serde_json::json!({}))
+            .await;
         assert!(
             matches!(&plugins, Err(RpcError::Capability(code)) if code == "setup_incomplete"),
             "{plugins:?}"
@@ -7260,7 +7288,10 @@ mod tests {
         let mut s = AppState::new();
         let now = chrono::Utc::now();
         s.begin_pending_send("c", "m-a", now);
-        s.apply_held_sends(vec![held_send("a", None), held_send("b", Some("too large"))]);
+        s.apply_held_sends(vec![
+            held_send("a", None),
+            held_send("b", Some("too large")),
+        ]);
         // The failed one is offered first.
         assert_eq!(s.removable_held_send("c").map(|h| h.id.as_str()), Some("b"));
         assert_eq!(s.removable_held_send("other"), None);
@@ -7282,7 +7313,10 @@ mod tests {
         let mut row = held_send("r", None);
         row.queue_row = true;
         s.apply_held_sends(vec![row]);
-        assert!(s.echoes["c"].iter().any(|e| e.id == "m-r"), "visible while it uploads");
+        assert!(
+            s.echoes["c"].iter().any(|e| e.id == "m-r"),
+            "visible while it uploads"
+        );
         assert!(!s.send_pending("other", chrono::Utc::now()));
         assert!(
             !s.pending_sends.contains_key("c"),
@@ -7328,7 +7362,10 @@ mod tests {
         let start = chrono::Utc::now();
         s.begin_pending_send("c", "m-a", start);
         assert!(s.apply_held_sends(vec![held_send("a", None)]));
-        assert!(!s.apply_held_sends(vec![held_send("a", None)]), "no change, no redraw");
+        assert!(
+            !s.apply_held_sends(vec![held_send("a", None)]),
+            "no change, no redraw"
+        );
 
         let later = start + chrono::TimeDelta::hours(5);
         assert!(s.send_pending("c", later));
@@ -7354,7 +7391,10 @@ mod tests {
         let now = chrono::Utc::now();
         s.begin_pending_send("c", "m-a", now);
         s.apply_held_sends(vec![held_send("a", Some("the file is too large"))]);
-        assert!(s.send_undelivered("c", now), "right away, no grace to wait out");
+        assert!(
+            s.send_undelivered("c", now),
+            "right away, no grace to wait out"
+        );
         assert_eq!(s.held_send_failure("c"), Some("the file is too large"));
         assert_eq!(s.held_send_failure("other"), None);
 
@@ -7545,13 +7585,21 @@ mod tests {
         // session row says Working yet.
         s.apply_transcript(vec![
             entry("m1", user, None),
-            entry("m1.cloud-setup", assistant, Some(zeron_doc::MessageStatus::Streaming)),
+            entry(
+                "m1.cloud-setup",
+                assistant,
+                Some(zeron_doc::MessageStatus::Streaming),
+            ),
         ]);
         assert_eq!(s.indicator_for("c", now), Indicator::Working);
         // Finished: the session row speaks for itself again.
         s.apply_transcript(vec![
             entry("m1", user, None),
-            entry("m1.cloud-setup", assistant, Some(zeron_doc::MessageStatus::Complete)),
+            entry(
+                "m1.cloud-setup",
+                assistant,
+                Some(zeron_doc::MessageStatus::Complete),
+            ),
         ]);
         assert_ne!(s.indicator_for("c", now), Indicator::Working);
     }
@@ -7642,7 +7690,11 @@ mod tests {
         s.settle_failed_cloud_setups();
         assert_eq!(
             step(&s),
-            ("Couldn't start a machine".into(), true, Some("No room".into()))
+            (
+                "Couldn't start a machine".into(),
+                true,
+                Some("No room".into())
+            )
         );
         assert_eq!(
             s.pending_echoes()[0].status,
@@ -9791,21 +9843,50 @@ mod tests {
         s.transcript_replayed = true;
         s.apply_connectivity_at(connectivity(C::Synced, true, true), t0);
         assert_eq!(s.transcript_loading(t0), None, "a stored chat's room knows");
-        let row = s.chats.iter_mut().find(|chat| chat.id == "c-remote").unwrap();
+        let row = s
+            .chats
+            .iter_mut()
+            .find(|chat| chat.id == "c-remote")
+            .unwrap();
         row.room_gen = Some(zeron_proto::relay_gen::RELAY_ROOM_GEN);
-        assert_eq!(s.transcript_loading(t0), None, "no messages yet: it really is empty");
-        let row = s.chats.iter_mut().find(|chat| chat.id == "c-remote").unwrap();
+        assert_eq!(
+            s.transcript_loading(t0),
+            None,
+            "no messages yet: it really is empty"
+        );
+        let row = s
+            .chats
+            .iter_mut()
+            .find(|chat| chat.id == "c-remote")
+            .unwrap();
         row.last_message_at = Some(t0);
-        assert_eq!(s.transcript_loading(t0), Some(TranscriptLoading::Syncing), "the host can answer");
-        let host = s.chats.iter().find(|chat| chat.id == "c-remote").unwrap().device_id.clone();
+        assert_eq!(
+            s.transcript_loading(t0),
+            Some(TranscriptLoading::Syncing),
+            "the host can answer"
+        );
+        let host = s
+            .chats
+            .iter()
+            .find(|chat| chat.id == "c-remote")
+            .unwrap()
+            .device_id
+            .clone();
         let away = t0 + TimeDelta::days(1);
         for device in s.devices.iter_mut().filter(|device| device.id == host) {
             device.last_seen_at = Some(t0);
         }
         s.apply_connectivity_at(connectivity(C::Synced, true, true), away);
-        assert_eq!(s.transcript_loading(away), Some(TranscriptLoading::HostAway));
+        assert_eq!(
+            s.transcript_loading(away),
+            Some(TranscriptLoading::HostAway)
+        );
         s.transcript = vec![user_entry("m")];
-        assert_eq!(s.transcript_loading(away), None, "what's stored here always shows");
+        assert_eq!(
+            s.transcript_loading(away),
+            None,
+            "what's stored here always shows"
+        );
     }
 }
 

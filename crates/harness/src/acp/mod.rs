@@ -1461,7 +1461,10 @@ fn auth_methods(initialized: &Value) -> Vec<AuthMethodInfo> {
         .into_iter()
         .flatten()
         .filter_map(|m| {
-            let id = m.get("id").and_then(Value::as_str).filter(|id| !id.is_empty() && id.len() <= 128)?;
+            let id = m
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.len() <= 128)?;
             let kind = m
                 .get("type")
                 .and_then(Value::as_str)
@@ -1474,7 +1477,9 @@ fn auth_methods(initialized: &Value) -> Vec<AuthMethodInfo> {
             // An agent method that says it's a key read from the environment
             // (Factory Droid's "…set in the FACTORY_API_KEY environment
             // variable"): a key to paste, as an `env_var` method is.
-            let named_var = (kind == "agent").then(|| description.and_then(env_var_named)).flatten();
+            let named_var = (kind == "agent")
+                .then(|| description.and_then(env_var_named))
+                .flatten();
             let kind = if named_var.is_some() { "env_var" } else { kind };
             let vars = match m.get("vars").and_then(Value::as_array) {
                 Some(vars) => vars
@@ -1492,8 +1497,15 @@ fn auth_methods(initialized: &Value) -> Vec<AuthMethodInfo> {
             };
             Some(AuthMethodInfo {
                 id: id.to_owned(),
-                name: m.get("name").and_then(Value::as_str).unwrap_or(id).to_owned(),
-                description: m.get("description").and_then(Value::as_str).map(str::to_owned),
+                name: m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                description: m
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 kind: kind.to_owned(),
                 vars,
                 link: m
@@ -1534,7 +1546,10 @@ fn account_in(meta: Option<&Value>) -> Option<String> {
             for (key, v) in object {
                 let key = key.to_ascii_lowercase().replace(['_', '-'], "");
                 if (key == want || key == format!("{want}email") || key == format!("{want}name"))
-                    && let Some(text) = v.as_str().map(str::trim).filter(|t| !t.is_empty() && t.len() <= 200)
+                    && let Some(text) = v
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && t.len() <= 200)
                 {
                     return Some(text.to_owned());
                 }
@@ -1566,7 +1581,11 @@ fn choose_auth_method(initialized: &Value, wanted: Option<&str>) -> Option<AuthM
             .unwrap_or("agent");
         // (A key it reads from its environment isn't signed in this way:
         // it's pasted, and kept in the agent's environment.)
-        let reads_a_key = m.get("description").and_then(Value::as_str).and_then(env_var_named).is_some();
+        let reads_a_key = m
+            .get("description")
+            .and_then(Value::as_str)
+            .and_then(env_var_named)
+            .is_some();
         match kind {
             "agent" if reads_a_key && wanted.is_none() => None,
             "agent" => Some(AuthMethod::Agent(id.to_owned())),
@@ -1581,7 +1600,12 @@ fn choose_auth_method(initialized: &Value, wanted: Option<&str>) -> Option<AuthM
                 let args = spec
                     .get("args")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let env = spec
                     .get("env")
@@ -1712,10 +1736,7 @@ fn sign_in_url(line: &str) -> Option<String> {
 /// [`AcpHarness::resolve_program`]).
 enum Launch {
     Program(PathBuf, Vec<String>),
-    Archive {
-        entry: PathBuf,
-        args: Vec<String>,
-    },
+    Archive { entry: PathBuf, args: Vec<String> },
 }
 
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
@@ -2027,7 +2048,10 @@ impl AcpHarness {
         on_progress: impl Fn(SignInProgress) + Send + Sync + 'static,
     ) -> Result<(), HarnessError> {
         let SignInOptions {
-            browser, method, env, ..
+            browser,
+            method,
+            env,
+            ..
         } = options;
         let display_name = self.spec.display_name;
         let on_progress: std::sync::Arc<dyn Fn(SignInProgress) + Send + Sync> =
@@ -2100,7 +2124,12 @@ impl AcpHarness {
         params["clientCapabilities"]["_meta"]["terminal-auth"] = json!(true);
         // A page it asks to have opened (`elicitation/create`, `url` mode).
         params["clientCapabilities"]["elicitation"] = json!({ "url": {} });
-        let initialized = match tokio::time::timeout(self.handshake_timeout, client.request("initialize", params)).await {
+        let initialized = match tokio::time::timeout(
+            self.handshake_timeout,
+            client.request("initialize", params),
+        )
+        .await
+        {
             Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 client.close_stdin_for_teardown();
@@ -2110,14 +2139,18 @@ impl AcpHarness {
             Err(_) => {
                 client.close_stdin_for_teardown();
                 shutdown_child(&mut child, self.kill_grace).await;
-                return Err(HarnessError::Protocol(format!("{display_name} didn't start its sign-in")));
+                return Err(HarnessError::Protocol(format!(
+                    "{display_name} didn't start its sign-in"
+                )));
             }
         };
         let chosen = choose_auth_method(&initialized, method.as_deref());
         let Some(chosen) = chosen else {
             client.close_stdin_for_teardown();
             shutdown_child(&mut child, self.kill_grace).await;
-            return Err(HarnessError::Protocol(format!("{display_name} offers no sign-in")));
+            return Err(HarnessError::Protocol(format!(
+                "{display_name} offers no sign-in"
+            )));
         };
         // How it signs in through its own command, if it does: a terminal
         // method, else, for an agent that says it signs in in a terminal
@@ -2146,8 +2179,14 @@ impl AcpHarness {
                 .and_then(crate::acp_registry::record)
                 .map(|r| r.args)
                 .unwrap_or_default();
-            let keep = if args.ends_with(&acp_args) { args.len() - acp_args.len() } else { args.len() };
-            std::iter::once(exe.display().to_string()).chain(args[..keep].iter().cloned()).collect()
+            let keep = if args.ends_with(&acp_args) {
+                args.len() - acp_args.len()
+            } else {
+                args.len()
+            };
+            std::iter::once(exe.display().to_string())
+                .chain(args[..keep].iter().cloned())
+                .collect()
         };
         match chosen {
             AuthMethod::Agent(id) => {
@@ -2157,7 +2196,9 @@ impl AcpHarness {
                 // its device code in that answer, and its `authenticate`
                 // then opens the page and waits for the pairing).
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                let can_log_out = initialized.pointer("/agentCapabilities/auth/logout").is_some();
+                let can_log_out = initialized
+                    .pointer("/agentCapabilities/auth/logout")
+                    .is_some();
                 let pages = on_progress.clone();
                 let on_page = move |url: String| pages(SignInProgress::OpenBrowser(url));
                 let on_page: &(dyn Fn(String) + Send + Sync) = &on_page;
@@ -2215,9 +2256,11 @@ impl AcpHarness {
                                 AccessMode::FullAccess,
                                 "session/new",
                                 json!({ "cwd": home, "mcpServers": [] }),
-                            Some(on_page),
+                                Some(on_page),
                             );
-                            match tokio::time::timeout(self.model_discovery_timeout * 3, probe).await {
+                            match tokio::time::timeout(self.model_discovery_timeout * 3, probe)
+                                .await
+                            {
                                 Ok(Err(error)) if still_signed_out(&error) => Err(error),
                                 // Started, or failed for another reason than
                                 // sign-in (its models, its network): signed in.
@@ -2244,7 +2287,10 @@ impl AcpHarness {
                         json!({}),
                         Some(on_page),
                     );
-                    if !matches!(tokio::time::timeout(SIGN_OUT_TIMEOUT, logout).await, Ok(Ok(_))) {
+                    if !matches!(
+                        tokio::time::timeout(SIGN_OUT_TIMEOUT, logout).await,
+                        Ok(Ok(_))
+                    ) {
                         break;
                     }
                 }
@@ -2254,10 +2300,15 @@ impl AcpHarness {
                     Ok(()) => Ok(()),
                     Err(error) if still_signed_out(&error) => match terminal_method {
                         Some(method) => {
-                            self.terminal_sign_in(method, &exe, &args, &command, &on_progress).await
+                            self.terminal_sign_in(method, &exe, &args, &command, &on_progress)
+                                .await
                         }
                         None if signs_in_in_terminal => {
-                            let line = own_cli().iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+                            let line = own_cli()
+                                .iter()
+                                .map(|a| shell_quote(a))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             Err(HarnessError::Protocol(format!("{NEEDS_TERMINAL}{line}")))
                         }
                         None => Err(HarnessError::Protocol(format!(
@@ -2270,7 +2321,8 @@ impl AcpHarness {
             terminal @ AuthMethod::Terminal { .. } => {
                 client.close_stdin_for_teardown();
                 shutdown_child(&mut child, self.kill_grace).await;
-                self.terminal_sign_in(terminal, &exe, &args, &command, &on_progress).await
+                self.terminal_sign_in(terminal, &exe, &args, &command, &on_progress)
+                    .await
             }
         }
     }
@@ -2302,7 +2354,9 @@ impl AcpHarness {
             Ok(Err(error)) if still_signed_out(&error) => None,
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                return Err(HarnessError::Protocol(format!("{display_name} didn't say whether it's signed in")));
+                return Err(HarnessError::Protocol(format!(
+                    "{display_name} didn't say whether it's signed in"
+                )));
             }
         };
         let account = signed_in
@@ -2313,7 +2367,9 @@ impl AcpHarness {
         Ok(RegistrySignIn {
             signed_in: signed_in.is_some(),
             account,
-            can_sign_out: initialized.pointer("/agentCapabilities/auth/logout").is_some(),
+            can_sign_out: initialized
+                .pointer("/agentCapabilities/auth/logout")
+                .is_some(),
             methods: auth_methods(&initialized),
         })
     }
@@ -2322,13 +2378,26 @@ impl AcpHarness {
     pub async fn sign_out_registry(&self) -> Result<(), HarnessError> {
         let (mut child, client, mut incoming, initialized) = self.start_registry().await?;
         let display_name = self.spec.display_name;
-        let outcome = if initialized.pointer("/agentCapabilities/auth/logout").is_none() {
-            Err(HarnessError::Protocol(format!("{display_name} doesn't offer signing out")))
+        let outcome = if initialized
+            .pointer("/agentCapabilities/auth/logout")
+            .is_none()
+        {
+            Err(HarnessError::Protocol(format!(
+                "{display_name} doesn't offer signing out"
+            )))
         } else {
-            let logout = request_draining(&client, &mut incoming, AccessMode::FullAccess, "logout", json!({}));
+            let logout = request_draining(
+                &client,
+                &mut incoming,
+                AccessMode::FullAccess,
+                "logout",
+                json!({}),
+            );
             match tokio::time::timeout(SIGN_OUT_TIMEOUT, logout).await {
                 Ok(outcome) => outcome.map(|_| ()),
-                Err(_) => Err(HarnessError::Protocol(format!("{display_name} didn't finish signing out"))),
+                Err(_) => Err(HarnessError::Protocol(format!(
+                    "{display_name} didn't finish signing out"
+                ))),
             }
         };
         client.close_stdin_for_teardown();
@@ -2338,7 +2407,17 @@ impl AcpHarness {
 
     /// A registry agent started and initialized as a sign-in client
     /// (terminal sign-ins offered), its output discarded.
-    async fn start_registry(&self) -> Result<(crate::process::Child, RpcClient, mpsc::Receiver<Incoming>, Value), HarnessError> {
+    async fn start_registry(
+        &self,
+    ) -> Result<
+        (
+            crate::process::Child,
+            RpcClient,
+            mpsc::Receiver<Incoming>,
+            Value,
+        ),
+        HarnessError,
+    > {
         let display_name = self.spec.display_name;
         let (exe, args) = self.resolve_program(false).await?;
         let mut cmd = Command::new(&exe);
@@ -2365,7 +2444,9 @@ impl AcpHarness {
         let mut params = initialize_params(self.spec.id);
         params["clientCapabilities"]["auth"] = json!({ "terminal": true });
         params["clientCapabilities"]["_meta"]["terminal-auth"] = json!(true);
-        match tokio::time::timeout(self.handshake_timeout, client.request("initialize", params)).await {
+        match tokio::time::timeout(self.handshake_timeout, client.request("initialize", params))
+            .await
+        {
             Ok(Ok(initialized)) => Ok((child, client, incoming, initialized)),
             Ok(Err(error)) => {
                 client.close_stdin_for_teardown();
@@ -2375,7 +2456,9 @@ impl AcpHarness {
             Err(_) => {
                 client.close_stdin_for_teardown();
                 shutdown_child(&mut child, self.kill_grace).await;
-                Err(HarnessError::Protocol(format!("{display_name} didn't start")))
+                Err(HarnessError::Protocol(format!(
+                    "{display_name} didn't start"
+                )))
             }
         }
     }
@@ -2392,7 +2475,12 @@ impl AcpHarness {
         on_progress: &std::sync::Arc<dyn Fn(SignInProgress) + Send + Sync>,
     ) -> Result<(), HarnessError> {
         let display_name = self.spec.display_name;
-        let AuthMethod::Terminal { command: own, args: extra, env: extra_env } = method else {
+        let AuthMethod::Terminal {
+            command: own,
+            args: extra,
+            env: extra_env,
+        } = method
+        else {
             return Err(HarnessError::Protocol("not a terminal sign-in".into()));
         };
         // Its own command (the older `_meta` form): that program with these
@@ -2423,7 +2511,9 @@ impl AcpHarness {
                     }
                 }
                 cmd = replaced;
-                let line = std::iter::once(resolved.display().to_string()).chain(extra.iter().cloned()).collect();
+                let line = std::iter::once(resolved.display().to_string())
+                    .chain(extra.iter().cloned())
+                    .collect();
                 (cmd, line)
             }
             None => {
@@ -2440,9 +2530,9 @@ impl AcpHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut login = cmd
-            .spawn()
-            .map_err(|e| crate::executable::spawn_error(e, None, || crate::executable::binary_hint(exe)))?;
+        let mut login = cmd.spawn().map_err(|e| {
+            crate::executable::spawn_error(e, None, || crate::executable::binary_hint(exe))
+        })?;
         let mut readers = Vec::new();
         if let Some(out) = login.stdout.take() {
             readers.push(tokio::spawn(report_lines(out, on_progress.clone())));
@@ -2466,7 +2556,11 @@ impl AcpHarness {
         if status.success() {
             return Ok(());
         }
-        let line = line.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        let line = line
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
         Err(HarnessError::Protocol(format!("{NEEDS_TERMINAL}{line}")))
     }
 
@@ -2847,10 +2941,7 @@ impl AcpHarness {
             if models.is_empty()
                 && let Some(state) = &handshake_models
             {
-                models = models_from_session(
-                    &json!({ "models": state }),
-                    &(self.spec.models)(),
-                );
+                models = models_from_session(&json!({ "models": state }), &(self.spec.models)());
             }
             if models.is_empty() {
                 // Nothing advertised anywhere: surface the session's own
@@ -2906,7 +2997,9 @@ impl AcpHarness {
                         "naming Hermes models failed: {error}"
                     )))),
                     Err(_) => {
-                        tracing::debug!("naming Hermes models took too long; models keep their ids");
+                        tracing::debug!(
+                            "naming Hermes models took too long; models keep their ids"
+                        );
                         Ok(Ok(unnamed))
                     }
                 }
@@ -3003,7 +3096,11 @@ fn split_provider_label(model: &mut Model) {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let provider_name = if known == spelled { written.to_owned() } else { known };
+    let provider_name = if known == spelled {
+        written.to_owned()
+    } else {
+        known
+    };
     model.label = name.to_owned();
     model.provider = Some(zeron_proto::ModelProvider {
         id: pid.to_owned(),
@@ -3381,7 +3478,13 @@ impl Harness for AcpHarness {
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
         let binary = match self.resolve_launch()? {
             // (A registry agent's own entry, not the Node.js that runs it.)
-            Launch::Program(_, _) if let Some(path) = self.executable_path().filter(|_| self.spec.id.registry().is_some()) => path,
+            Launch::Program(_, _)
+                if let Some(path) = self
+                    .executable_path()
+                    .filter(|_| self.spec.id.registry().is_some()) =>
+            {
+                path
+            }
             Launch::Program(path, _) => path,
             Launch::Archive { entry, .. } => entry,
         };
@@ -3601,11 +3704,8 @@ impl Harness for AcpHarness {
         request: RunRequest,
         target: crate::RevertTarget,
     ) -> Result<Vec<String>, HarnessError> {
-        let file = crate::revert::session_file_in(
-            self.spec.id,
-            &request,
-            self.sessions_root.as_deref(),
-        );
+        let file =
+            crate::revert::session_file_in(self.spec.id, &request, self.sessions_root.as_deref());
         crate::revert::preview_at(file.as_deref(), &target)
     }
 
@@ -3615,11 +3715,8 @@ impl Harness for AcpHarness {
         target: crate::RevertTarget,
         _files: bool,
     ) -> Result<(), HarnessError> {
-        let file = crate::revert::session_file_in(
-            self.spec.id,
-            &request,
-            self.sessions_root.as_deref(),
-        );
+        let file =
+            crate::revert::session_file_in(self.spec.id, &request, self.sessions_root.as_deref());
         crate::revert::commit_at(file.as_deref(), &target)
     }
 }
@@ -4984,12 +5081,19 @@ async fn request_draining(
 /// mode): a web page, reported to `on_page` and accepted (the person asked
 /// to sign in; the page is the app's to open, as any sign-in page); anything
 /// else declined.
-fn answer_elicitation(client: &RpcClient, id: &Value, params: &Value, on_page: &(dyn Fn(String) + Send + Sync)) {
+fn answer_elicitation(
+    client: &RpcClient,
+    id: &Value,
+    params: &Value,
+    on_page: &(dyn Fn(String) + Send + Sync),
+) {
     let url = params
         .get("url")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|u| u.starts_with("https://") && u.len() <= 4096 && !u.chars().any(char::is_whitespace));
+        .filter(|u| {
+            u.starts_with("https://") && u.len() <= 4096 && !u.chars().any(char::is_whitespace)
+        });
     let known = params
         .get("elicitationId")
         .and_then(Value::as_str)
@@ -5020,7 +5124,9 @@ async fn request_draining_with(
         .map(str::to_owned);
     let mut metadata = VecDeque::new();
     let mut handle_incoming = |inc| match inc {
-        Incoming::Request { id, method, params } if method == "elicitation/create" && on_page.is_some() => {
+        Incoming::Request { id, method, params }
+            if method == "elicitation/create" && on_page.is_some() =>
+        {
             if let Some(on_page) = on_page {
                 answer_elicitation(client, &id, &params, on_page);
             }
@@ -7930,15 +8036,32 @@ mod tests {
             ],
         });
         let models = models_from_session(&response, &[]);
-        let row = |id: &str| models.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("{id}"));
+        let row = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id}"))
+        };
         let fable = row("anthropic:claude-fable-5.1");
         assert_eq!(fable.label, "claude-fable-5.1");
-        assert_eq!(fable.provider.as_ref().map(|p| (p.id.as_str(), p.name.as_str())), Some(("anthropic", "Anthropic")));
+        assert_eq!(
+            fable
+                .provider
+                .as_ref()
+                .map(|p| (p.id.as_str(), p.name.as_str())),
+            Some(("anthropic", "Anthropic"))
+        );
         let luna = row("openai-codex:gpt-6-luna");
         assert_eq!(luna.label, "gpt-6-luna");
-        assert_eq!(luna.provider.as_ref().map(|p| p.name.as_str()), Some("Codex"));
+        assert_eq!(
+            luna.provider.as_ref().map(|p| p.name.as_str()),
+            Some("Codex")
+        );
         let nous = row("nous-portal:hermes-4-405b");
-        assert_eq!(nous.provider.as_ref().map(|p| p.name.as_str()), Some("Nous Portal Plus"));
+        assert_eq!(
+            nous.provider.as_ref().map(|p| p.name.as_str()),
+            Some("Nous Portal Plus")
+        );
         let plain = row("local-model");
         assert_eq!(plain.label, "Local Model");
         assert!(plain.provider.is_none());

@@ -82,7 +82,10 @@ pub fn set_app_version(version: &str) {
 /// The version the desktop app compares releases with: [`set_app_version`]'s,
 /// or [`current_version`].
 pub fn app_version() -> &'static str {
-    APP_VERSION.get().map(String::as_str).unwrap_or(current_version())
+    APP_VERSION
+        .get()
+        .map(String::as_str)
+        .unwrap_or(current_version())
 }
 
 /// Successful checks repeat this often. The feed is a sub-kilobyte,
@@ -130,11 +133,19 @@ pub struct Manifest {
     pub files: BTreeMap<String, FileMeta>,
     /// The engine inside the release's app, when it isn't `version`'s own (a
     /// beta app carries the stable engine).
-    #[serde(default, rename = "engineVersion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "engineVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub engine_version: Option<String>,
     /// The oldest macOS the release's app runs on, when it's newer than the
     /// stable app's (beta: [`channel::BETA_MINIMUM_MACOS`]).
-    #[serde(default, rename = "minimumMacOS", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "minimumMacOS",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub minimum_macos: Option<String>,
     /// The channel this manifest was fetched from: where its files are.
     #[serde(skip)]
@@ -336,7 +347,14 @@ pub fn offer(
     running_engine: Option<&str>,
     macos: Option<&str>,
 ) -> Offer {
-    offer_given(manifest, running, selected, running_engine, macos, channel::stable_on_record())
+    offer_given(
+        manifest,
+        running,
+        selected,
+        running_engine,
+        macos,
+        channel::stable_on_record(),
+    )
 }
 
 /// [`offer`], told whether Stable is the choice on record.
@@ -352,8 +370,9 @@ fn offer_given(
     if parse_version(latest).is_none() || latest.trim() == running.trim() {
         return Offer::Current;
     }
-    let leaving_beta =
-        Channel::of_version(running) == Channel::Beta && selected == Channel::Stable && stable_chosen;
+    let leaving_beta = Channel::of_version(running) == Channel::Beta
+        && selected == Channel::Stable
+        && stable_chosen;
     if !leaving_beta && !version_newer(latest, running) {
         return Offer::Current;
     }
@@ -494,10 +513,7 @@ async fn fetch_github_latest() -> anyhow::Result<Manifest> {
 }
 
 /// The `manifest.json` a release publishes, if it has one.
-async fn fetch_release_checksums(
-    client: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<Manifest> {
+async fn fetch_release_checksums(client: &reqwest::Client, url: &str) -> anyhow::Result<Manifest> {
     let mut request = client.get(url);
     // Public releases need no credentials; a private mirror's assets do, and
     // `GITHUB_TOKEN` covers that case.
@@ -528,11 +544,7 @@ fn manifest_from_release(
     release: &GithubRelease,
     checksums: Option<&Manifest>,
 ) -> anyhow::Result<Manifest> {
-    let version = release
-        .tag_name
-        .trim()
-        .trim_start_matches('v')
-        .to_owned();
+    let version = release.tag_name.trim().trim_start_matches('v').to_owned();
     anyhow::ensure!(!version.is_empty(), "the latest GitHub release has no tag");
     let artifacts: Vec<&GithubAsset> = release
         .assets
@@ -1160,7 +1172,9 @@ pub fn detect_install() -> InstallKind {
             // going to become.
             if let Some(installed) = std::env::var_os(INSTALLED_AT_ENV).map(PathBuf::from) {
                 #[cfg(windows)]
-                return InstallKind::WindowsPortable { directory: installed };
+                return InstallKind::WindowsPortable {
+                    directory: installed,
+                };
                 #[cfg(not(windows))]
                 return InstallKind::MacApp { bundle: installed };
             }
@@ -1235,7 +1249,8 @@ pub fn installed_version(kind: &InstallKind) -> Option<String> {
 /// restart a beta's engine forever.
 pub fn bundle_engine_version(bundle: &Path) -> Option<String> {
     let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
-    plist_string(&plist, "ZeronEngineVersion").or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
+    plist_string(&plist, "ZeronEngineVersion")
+        .or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
 }
 
 /// The app's own version in a macOS bundle (a beta's isn't its engine's). A
@@ -1243,7 +1258,8 @@ pub fn bundle_engine_version(bundle: &Path) -> Option<String> {
 /// that alone would read `0.2.137-beta.3` as the stable `0.2.137`.
 pub fn bundle_app_version(bundle: &Path) -> Option<String> {
     let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
-    plist_string(&plist, "ZeronVersion").or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
+    plist_string(&plist, "ZeronVersion")
+        .or_else(|| plist_string(&plist, "CFBundleShortVersionString"))
 }
 
 /// A string value from an XML property list (the packaging template;
@@ -1516,8 +1532,10 @@ fn strip_unused_from_versions(app_root: &Path) {
         return;
     };
     for entry in entries.flatten() {
-        let named_like_a_version =
-            entry.file_name().to_str().is_some_and(|name| parse_version(name).is_some());
+        let named_like_a_version = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| parse_version(name).is_some());
         if named_like_a_version && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             strip_cloud_unused(&entry.path());
         }
@@ -1598,7 +1616,10 @@ pub fn prune_installed_versions(
 /// `.stage-<version>-<pid>`, left by a download whose process is gone (a stop
 /// mid-download kills it before it can clean up).
 fn stage_is_abandoned(rest: &str) -> bool {
-    let Some(pid) = rest.rsplit_once('-').and_then(|(_, pid)| pid.parse::<u32>().ok()) else {
+    let Some(pid) = rest
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<u32>().ok())
+    else {
         return false;
     };
     if pid == std::process::id() {
@@ -1623,8 +1644,9 @@ static BEFORE_RESTART: std::sync::Mutex<Option<BeforeRestart>> = std::sync::Mute
 /// or a later move back to an older version, finds nothing it can't read.
 /// The newest call wins.
 pub fn set_before_restart(prepare: impl Fn() + Send + Sync + 'static) {
-    *BEFORE_RESTART.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(std::sync::Arc::new(prepare));
+    *BEFORE_RESTART
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(prepare));
 }
 
 /// Runs what [`set_before_restart`] set, as [`restart_service`] does first,
@@ -1907,12 +1929,17 @@ pub fn process_runs_from(dir: &Path) -> bool {
             return true;
         }
         let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        pids.iter().take(count as usize).filter(|pid| **pid > 0).any(|&pid| {
-            // SAFETY: `path` is PROC_PIDPATHINFO_MAXSIZE bytes, as the call needs.
-            let len =
-                unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-            len > 0 && Path::new(std::ffi::OsStr::from_bytes(&path[..len as usize])).starts_with(&dir)
-        })
+        pids.iter()
+            .take(count as usize)
+            .filter(|pid| **pid > 0)
+            .any(|&pid| {
+                // SAFETY: `path` is PROC_PIDPATHINFO_MAXSIZE bytes, as the call needs.
+                let len =
+                    unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+                len > 0
+                    && Path::new(std::ffi::OsStr::from_bytes(&path[..len as usize]))
+                        .starts_with(&dir)
+            })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1964,8 +1991,13 @@ pub(crate) fn swap_mac_bundles(incoming: &Path, bundle: &Path) -> anyhow::Result
         if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } != 0 {
             return Err(std::io::Error::last_os_error()).context("swapping in the new app");
         }
-        let parent = bundle.parent().context("app bundle has no parent directory")?;
-        let name = bundle.file_name().context("app bundle has no name")?.to_string_lossy();
+        let parent = bundle
+            .parent()
+            .context("app bundle has no parent directory")?;
+        let name = bundle
+            .file_name()
+            .context("app bundle has no name")?
+            .to_string_lossy();
         let retired = parent.join(format!(".{name}.old-{}", std::process::id()));
         // If this is lost to a crash, it's tidied up under the name it has.
         let _ = std::fs::rename(incoming, &retired);
@@ -1974,7 +2006,10 @@ pub(crate) fn swap_mac_bundles(incoming: &Path, bundle: &Path) -> anyhow::Result
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (incoming, bundle);
-        bail!("macOS app updates are not supported on {}", std::env::consts::OS)
+        bail!(
+            "macOS app updates are not supported on {}",
+            std::env::consts::OS
+        )
     }
 }
 
@@ -2538,7 +2573,10 @@ impl Updater {
         Ok(match verdict {
             BootVerdict::Current => BootCheck::Current,
             BootVerdict::Newer => BootCheck::Newer(manifest),
-            BootVerdict::Skip(why) => BootCheck::Skip { version: manifest.version, why },
+            BootVerdict::Skip(why) => BootCheck::Skip {
+                version: manifest.version,
+                why,
+            },
         })
     }
 
@@ -2561,7 +2599,8 @@ impl Updater {
         .unwrap_or_else(|| current_version().to_owned());
         Ok(PreparedBootUpdate {
             version: manifest.version.clone(),
-            layout: (from != manifest.version).then_some(transaction::Layout::Versioned { app_root }),
+            layout: (from != manifest.version)
+                .then_some(transaction::Layout::Versioned { app_root }),
             from,
         })
     }
@@ -2584,7 +2623,9 @@ impl Updater {
                 layout,
                 &prepared.from,
                 &prepared.version,
-                transaction::RestartMode::Service { unit: service_unit() },
+                transaction::RestartMode::Service {
+                    unit: service_unit(),
+                },
                 trial_base,
             )?),
         };
@@ -2613,7 +2654,9 @@ impl Updater {
         let Some(data_dir) = channel::data_dir() else {
             return;
         };
-        if let Some(requested) = transaction::read(data_dir).filter(|t| t.phase == transaction::Phase::Requested) {
+        if let Some(requested) =
+            transaction::read(data_dir).filter(|t| t.phase == transaction::Phase::Requested)
+        {
             transaction::fail_request(
                 data_dir,
                 &requested.id,
@@ -2659,8 +2702,7 @@ impl Updater {
             bail!("An update is already in progress on this device.");
         }
         let manifest = fetch_latest(&self.edge_url).await?;
-        let Some(prepared) =
-            prepare_this_install(&self.edge_url, &manifest, &data_dir).await?
+        let Some(prepared) = prepare_this_install(&self.edge_url, &manifest, &data_dir).await?
         else {
             bail!("already up to date ({})", current_version());
         };
@@ -2680,7 +2722,9 @@ impl Updater {
                     if MANAGED_RESTART.get().is_some() {
                         transaction::RestartMode::Relaunch
                     } else {
-                        transaction::RestartMode::Service { unit: service_unit() }
+                        transaction::RestartMode::Service {
+                            unit: service_unit(),
+                        }
                     },
                 )?;
                 self.refresh_update_report();
@@ -2751,7 +2795,8 @@ async fn prepare_this_install(
         }
         InstallKind::MacApp { bundle } => {
             // The engine's version isn't the app's (a beta carries stable's).
-            let from = bundle_app_version(&bundle).context("reading the installed app's version")?;
+            let from =
+                bundle_app_version(&bundle).context("reading the installed app's version")?;
             match offer(
                 manifest,
                 &from,
@@ -2763,20 +2808,29 @@ async fn prepare_this_install(
                 Offer::Held(why) => bail!(why),
                 Offer::Current => return Ok(None),
             }
-            let parent = bundle.parent().context("app bundle has no parent directory")?;
+            let parent = bundle
+                .parent()
+                .context("app bundle has no parent directory")?;
             let download = artifact_size(edge_url, manifest, &mac_app_artifact(&manifest.version))
                 .await
                 .unwrap_or(transaction::UNKNOWN_ARTIFACT_BYTES);
             // A staged copy and the one beside the installed app.
-            if let Err(why) = transaction::ensure_room(data_dir, parent, download.saturating_mul(2)) {
+            if let Err(why) = transaction::ensure_room(data_dir, parent, download.saturating_mul(2))
+            {
                 bail!(why);
             }
             let staged = stage_mac_app(edge_url, manifest, data_dir).await?;
-            let name = bundle.file_name().context("app bundle has no name")?.to_string_lossy();
+            let name = bundle
+                .file_name()
+                .context("app bundle has no name")?
+                .to_string_lossy();
             let incoming = parent.join(format!(".{name}.new-{}", transaction::new_id()));
             // Everything that can fail about installing it happens here, with
             // nothing stopped: it's a plain copy, and then one atomic swap.
-            if let Err(err) = run("ditto", &[&staged.to_string_lossy(), &incoming.to_string_lossy()]) {
+            if let Err(err) = run(
+                "ditto",
+                &[&staged.to_string_lossy(), &incoming.to_string_lossy()],
+            ) {
                 let _ = std::fs::remove_dir_all(&incoming);
                 return Err(err).context("copying the new app into place");
             }
@@ -2806,7 +2860,10 @@ async fn prepare_this_install(
             let incoming = windows::stage(edge_url, manifest, &directory).await?;
             Ok(Some(PreparedInstall {
                 from,
-                layout: Some(transaction::Layout::WindowsFolder { directory, incoming }),
+                layout: Some(transaction::Layout::WindowsFolder {
+                    directory,
+                    incoming,
+                }),
             }))
         }
         InstallKind::Unmanaged => bail!("this install doesn't update itself"),
@@ -2822,7 +2879,10 @@ async fn prepare_this_install(
 pub enum BootCheck {
     Current,
     Newer(Manifest),
-    Skip { version: String, why: BootSkipReason },
+    Skip {
+        version: String,
+        why: BootSkipReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2949,7 +3009,9 @@ async fn install_release_within(
     let task = {
         let (edge_url, manifest) = (edge_url.to_owned(), manifest.clone());
         let (app_root, data_dir) = (app_root.to_path_buf(), data_dir.to_path_buf());
-        tokio::spawn(async move { prepare_install(&edge_url, &manifest, &app_root, &data_dir).await })
+        tokio::spawn(
+            async move { prepare_install(&edge_url, &manifest, &app_root, &data_dir).await },
+        )
     };
     let abort = task.abort_handle();
     let mut task = task;
@@ -2957,12 +3019,19 @@ async fn install_release_within(
         Ok(joined) => joined.context("installing the release")?,
         Err(_) => {
             abort.abort();
-            let stage = app_root.join(format!(".stage-{}-{}", manifest.version, std::process::id()));
+            let stage = app_root.join(format!(
+                ".stage-{}-{}",
+                manifest.version,
+                std::process::id()
+            ));
             tokio::spawn(async move {
                 let _ = task.await;
                 let _ = std::fs::remove_dir_all(&stage);
             });
-            bail!("installing the release took longer than {}s", limit.as_secs())
+            bail!(
+                "installing the release took longer than {}s",
+                limit.as_secs()
+            )
         }
     }
 }
@@ -3006,7 +3075,10 @@ async fn artifact_size(edge_url: &str, manifest: &Manifest, file: &str) -> Optio
     };
     let url = format!("{base}/{file}");
     let response = http_client().ok()?.head(&url).send().await.ok()?;
-    response.status().is_success().then(|| response.content_length())?
+    response
+        .status()
+        .is_success()
+        .then(|| response.content_length())?
 }
 
 /// Wall-clock check deadlines with failure backoff.
@@ -3171,12 +3243,21 @@ mod tests {
         let verdict = |last: Option<&transaction::Transaction>, skip: Option<&BootSkip>| {
             boot_verdict("2.0.0", "1.0.0", last, skip, 1_000)
         };
-        assert_eq!(boot_verdict("1.0.0", "1.0.0", None, None, 0), BootVerdict::Current);
-        assert_eq!(boot_verdict("0.9.0", "1.0.0", None, None, 0), BootVerdict::Current);
+        assert_eq!(
+            boot_verdict("1.0.0", "1.0.0", None, None, 0),
+            BootVerdict::Current
+        );
+        assert_eq!(
+            boot_verdict("0.9.0", "1.0.0", None, None, 0),
+            BootVerdict::Current
+        );
         assert_eq!(verdict(None, None), BootVerdict::Newer);
 
         let back = transaction_of("2.0.0", "rolledBack");
-        assert_eq!(verdict(Some(&back), None), BootVerdict::Skip(BootSkipReason::WentBack));
+        assert_eq!(
+            verdict(Some(&back), None),
+            BootVerdict::Skip(BootSkipReason::WentBack)
+        );
         // Gone back only because the service was stopped mid-trial: tried again.
         let mut interrupted = transaction_of("2.0.0", "rolledBack");
         interrupted.interrupted = true;
@@ -3198,13 +3279,28 @@ mod tests {
             );
         }
         // An older update that went well doesn't get in the way.
-        assert_eq!(verdict(Some(&transaction_of("1.0.0", "updated")), None), BootVerdict::Newer);
+        assert_eq!(
+            verdict(Some(&transaction_of("1.0.0", "updated")), None),
+            BootVerdict::Newer
+        );
 
-        let recent = BootSkip { version: "2.0.0".into(), until: 2_000 };
-        assert_eq!(verdict(None, Some(&recent)), BootVerdict::Skip(BootSkipReason::TriedRecently));
-        let expired = BootSkip { version: "2.0.0".into(), until: 1_000 };
+        let recent = BootSkip {
+            version: "2.0.0".into(),
+            until: 2_000,
+        };
+        assert_eq!(
+            verdict(None, Some(&recent)),
+            BootVerdict::Skip(BootSkipReason::TriedRecently)
+        );
+        let expired = BootSkip {
+            version: "2.0.0".into(),
+            until: 1_000,
+        };
         assert_eq!(verdict(None, Some(&expired)), BootVerdict::Newer);
-        let other = BootSkip { version: "1.5.0".into(), until: 2_000 };
+        let other = BootSkip {
+            version: "1.5.0".into(),
+            until: 2_000,
+        };
         assert_eq!(verdict(None, Some(&other)), BootVerdict::Newer);
     }
 
@@ -3260,13 +3356,26 @@ mod tests {
         std::fs::create_dir_all(&app_root).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let (base, server) = serve_nothing().await;
-        let manifest = Manifest { version: "9.9.9".into(), ..Manifest::default() };
+        let manifest = Manifest {
+            version: "9.9.9".into(),
+            ..Manifest::default()
+        };
         let started = std::time::Instant::now();
-        let error = install_release_within(&base, &manifest, &app_root, &data, Duration::from_millis(300))
-            .await
-            .unwrap_err();
+        let error = install_release_within(
+            &base,
+            &manifest,
+            &app_root,
+            &data,
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("took longer"), "{error:#}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         for _ in 0..200 {
             if std::fs::read_dir(&app_root).unwrap().count() == 0 {
                 break;
@@ -3288,7 +3397,9 @@ mod tests {
             version: "9.9.9".into(),
             files: [(
                 headless_artifact("9.9.9"),
-                FileMeta { sha256: Some(format!("{:x}", Sha256::digest(bytes))) },
+                FileMeta {
+                    sha256: Some(format!("{:x}", Sha256::digest(bytes))),
+                },
             )]
             .into(),
             ..Manifest::default()
@@ -3298,15 +3409,31 @@ mod tests {
 
         // Bytes that aren't what the feed promised.
         let (base, server) = serve_forever(b"truncated".to_vec()).await;
-        assert!(install_release_within(&base, &manifest(&good), &app_root, &data, limit).await.is_err());
+        assert!(
+            install_release_within(&base, &manifest(&good), &app_root, &data, limit)
+                .await
+                .is_err()
+        );
         server.abort();
         assert!(!app_root.join("9.9.9").exists());
 
         // Nothing there at all.
-        assert!(install_release_within("http://127.0.0.1:1", &manifest(&good), &app_root, &data, limit).await.is_err());
+        assert!(
+            install_release_within(
+                "http://127.0.0.1:1",
+                &manifest(&good),
+                &app_root,
+                &data,
+                limit
+            )
+            .await
+            .is_err()
+        );
 
         let (base, server) = serve_forever(good.clone()).await;
-        install_release_within(&base, &manifest(&good), &app_root, &data, limit).await.unwrap();
+        install_release_within(&base, &manifest(&good), &app_root, &data, limit)
+            .await
+            .unwrap();
         server.abort();
         assert!(app_root.join("9.9.9").join("zeron").is_file());
     }
@@ -3321,7 +3448,11 @@ mod tests {
         let delay = Duration::from_millis(150);
         let started = std::time::Instant::now();
         wait_out_initial_delay(&mut rx, &forced, delay).await;
-        assert!(started.elapsed() >= delay, "a poke ended it after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= delay,
+            "a poke ended it after {:?}",
+            started.elapsed()
+        );
 
         // A forced check does, even one that landed before the wait began.
         forced.store(true, Ordering::SeqCst);
@@ -3340,7 +3471,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         forcing.store(true, Ordering::SeqCst);
         tx.send_modify(|epoch| *epoch += 1);
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -3416,7 +3550,12 @@ mod tests {
         );
         assert_eq!(read_only.install, InstallMethod::LinuxService);
         assert!(!read_only.can_apply_remotely);
-        assert!(read_only.cannot_apply_reason.unwrap().contains("/opt/zeron"));
+        assert!(
+            read_only
+                .cannot_apply_reason
+                .unwrap()
+                .contains("/opt/zeron")
+        );
 
         let bundle = InstallKind::MacApp {
             bundle: PathBuf::from("/Applications/Zeron.app"),
@@ -3435,7 +3574,12 @@ mod tests {
             Some(UpdateBlocker::Translocated),
         );
         assert!(!mac_translocated.can_apply_remotely);
-        assert!(mac_translocated.cannot_apply_reason.unwrap().contains("Applications"));
+        assert!(
+            mac_translocated
+                .cannot_apply_reason
+                .unwrap()
+                .contains("Applications")
+        );
 
         // No macOS headless release exists, whatever the old layout says.
         let old_mac_service = UpdateAbility::decide(&managed(), "macos", true, true, None);
@@ -3444,8 +3588,12 @@ mod tests {
 
         let source = UpdateAbility::decide(&InstallKind::Unmanaged, "linux", false, false, None);
         assert_eq!(source.install, InstallMethod::Unmanaged);
-        assert_eq!(source.manual_command.as_deref(), Some(LINUX_INSTALL_COMMAND));
-        let mac_source = UpdateAbility::decide(&InstallKind::Unmanaged, "macos", false, false, None);
+        assert_eq!(
+            source.manual_command.as_deref(),
+            Some(LINUX_INSTALL_COMMAND)
+        );
+        let mac_source =
+            UpdateAbility::decide(&InstallKind::Unmanaged, "macos", false, false, None);
         assert_eq!(mac_source.manual_command, None);
     }
 
@@ -3871,7 +4019,10 @@ mod tests {
     fn a_settled_install_keeps_current_and_the_one_before() {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
-        versions_installed(&app_root, &["0.2.9", "0.2.10", "0.2.11", "0.2.12", "0.2.13"]);
+        versions_installed(
+            &app_root,
+            &["0.2.9", "0.2.10", "0.2.11", "0.2.12", "0.2.13"],
+        );
         // Not versions, so not ours to judge.
         std::fs::create_dir_all(app_root.join("notes")).unwrap();
         std::fs::write(app_root.join("README"), "hi").unwrap();
@@ -3881,8 +4032,14 @@ mod tests {
 
         assert_eq!(removed.len(), 2, "{removed:?}");
         // 0.2.13 is newer than current: an update staged and waiting, kept.
-        assert_eq!(folders(&app_root), ["0.2.11", "0.2.12", "0.2.13", "README", "current", "notes"]);
-        assert_eq!(std::fs::read_link(app_root.join("current")).unwrap(), app_root.join("0.2.12"));
+        assert_eq!(
+            folders(&app_root),
+            ["0.2.11", "0.2.12", "0.2.13", "README", "current", "notes"]
+        );
+        assert_eq!(
+            std::fs::read_link(app_root.join("current")).unwrap(),
+            app_root.join("0.2.12")
+        );
     }
 
     #[cfg(unix)]
@@ -3912,7 +4069,10 @@ mod tests {
         versions_installed(&app_root, &["0.2.10", "0.2.11"]);
         apply_headless(&app_root, "0.2.10").unwrap();
 
-        assert_eq!(prune_installed_versions(&app_root, 1, Some("0.2.11")), ["0.2.11"]);
+        assert_eq!(
+            prune_installed_versions(&app_root, 1, Some("0.2.11")),
+            ["0.2.11"]
+        );
         assert_eq!(folders(&app_root), ["0.2.10", "current"]);
         // Named as abandoned while it's current (a reinstall since): kept.
         assert!(prune_installed_versions(&app_root, 0, Some("0.2.10")).is_empty());
@@ -3930,7 +4090,10 @@ mod tests {
         std::fs::create_dir_all(app_root.join("0.2.12")).unwrap();
         std::os::unix::fs::symlink(app_root.join("0.2.12"), app_root.join("current")).unwrap();
         assert!(prune_installed_versions(&app_root, 0, None).is_empty());
-        assert_eq!(folders(&app_root), ["0.2.10", "0.2.11", "0.2.12", "current"]);
+        assert_eq!(
+            folders(&app_root),
+            ["0.2.10", "0.2.11", "0.2.12", "current"]
+        );
     }
 
     #[cfg(unix)]
@@ -4034,10 +4197,15 @@ mod tests {
     fn an_engine_restarts_into_the_next_beta_and_the_stable_it_becomes() {
         let attempts = |installed: &str, running: &str| {
             let restarts = std::cell::Cell::new(0);
-            SupersededRestart::default().poll_installed(installed, running, || true, || {
-                restarts.set(restarts.get() + 1);
-                Ok(())
-            });
+            SupersededRestart::default().poll_installed(
+                installed,
+                running,
+                || true,
+                || {
+                    restarts.set(restarts.get() + 1);
+                    Ok(())
+                },
+            );
             restarts.get()
         };
         assert_eq!(attempts("0.2.137-beta.19", "0.2.137-beta.18"), 1);
@@ -4067,10 +4235,19 @@ mod tests {
     fn bundle_version_reads_the_packaged_plist() {
         let template = include_str!("../../../dist/macos/Info.plist");
         let plist = template.replace("__VERSION__", "0.3.1");
-        assert_eq!(plist_string(&plist, "CFBundleShortVersionString").as_deref(), Some("0.3.1"));
+        assert_eq!(
+            plist_string(&plist, "CFBundleShortVersionString").as_deref(),
+            Some("0.3.1")
+        );
         // Packaging names the engine it bundles.
-        assert_eq!(plist_string(&plist, "ZeronEngineVersion").as_deref(), Some("0.3.1"));
-        assert_eq!(plist_string("<plist></plist>", "CFBundleShortVersionString"), None);
+        assert_eq!(
+            plist_string(&plist, "ZeronEngineVersion").as_deref(),
+            Some("0.3.1")
+        );
+        assert_eq!(
+            plist_string("<plist></plist>", "CFBundleShortVersionString"),
+            None
+        );
     }
 
     #[test]
@@ -4086,10 +4263,14 @@ mod tests {
              <key>ZeronEngineVersion</key><string>0.2.135</string></dict></plist>",
         );
         assert_eq!(bundle_engine_version(&bundle).as_deref(), Some("0.2.135"));
-        let mac = InstallKind::MacApp { bundle: bundle.clone() };
+        let mac = InstallKind::MacApp {
+            bundle: bundle.clone(),
+        };
         assert_eq!(installed_version(&mac).as_deref(), Some("0.2.135"));
         // A bundle from before the key.
-        write("<plist><dict><key>CFBundleShortVersionString</key><string>0.2.134</string></dict></plist>");
+        write(
+            "<plist><dict><key>CFBundleShortVersionString</key><string>0.2.134</string></dict></plist>",
+        );
         assert_eq!(bundle_engine_version(&bundle).as_deref(), Some("0.2.134"));
     }
 
@@ -4106,7 +4287,9 @@ mod tests {
             std::fs::create_dir_all(root.path().join(dir)).unwrap();
             std::fs::write(root.path().join(dir).join("zeron"), "").unwrap();
         }
-        let managed = InstallKind::Managed { app_root: root.path().to_path_buf() };
+        let managed = InstallKind::Managed {
+            app_root: root.path().to_path_buf(),
+        };
         apply_headless(root.path(), "0.2.137-beta.1").unwrap();
         assert_eq!(installed_version(&managed), None);
         // Back on Stable it reads as ever.
@@ -4116,10 +4299,23 @@ mod tests {
 
     #[test]
     fn prereleases_sort_as_semver_says() {
-        let ordered = ["0.2.134", "0.2.135", "0.2.136-beta.1", "0.2.136-beta.2", "0.2.136-beta.10", "0.2.136", "0.2.137-beta.1"];
+        let ordered = [
+            "0.2.134",
+            "0.2.135",
+            "0.2.136-beta.1",
+            "0.2.136-beta.2",
+            "0.2.136-beta.10",
+            "0.2.136",
+            "0.2.137-beta.1",
+        ];
         for pair in ordered.windows(2) {
             assert!(version_newer(pair[1], pair[0]), "{} > {}", pair[1], pair[0]);
-            assert!(!version_newer(pair[0], pair[1]), "{} < {}", pair[0], pair[1]);
+            assert!(
+                !version_newer(pair[0], pair[1]),
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
         }
         assert!(!version_newer("0.2.136-beta.1", "0.2.136-beta.1"));
         assert!(version_newer("v0.2.136-beta.1", "0.2.135"));
@@ -4143,29 +4339,82 @@ mod tests {
     #[test]
     fn a_build_takes_newer_releases_of_its_channel() {
         let stable = manifest_of("0.2.136", Channel::Stable);
-        assert_eq!(offer(&stable, "0.2.135", Channel::Stable, None, None), Offer::Newer);
-        assert_eq!(offer(&stable, "0.2.136", Channel::Stable, None, None), Offer::Current);
-        assert_eq!(offer(&stable, "0.2.137", Channel::Stable, None, None), Offer::Current);
+        assert_eq!(
+            offer(&stable, "0.2.135", Channel::Stable, None, None),
+            Offer::Newer
+        );
+        assert_eq!(
+            offer(&stable, "0.2.136", Channel::Stable, None, None),
+            Offer::Current
+        );
+        assert_eq!(
+            offer(&stable, "0.2.137", Channel::Stable, None, None),
+            Offer::Current
+        );
         let beta = manifest_of("0.2.136-beta.2", Channel::Beta);
-        assert_eq!(offer(&beta, "0.2.136-beta.1", Channel::Beta, Some("0.2.135"), None), Offer::Newer);
-        assert_eq!(offer(&beta, "0.2.136-beta.2", Channel::Beta, Some("0.2.135"), None), Offer::Current);
+        assert_eq!(
+            offer(
+                &beta,
+                "0.2.136-beta.1",
+                Channel::Beta,
+                Some("0.2.135"),
+                None
+            ),
+            Offer::Newer
+        );
+        assert_eq!(
+            offer(
+                &beta,
+                "0.2.136-beta.2",
+                Channel::Beta,
+                Some("0.2.135"),
+                None
+            ),
+            Offer::Current
+        );
     }
 
     #[test]
     fn choosing_beta_on_stable_takes_only_a_newer_beta() {
         let beta = manifest_of("0.2.136-beta.1", Channel::Beta);
-        assert_eq!(offer(&beta, "0.2.135", Channel::Beta, None, None), Offer::Newer);
+        assert_eq!(
+            offer(&beta, "0.2.135", Channel::Beta, None, None),
+            Offer::Newer
+        );
         // Stable moved past the last beta: wait for the next one.
-        assert_eq!(offer(&beta, "0.2.136", Channel::Beta, None, None), Offer::Current);
+        assert_eq!(
+            offer(&beta, "0.2.136", Channel::Beta, None, None),
+            Offer::Current
+        );
     }
 
     #[test]
     fn leaving_beta_installs_stable_even_when_older() {
         let stable = manifest_of("0.2.135", Channel::Stable);
-        assert_eq!(offer_given(&stable, "0.2.136-beta.2", Channel::Stable, Some("0.2.135"), None, true), Offer::Switch);
+        assert_eq!(
+            offer_given(
+                &stable,
+                "0.2.136-beta.2",
+                Channel::Stable,
+                Some("0.2.135"),
+                None,
+                true
+            ),
+            Offer::Switch
+        );
         // A stable that caught up is simply newer.
         let caught_up = manifest_of("0.2.136", Channel::Stable);
-        assert_eq!(offer_given(&caught_up, "0.2.136-beta.2", Channel::Stable, Some("0.2.135"), None, true), Offer::Newer);
+        assert_eq!(
+            offer_given(
+                &caught_up,
+                "0.2.136-beta.2",
+                Channel::Stable,
+                Some("0.2.135"),
+                None,
+                true
+            ),
+            Offer::Newer
+        );
     }
 
     /// 0.3.0, the first zgx stable, after 0.2.138 and the 0.2.139 betas: newer
@@ -4178,9 +4427,29 @@ mod tests {
         }
         assert!(version_newer("0.3.1", "0.3.0") && version_newer("0.3.1-beta.1", "0.3.0"));
         let stable = manifest_of("0.3.0", Channel::Stable);
-        assert_eq!(offer_given(&stable, "0.2.138", Channel::Stable, Some("0.2.138"), None, false), Offer::Newer);
+        assert_eq!(
+            offer_given(
+                &stable,
+                "0.2.138",
+                Channel::Stable,
+                Some("0.2.138"),
+                None,
+                false
+            ),
+            Offer::Newer
+        );
         let beta_feed = manifest_of("0.3.0", Channel::Beta);
-        assert_eq!(offer_given(&beta_feed, "0.2.139-beta.6", Channel::Beta, Some("0.2.139-beta.6"), None, false), Offer::Newer);
+        assert_eq!(
+            offer_given(
+                &beta_feed,
+                "0.2.139-beta.6",
+                Channel::Beta,
+                Some("0.2.139-beta.6"),
+                None,
+                false
+            ),
+            Offer::Newer
+        );
         assert_eq!(managed_dir("0.3.0"), "0.3.0");
     }
 
@@ -4190,16 +4459,37 @@ mod tests {
     #[test]
     fn a_beta_never_goes_back_to_an_older_stable_unless_stable_was_chosen() {
         let older = manifest_of("0.2.138", Channel::Stable);
-        assert_eq!(offer_given(&older, "0.2.139-beta.6", Channel::Stable, None, None, false), Offer::Current);
-        assert_eq!(offer_given(&older, "0.2.139-beta.6", Channel::Stable, None, None, true), Offer::Switch);
+        assert_eq!(
+            offer_given(&older, "0.2.139-beta.6", Channel::Stable, None, None, false),
+            Offer::Current
+        );
+        assert_eq!(
+            offer_given(&older, "0.2.139-beta.6", Channel::Stable, None, None, true),
+            Offer::Switch
+        );
         // Stable catching up is newer either way.
         let caught_up = manifest_of("0.2.139", Channel::Stable);
-        assert_eq!(offer_given(&caught_up, "0.2.139-beta.6", Channel::Stable, None, None, false), Offer::Newer);
+        assert_eq!(
+            offer_given(
+                &caught_up,
+                "0.2.139-beta.6",
+                Channel::Stable,
+                None,
+                None,
+                false
+            ),
+            Offer::Newer
+        );
         #[cfg(target_os = "linux")]
         {
-            let unpacked = std::path::Path::new("/home/someone/Downloads/zeron-0.2.139-beta.6-linux-x86_64/zeron");
+            let unpacked = std::path::Path::new(
+                "/home/someone/Downloads/zeron-0.2.139-beta.6-linux-x86_64/zeron",
+            );
             let home = std::path::Path::new("/home/someone");
-            assert_eq!(detect_install_from(unpacked, Some(home)), InstallKind::Unmanaged);
+            assert_eq!(
+                detect_install_from(unpacked, Some(home)),
+                InstallKind::Unmanaged
+            );
             assert!(!InstallKind::Unmanaged.follows_channels());
         }
     }
@@ -4207,11 +4497,34 @@ mod tests {
     #[test]
     fn leaving_beta_waits_when_stable_s_engine_is_older_than_the_beta_s() {
         let stable = manifest_of("0.2.135", Channel::Stable);
-        let held = offer_given(&stable, "0.2.136-beta.3", Channel::Stable, Some("0.2.136"), None, true);
-        assert!(matches!(&held, Offer::Held(why) if why.contains("catches up")), "{held:?}");
+        let held = offer_given(
+            &stable,
+            "0.2.136-beta.3",
+            Channel::Stable,
+            Some("0.2.136"),
+            None,
+            true,
+        );
+        assert!(
+            matches!(&held, Offer::Held(why) if why.contains("catches up")),
+            "{held:?}"
+        );
         // A manifest naming its engine is weighed by that.
-        let named = Manifest { engine_version: Some("0.2.136".into()), ..stable };
-        assert_eq!(offer_given(&named, "0.2.136-beta.3", Channel::Stable, Some("0.2.136"), None, true), Offer::Switch);
+        let named = Manifest {
+            engine_version: Some("0.2.136".into()),
+            ..stable
+        };
+        assert_eq!(
+            offer_given(
+                &named,
+                "0.2.136-beta.3",
+                Channel::Stable,
+                Some("0.2.136"),
+                None,
+                true
+            ),
+            Offer::Switch
+        );
     }
 
     #[test]
@@ -4221,8 +4534,14 @@ mod tests {
             ..manifest_of("0.2.136-beta.1", Channel::Beta)
         };
         let held = offer(&beta, "0.2.135", Channel::Beta, None, Some("13.6"));
-        assert!(matches!(&held, Offer::Held(why) if why.contains("macOS 14.0")), "{held:?}");
-        assert_eq!(offer(&beta, "0.2.135", Channel::Beta, None, Some("14.1")), Offer::Newer);
+        assert!(
+            matches!(&held, Offer::Held(why) if why.contains("macOS 14.0")),
+            "{held:?}"
+        );
+        assert_eq!(
+            offer(&beta, "0.2.135", Channel::Beta, None, Some("14.1")),
+            Offer::Newer
+        );
         assert!(!held.installs());
     }
 
@@ -4435,7 +4754,9 @@ mod tests {
             let app_root = tmp.path().join(format!("app-{cloud}"));
             std::fs::create_dir_all(&app_root).unwrap();
             let (base, server) = serve_forever(bytes.clone()).await;
-            let staged = stage_headless_on(&base, &manifest, &app_root, cloud).await.unwrap();
+            let staged = stage_headless_on(&base, &manifest, &app_root, cloud)
+                .await
+                .unwrap();
             server.abort();
             assert!(staged.join("zeron").is_file(), "cloud {cloud}");
             assert_eq!(staged.join("zeron-engine").exists(), kept, "cloud {cloud}");
@@ -4455,7 +4776,10 @@ mod tests {
              <key>ZeronVersion</key><string>0.2.137-beta.16</string></dict></plist>",
         )
         .unwrap();
-        assert_eq!(bundle_app_version(dir.path()).as_deref(), Some("0.2.137-beta.16"));
+        assert_eq!(
+            bundle_app_version(dir.path()).as_deref(),
+            Some("0.2.137-beta.16")
+        );
         // A stable bundle has no `ZeronVersion`.
         std::fs::write(
             contents.join("Info.plist"),

@@ -295,7 +295,8 @@ mod macos_system_sound {
         let url = CFURL::from_path(path, false)
             .ok_or_else(|| format!("no file URL for {}", path.display()))?;
         let mut id: SystemSoundId = 0;
-        let status = unsafe { AudioServicesCreateSystemSoundID(url.as_concrete_TypeRef(), &mut id) };
+        let status =
+            unsafe { AudioServicesCreateSystemSoundID(url.as_concrete_TypeRef(), &mut id) };
         if status != 0 {
             return Err(format!("system sound server refused the chime ({status})"));
         }

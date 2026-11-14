@@ -275,7 +275,10 @@ struct PublishedVersions {
 
 /// The registry replica a store holds: its whole snapshot plus the row
 /// deltas saved on it. `None` when the store has no registry.
-pub(crate) fn load_registry(store: &DocsStore, device_id: &str) -> Result<Option<RegistryDoc>, EngineError> {
+pub(crate) fn load_registry(
+    store: &DocsStore,
+    device_id: &str,
+) -> Result<Option<RegistryDoc>, EngineError> {
     let Some((base, chain, tail)) = store.load_row_deltas(REGISTRY_DOC_ID)? else {
         return Ok(None);
     };
@@ -1365,7 +1368,11 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.rename_space(space_id, name))?)
     }
 
-    pub fn set_space_icon(&self, space_id: &str, icon: Option<&zeron_proto::SpaceIcon>) -> Result<bool, EngineError> {
+    pub fn set_space_icon(
+        &self,
+        space_id: &str,
+        icon: Option<&zeron_proto::SpaceIcon>,
+    ) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_space_icon(space_id, icon))?)
     }
 
@@ -1657,7 +1664,8 @@ impl WorkspaceHostInner {
             .as_ref()
             .is_some_and(|room| room.stats().synced);
         if registry_synced {
-            self.registry_synced_tx.send_if_modified(|synced| !std::mem::replace(synced, true));
+            self.registry_synced_tx
+                .send_if_modified(|synced| !std::mem::replace(synced, true));
         }
         // Sidebar pins are viewport state. A Cloud device has no viewport, and
         // the edge refuses its writes to rows it doesn't own: reconciling here
@@ -1674,11 +1682,13 @@ impl WorkspaceHostInner {
             chats: doc.kind_version(zeron_doc::KIND_CHATS),
             sessions: doc.kind_version(zeron_doc::KIND_SESSIONS),
             devices: doc.kind_version(zeron_doc::KIND_DEVICES),
-            spaces: doc.kind_version(zeron_doc::KIND_SPACES)
+            spaces: doc
+                .kind_version(zeron_doc::KIND_SPACES)
                 .wrapping_add(doc.kind_version(zeron_doc::KIND_REPOSITORY_LOOKS)),
         };
         let last = *published;
-        let changed = |pick: fn(&PublishedVersions) -> u64| last.is_none_or(|last| pick(&last) != pick(&now));
+        let changed =
+            |pick: fn(&PublishedVersions) -> u64| last.is_none_or(|last| pick(&last) != pick(&now));
         let chats = changed(|v| v.chats).then(|| doc.read_chats());
         let sessions = changed(|v| v.sessions).then(|| doc.read_sessions());
         let devices = (clock_tick || changed(|v| v.devices)).then(|| doc.read_devices());
@@ -1913,7 +1923,9 @@ impl WorkspaceHostInner {
 
     /// Row deltas wait on the last whole save (see `persist`).
     fn row_deltas_outstanding(&self) -> bool {
-        lock(&self.registry_base).as_ref().is_some_and(|base| base.delta_rows > 0)
+        lock(&self.registry_base)
+            .as_ref()
+            .is_some_and(|base| base.delta_rows > 0)
     }
 
     fn save_compacted(&self) {
@@ -2381,16 +2393,26 @@ mod tests {
             tx.send(zeron_sync::RegistryEvent::Applied).unwrap();
         }
         let lagged = rx.recv().await;
-        assert!(matches!(lagged, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))));
+        assert!(matches!(
+            lagged,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+        ));
         let mut changed = host.inner.changed_tx.subscribe();
         changed.mark_unchanged();
         assert!(host.inner.on_registry_event(lagged));
-        assert!(changed.has_changed().unwrap(), "a lagged pump dropped applied frames silently");
+        assert!(
+            changed.has_changed().unwrap(),
+            "a lagged pump dropped applied frames silently"
+        );
         drop(tx);
         while let Ok(event) = rx.try_recv() {
             assert!(host.inner.on_registry_event(Ok(event)));
         }
-        assert!(!host.inner.on_registry_event(Err(tokio::sync::broadcast::error::RecvError::Closed)));
+        assert!(
+            !host
+                .inner
+                .on_registry_event(Err(tokio::sync::broadcast::error::RecvError::Closed))
+        );
     }
 
     /// A crash loses nothing local: what is on disk 1.5 s after a local
@@ -2418,14 +2440,19 @@ mod tests {
         let on_disk = || {
             // As a reopen reads it: the whole save plus its row deltas.
             let store = DocsStore::open(dir.path()).unwrap();
-            load_registry(&store, "test-device").unwrap().unwrap().read_all().unwrap()
+            load_registry(&store, "test-device")
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap()
         };
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
 
         // A server change arrives first and starts its long debounce.
         host.inner.bump_changed();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        host.create_space("kept", "test-device", "/project", None, false).unwrap();
+        host.create_space("kept", "test-device", "/project", None, false)
+            .unwrap();
         // Server changes keep coming while the local write waits to save.
         for _ in 0..7 {
             host.inner.bump_changed();
@@ -2439,7 +2466,13 @@ mod tests {
         host.rename_space("kept", Some("Renamed")).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         assert_eq!(
-            on_disk().spaces.iter().find(|space| space.id == "kept").unwrap().name.as_deref(),
+            on_disk()
+                .spaces
+                .iter()
+                .find(|space| space.id == "kept")
+                .unwrap()
+                .name
+                .as_deref(),
             Some("Renamed")
         );
     }
@@ -2466,23 +2499,38 @@ mod tests {
         )
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-        host.create_space("space", "test-device", "/project", None, false).unwrap();
+        host.create_space("space", "test-device", "/project", None, false)
+            .unwrap();
         // The debounced save (1 s) writes a row delta...
         tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
-        assert!(store.row_delta_stats(REGISTRY_DOC_ID).unwrap().0 > 0, "no row delta was written");
+        assert!(
+            store.row_delta_stats(REGISTRY_DOC_ID).unwrap().0 > 0,
+            "no row delta was written"
+        );
         // ...and a quiet registry folds it into a whole save.
-        tokio::time::sleep(REGISTRY_COMPACT_WHEN_QUIET + std::time::Duration::from_millis(1_000)).await;
-        assert_eq!(store.row_delta_stats(REGISTRY_DOC_ID).unwrap(), (0, 0), "row deltas never folded in");
+        tokio::time::sleep(REGISTRY_COMPACT_WHEN_QUIET + std::time::Duration::from_millis(1_000))
+            .await;
+        assert_eq!(
+            store.row_delta_stats(REGISTRY_DOC_ID).unwrap(),
+            (0, 0),
+            "row deltas never folded in"
+        );
         let loaded = load_registry(&store, "test-device").unwrap().unwrap();
         assert_eq!(loaded.read_spaces().unwrap()[0].id, "space");
         // A busy registry still folds them in at the latest bound.
-        let whole = host.inner.whole_saves.load(std::sync::atomic::Ordering::Relaxed);
+        let whole = host
+            .inner
+            .whole_saves
+            .load(std::sync::atomic::Ordering::Relaxed);
         for i in 0..10 {
             host.rename_space("space", Some(&format!("n{i}"))).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         }
         assert!(
-            host.inner.whole_saves.load(std::sync::atomic::Ordering::Relaxed) > whole,
+            host.inner
+                .whole_saves
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > whole,
             "a busy registry never folded its deltas"
         );
     }
@@ -2526,12 +2574,23 @@ mod tests {
         };
         for i in 0..300 {
             let id = format!("chat-{i:03}");
-            host.create_chat(&id, None, Some("test-device"), None, Some(format!("/work/{i}"))).unwrap();
+            host.create_chat(
+                &id,
+                None,
+                Some("test-device"),
+                None,
+                Some(format!("/work/{i}")),
+            )
+            .unwrap();
             host.record_session(&session(&id, SessionStatus::Idle));
         }
         host.flush();
         host.inner.publish();
-        let whole = || host.inner.whole_saves.load(std::sync::atomic::Ordering::Relaxed);
+        let whole = || {
+            host.inner
+                .whole_saves
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         let parsed = || lock(&host.inner.reg).rows_parsed();
         let (whole_before, parsed_before) = (whole(), parsed());
         let mut chats = host.watch_chats();
@@ -2540,28 +2599,47 @@ mod tests {
         sessions.mark_unchanged();
         let statuses = [SessionStatus::Working, SessionStatus::Idle];
         for turn in 0..100 {
-            host.record_session(&session(&format!("chat-{:03}", turn % 5), statuses[turn % 2]));
+            host.record_session(&session(
+                &format!("chat-{:03}", turn % 5),
+                statuses[turn % 2],
+            ));
             host.inner.publish();
             let written = host.inner.persist(false).unwrap();
             assert!(written < 4_096, "change {turn} saved {written} B");
         }
-        assert_eq!(whole(), whole_before, "a whole registry save during a session-status stream");
+        assert_eq!(
+            whole(),
+            whole_before,
+            "a whole registry save during a session-status stream"
+        );
         assert_eq!(store.row_delta_stats(REGISTRY_DOC_ID).unwrap().0, 100);
         let reparsed = parsed() - parsed_before;
-        assert!(reparsed <= 100, "{reparsed} rows parsed for 100 one-row changes");
-        assert!(!chats.has_changed().unwrap(), "the chat list republished for session changes");
+        assert!(
+            reparsed <= 100,
+            "{reparsed} rows parsed for 100 one-row changes"
+        );
+        assert!(
+            !chats.has_changed().unwrap(),
+            "the chat list republished for session changes"
+        );
         assert!(sessions.has_changed().unwrap());
 
         // What's on disk loads back the same.
         let loaded = load_registry(&store, "test-device").unwrap().unwrap();
-        assert_eq!(loaded.read_sessions().unwrap(), host.read_sessions().unwrap());
+        assert_eq!(
+            loaded.read_sessions().unwrap(),
+            host.read_sessions().unwrap()
+        );
         assert_eq!(loaded.read_chats().unwrap(), host.read_chats().unwrap());
         // A flush (shutdown, a version change) folds them into a whole save.
         host.flush();
         assert_eq!(store.row_delta_stats(REGISTRY_DOC_ID).unwrap(), (0, 0));
         assert_eq!(whole(), whole_before + 1);
         let loaded = load_registry(&store, "test-device").unwrap().unwrap();
-        assert_eq!(loaded.read_sessions().unwrap(), host.read_sessions().unwrap());
+        assert_eq!(
+            loaded.read_sessions().unwrap(),
+            host.read_sessions().unwrap()
+        );
     }
 
     /// Server rows come back from the room after a restart; local writes
@@ -2586,7 +2664,11 @@ mod tests {
             },
         )
         .unwrap();
-        let saves = || host.inner.snapshot_saves.load(std::sync::atomic::Ordering::Relaxed);
+        let saves = || {
+            host.inner
+                .snapshot_saves
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         // Let boot's own writes settle.
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         host.flush();
@@ -2595,12 +2677,21 @@ mod tests {
         // A server frame applied (RegistryEvent::Applied): no local write.
         host.inner.bump_changed();
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-        assert_eq!(saves(), base, "a server-only change saved within the second");
+        assert_eq!(
+            saves(),
+            base,
+            "a server-only change saved within the second"
+        );
 
         // A local write: saved on the 1 s debounce, as before.
-        host.create_space("space", "test-device", "/project", None, false).unwrap();
+        host.create_space("space", "test-device", "/project", None, false)
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-        assert_eq!(saves(), base + 1, "a local write must save within the second");
+        assert_eq!(
+            saves(),
+            base + 1,
+            "a local write must save within the second"
+        );
 
         // A server change first, then a local write: the local deadline wins.
         host.inner.bump_changed();
@@ -2613,9 +2704,17 @@ mod tests {
         host.inner.bump_changed();
         host.flush();
         assert_eq!(saves(), base + 3);
-        let saved = host.inner.store.load_snapshot(REGISTRY_DOC_ID).unwrap().unwrap();
+        let saved = host
+            .inner
+            .store
+            .load_snapshot(REGISTRY_DOC_ID)
+            .unwrap()
+            .unwrap();
         let reloaded = RegistryDoc::from_bytes(&saved, "test-device").unwrap();
-        assert_eq!(reloaded.read_all().unwrap().spaces[0].name.as_deref(), Some("Renamed"));
+        assert_eq!(
+            reloaded.read_all().unwrap().spaces[0].name.as_deref(),
+            Some("Renamed")
+        );
     }
 
     #[tokio::test]
