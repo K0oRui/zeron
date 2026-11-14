@@ -494,7 +494,7 @@ mod tests {
                 .unwrap();
         let mut listener = server(3000, 1, "server.js");
         listener.args.extend([
-            "--token=abc".into(),
+            "--token=zqx".into(),
             "--password".into(),
             "hunter2".into(),
             "https://user:pass@host/x?key=1".into(),
@@ -504,7 +504,7 @@ mod tests {
             .unwrap();
         let advertised = serde_json::to_string(&catalog.snapshot().services).unwrap();
         assert!(advertised.contains(r#""process":"node server.js""#), "{advertised}");
-        for secret in ["abc", "hunter2", "user:pass", "key=1", "--token", "--password"] {
+        for secret in ["zqx", "hunter2", "user:pass", "key=1", "--token", "--password"] {
             assert!(!advertised.contains(secret), "{secret} in {advertised}");
         }
     }
