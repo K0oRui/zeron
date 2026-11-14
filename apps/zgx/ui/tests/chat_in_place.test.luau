@@ -520,7 +520,10 @@ test("long messages open folded, never at their whole height first; a click ease
 	app:click(`role:button "Expand message"[{n}]`)
 	local seen: { number } = {}
 	for _ = 1, 30 do
-		app:wait("#never-shown", { timeout_ms = 16 })
+		-- One frame per sample: a wall-clock wait can skip the ease's
+		-- intermediate heights on a busy runner, failing the "between"
+		-- assertion below with nothing wrong.
+		app:frames(1)
 		local hs = bubbles(app)
 		table.insert(seen, hs[#hs])
 	end
