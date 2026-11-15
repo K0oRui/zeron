@@ -86,7 +86,12 @@ elif [[ "$PROFILE" == "release" ]]; then
   # so its size is wake time. Only here: macOS and Windows keep their build times.
   # The release was already stripped, with no debug info to split. Luau (the
   # engine's visuals and plugin services) without its asserts.
-  CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 LUAU_CXXFLAGS=-DNDEBUG \
+  # Fat LTO with one codegen unit gives the smallest binary, but its link
+  # needs more memory and time than the Arm runner has: that link was killed
+  # at about 23 minutes there. release.yml picks `thin` for Arm.
+  CARGO_PROFILE_RELEASE_LTO="${ZERON_RELEASE_LTO:-fat}" \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${ZERON_RELEASE_CODEGEN_UNITS:-1}" \
+    LUAU_CXXFLAGS=-DNDEBUG \
     cargo build --release -p zeron
   BIN="$ROOT/target/release/zeron"
 else

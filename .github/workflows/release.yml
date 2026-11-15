@@ -153,7 +153,10 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04 # x86_64
+            lto: fat
           - runner: ubuntu-24.04-arm # aarch64
+            # Fat LTO's link is too much for this runner (killed around 23m).
+            lto: thin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -171,6 +174,8 @@ jobs:
       - name: package
         # `bash <script>`, never the bare path: the checkout's exec bit is not
         # something a release can depend on.
+        env:
+          ZERON_RELEASE_LTO: ${{ matrix.lto }}
         run: bash scripts/package/package-linux.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
