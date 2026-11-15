@@ -451,7 +451,7 @@ pub fn render_shader(
     let (read, write) = (state.latest, 1 - state.latest);
 
     let mut uniforms = *uniforms;
-    &mut uniforms.channels.fill([width as f32, height as f32, 1.0, 0.0]);
+    uniforms.channels.fill([width as f32, height as f32, 1.0, 0.0]);
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("shader inputs"),
         contents: uniforms.as_bytes(),

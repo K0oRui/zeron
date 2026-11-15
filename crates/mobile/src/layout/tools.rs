@@ -1138,7 +1138,7 @@ fn place_block(block: &DetailBlock, px: Px, bx: f32, by: f32, bw: f32, out: Opti
 /// Subagent spawns: 38pt rows holding a bordered 30pt card — icon tile,
 /// "Agent", the description, the model it was given, then a mini spinner
 /// while it runs or a chevron: the whole card opens the child's transcript.
-fn place_agents(t: &ToolGroup, px: Px, x: f32, y: f32, cw: f32, mut out: Option<&mut DisplayBuilder>) -> f32 {
+fn place_agents(t: &ToolGroup, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut DisplayBuilder>) -> f32 {
     let row = d(px, AGENT_ROW);
     let h = row * t.lines.len() as f32;
     let Some(o) = out else { return h };

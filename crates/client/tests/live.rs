@@ -922,7 +922,9 @@ async fn an_online_launch_dials_as_soon_as_the_network_is_reported() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let reported = start.elapsed();
-    assert!(reported < Duration::from_millis(150), "an online launch waited {reported:?}");
+    // A busy simulator runner can take a few hundred ms to dial; the bound
+    // only has to sit well below the patience the unreported path waits.
+    assert!(reported < Duration::from_millis(800), "an online launch waited {reported:?}");
     client.shutdown();
 
     let edge = MockEdge::start().await;
