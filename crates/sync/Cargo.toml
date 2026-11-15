@@ -38,3 +38,6 @@ tempfile.workspace = true
 base64 = "0.22"
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

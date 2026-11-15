@@ -15,3 +15,6 @@ path = "src/main.rs"
 [dependencies]
 # Must match zeron-mobile's uniffi: the generator reads its metadata.
 uniffi = { version = "0.32", features = ["cli"] }
+
+[lints]
+workspace = true

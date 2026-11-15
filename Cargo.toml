@@ -37,6 +37,48 @@ members = [
     "apps/zeron",
 ]
 
+# This fork allows clippy's style and API-shape lints. They are judgement calls
+# the upstream project makes differently, and rewriting them here would diverge
+# from code we keep syncing. Correctness lints still warn, and a build fails on
+# errors. Every member opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+blocks_in_conditions = "allow"
+chunks_exact_to_as_chunks = "allow"
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+field_reassign_with_default = "allow"
+format_in_format_args = "allow"
+if_same_then_else = "allow"
+large_enum_variant = "allow"
+len_without_is_empty = "allow"
+len_zero = "allow"
+manual_clamp = "allow"
+manual_is_multiple_of = "allow"
+map_entry = "allow"
+match_like_matches_macro = "allow"
+module_inception = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_return = "allow"
+possible_missing_else = "allow"
+question_mark = "allow"
+redundant_closure = "allow"
+redundant_field_names = "allow"
+redundant_iter_cloned = "allow"
+redundant_locals = "allow"
+result_large_err = "allow"
+result_unit_err = "allow"
+too_many_arguments = "allow"
+trim_split_whitespace = "allow"
+type_complexity = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_operation = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_unwrap = "allow"
+wrong_self_convention = "allow"
+
 [workspace.package]
 version = "0.3.4"
 edition = "2024"

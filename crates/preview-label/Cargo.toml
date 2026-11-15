@@ -7,3 +7,6 @@ publish.workspace = true
 description = "A preview's process label and its redacted command line, shared by Zeron's engine and its zgx app"
 
 [dependencies]
+
+[lints]
+workspace = true

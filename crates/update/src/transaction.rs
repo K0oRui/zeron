@@ -742,6 +742,7 @@ fn discard_snapshots(data_dir: &Path) {
 // ---------------------------------------------------------------------------
 
 /// How long the new version gets, by how much it may have to migrate.
+#[cfg(test)]
 fn trial_deadline(store_bytes: u64) -> Duration {
     trial_deadline_from(BASE_DEADLINE, store_bytes)
 }

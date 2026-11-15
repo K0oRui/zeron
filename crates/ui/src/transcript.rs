@@ -8029,7 +8029,7 @@ impl Transcript {
             if !live {
                 return None;
             }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000);
+            let elapsed = (now.timestamp_millis() - last.created_at).max(0) / 1000;
             (
                 false,
                 false,
@@ -8087,7 +8087,7 @@ impl Transcript {
                 // and keyed on it, so neither restarts when the machine's
                 // turn begins.
                 if let Some(sent) = state.cloud_setup_turn_started() {
-                    let elapsed = ((now.timestamp_millis() - sent).max(0) / 1000);
+                    let elapsed = (now.timestamp_millis() - sent).max(0) / 1000;
                     // A woken machine installing a release says so under
                     // its steps, in place of the working word.
                     let updating = state.send_waits_on_update(&chat_id, now);
