@@ -40,7 +40,10 @@ permissions:
 # push event, and this workflow only runs on push/workflow_dispatch.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # A lost runner can leave a run "in progress" for an hour, and a queued run
+  # behind it then never starts. A newer run supersedes the older one; publish
+  # a tag deliberately by re-running it.
+  cancel-in-progress: true
 
 jobs:
   # Decides whether this run publishes at all. Cheap on purpose: an unchanged
