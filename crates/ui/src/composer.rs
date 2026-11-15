@@ -166,7 +166,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
-    (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+    (ms_since_activity / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 /// Auto-grow: content height for a wrapped-line count.
@@ -489,6 +489,21 @@ pub fn flip_morph_step(
 /// BOTH the local engine (an IPC daemon may be older than this UI) and, for
 /// remotely-hosted chats, the host device's stamped registry version.
 const QUEUED_ATTACHMENTS_MIN: (u64, u64, u64) = (0, 2, 12);
+
+/// Whether a send's files commit locally and travel as `pending://` refs, or
+/// upload straight to the host first. Through the store it's every send, since
+/// the host may be asleep. Over a peer link, a queue row has no escort and an
+/// app capture's escaped refs need a host that rewrites them, so those upload
+/// first (and a host too old for refs has no choice).
+fn uses_queued_flow(
+    has_files: bool,
+    queue: bool,
+    has_appshots: bool,
+    refs_supported: bool,
+    through_store: bool,
+) -> bool {
+    has_files && (through_store || (!queue && !has_appshots && refs_supported))
+}
 
 /// What the send button is right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1458,11 +1473,10 @@ impl TextProjection {
 
     fn raw_to_display(&self, raw: usize) -> usize {
         let ix = self.mappings.partition_point(|(range, _)| range.end <= raw);
-        if let Some((range, display)) = self.mappings.get(ix) {
-            if raw > range.start {
+        if let Some((range, display)) = self.mappings.get(ix)
+            && raw > range.start {
                 return display.start;
             }
-        }
         let (raw_at, display_at) = ix
             .checked_sub(1)
             .map(|previous| (&self.mappings[previous].0, &self.mappings[previous].1))
@@ -1476,15 +1490,14 @@ impl TextProjection {
         let ix = self
             .mappings
             .partition_point(|(_, display)| display.end <= display_offset);
-        if let Some((range, display)) = self.mappings.get(ix) {
-            if display_offset > display.start {
+        if let Some((range, display)) = self.mappings.get(ix)
+            && display_offset > display.start {
                 return if display_offset - display.start < display.len() / 2 {
                     range.start
                 } else {
                     range.end
                 };
             }
-        }
         let (raw_at, display_at) = ix
             .checked_sub(1)
             .map(|previous| (&self.mappings[previous].0, &self.mappings[previous].1))
@@ -2965,11 +2978,10 @@ impl ComposerInput {
             return false;
         }
         // Repeated clicks/Enter only mark one pending send and end audio once.
-        if self.dictation.finish(send, Instant::now()) {
-            if let Some(transcriber) = &mut self.transcriber {
+        if self.dictation.finish(send, Instant::now())
+            && let Some(transcriber) = &mut self.transcriber {
                 transcriber.finish();
             }
-        }
         cx.emit(DictationInputEvent::Changed);
         cx.notify();
         true
@@ -3709,13 +3721,12 @@ impl ComposerInput {
             return;
         }
         if let Some(mut text) = item.text() {
-            if self.mentions_enabled {
-                if let Some(value) = item
+            if self.mentions_enabled
+                && let Some(value) = item
                     .metadata()
                     .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                {
-                    if value.get("text").and_then(|v| v.as_str()) == Some(text.as_str()) {
-                        if let Some(raw) = value.get("zeronComposerV1").and_then(|v| v.as_str()) {
+                    && value.get("text").and_then(|v| v.as_str()) == Some(text.as_str())
+                        && let Some(raw) = value.get("zeronComposerV1").and_then(|v| v.as_str()) {
                             // Chip numbers belong to one draft: chips copied from
                             // another chat would name the wrong attachment, so
                             // they paste as their plain labels instead.
@@ -3730,9 +3741,6 @@ impl ComposerInput {
                                 text = raw.to_owned();
                             }
                         }
-                    }
-                }
-            }
             // Clipboard operations remain separate undo steps, even a one-character paste.
             self.last_edit = None;
             self.replace_text_in_range(None, &text, window, cx);
@@ -3782,15 +3790,14 @@ impl ComposerInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none() {
-            if let Some((range, inserted)) =
+        if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none()
+            && let Some((range, inserted)) =
                 composer_markdown::newline_edit(&self.content, self.cursor_offset())
             {
                 let range = self.range_to_utf16(&range);
                 self.replace_text_in_range(Some(range), &inserted, window, cx);
                 return;
             }
-        }
         let line_end = self.line_range_at(self.cursor_offset()).end;
         let newline = if self.line_content_end_at(self.cursor_offset()) < line_end {
             "\r\n"
@@ -4640,8 +4647,8 @@ impl ComposerInput {
                 .next()
                 .unwrap_or_default();
             let mut indent = px(0.0);
-            if self.mentions_enabled && !is_placeholder {
-                if let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
+            if self.mentions_enabled && !is_placeholder
+                && let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
                     let marker_at = raw_at + prefix.indent;
                     let code_ix = code_ranges.partition_point(|range| range.end <= marker_at);
                     !code_ranges
@@ -4661,7 +4668,6 @@ impl ComposerInput {
                         .width
                         .min(width * 0.4);
                 }
-            }
             let end = display_at + text.len();
             let first_run = run_ranges.partition_point(|(r, _)| r.end <= display_at);
             let line_runs: Vec<TextRun> = run_ranges[first_run..]
@@ -4783,8 +4789,8 @@ impl ComposerInput {
             return self.scroll_left != previous;
         }
         let previous = self.scroll_top;
-        if self.follow_cursor {
-            if let Some(cursor) = self.cursor_point() {
+        if self.follow_cursor
+            && let Some(cursor) = self.cursor_point() {
                 self.scroll_top = input_scroll_offset_for_cursor(
                     self.scroll_top,
                     f32::from(cursor.y),
@@ -4794,7 +4800,6 @@ impl ComposerInput {
                     self.settled_viewport_height,
                 );
             }
-        }
         self.scroll_top = self.scroll_top.clamp(
             0.0,
             input_max_scroll(
@@ -9421,12 +9426,7 @@ impl Composer {
         let host_is_remote = host_device_id
             .as_deref()
             .is_some_and(|id| local_device_id.as_deref() != Some(id));
-        // Queue rows do not carry upstream's attachment-transfer escort, so
-        // they retain the proven host-upload path and store absolute refs.
-        // Appshot XML attributes require escaped final paths. The engine's plain
-        // string replacement of pending refs cannot safely rewrite those, so
-        // rich captures use the existing upload-before-send path.
-        let queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
+        let queued_flow = {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -9435,7 +9435,23 @@ impl Composer {
                 || host_device_id
                     .as_deref()
                     .is_some_and(|id| state.device_version_at_least(id, QUEUED_ATTACHMENTS_MIN));
-            local_ok && host_ok
+            // A new Cloud chat's machine doesn't exist yet: it can't have
+            // reported in, and it's as current as Cloud gets.
+            let through_store = engine
+                .engine_info()
+                .supports(capabilities::ATTACHMENT_STORE_V1)
+                && (matches!(plan, crate::pickers::CheckoutPlan::Cloud { .. }) && is_new
+                    || host_is_remote
+                        && host_device_id
+                            .as_deref()
+                            .is_some_and(|id| state.host_fetches_from_store(id)));
+            uses_queued_flow(
+                !staged.is_empty(),
+                queue,
+                !staged_appshots.is_empty(),
+                local_ok && host_ok,
+                through_store,
+            )
         };
         // Upload identities minted NOW: in the queued flow the `pending://`
         // ref IS the persisted transport until the host rewrites it, so the
@@ -9921,12 +9937,15 @@ impl Composer {
                     } else {
                         queue_body.as_str()
                     };
-                    let params = serde_json::json!({
+                    let mut params = serde_json::json!({
                         "chatId": chat_id,
                         "text": queue_text,
                         "attachments": attachment_paths,
                         "holdForTurnEnd": true,
                     });
+                    if !transfers.is_empty() {
+                        params["transfers"] = serde_json::Value::Array(transfers);
+                    }
                     let reply = engine
                         .client()
                         .call(methods::QUEUE_MESSAGE, params)
@@ -13382,6 +13401,7 @@ mod tests {
                 terminal_activity: None,
                 running_subagents: 0,
                 background_tasks: Vec::new(),
+                waiting: None,
             }];
             state.selected_chat = Some("c".into());
             state.watch_clock_transitions(cx);
@@ -17313,6 +17333,24 @@ mod appshot_rebase_tests {
                 0
             ));
         });
+    }
+
+    #[test]
+    fn every_send_through_the_store_stages_locally_however_it_was_attached() {
+        // No files, nothing to stage.
+        assert!(!uses_queued_flow(false, false, false, true, true));
+        // Cloud: a plain send, a queued one, an app capture, all the same.
+        assert!(uses_queued_flow(true, false, false, true, true));
+        assert!(uses_queued_flow(true, true, false, true, true));
+        assert!(uses_queued_flow(true, false, true, true, true));
+        assert!(uses_queued_flow(true, true, true, true, true));
+        // A machine that hasn't reported a version still goes through the store.
+        assert!(uses_queued_flow(true, false, true, false, true));
+        // Peer link: only a plain send to a host that understands refs.
+        assert!(uses_queued_flow(true, false, false, true, false));
+        assert!(!uses_queued_flow(true, true, false, true, false));
+        assert!(!uses_queued_flow(true, false, true, true, false));
+        assert!(!uses_queued_flow(true, false, false, false, false));
     }
 
     #[gpui::test]

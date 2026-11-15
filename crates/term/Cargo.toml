@@ -10,3 +10,6 @@ publish.workspace = true
 # mobile core both paint it.
 [dependencies]
 alacritty_terminal.workspace = true
+
+[lints]
+workspace = true

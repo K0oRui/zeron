@@ -163,13 +163,12 @@ impl Shell {
         } else {
             self.state.read(cx).sidebar_preferences.sections.clone()
         };
-        if !local && self.optimistic_sidebar_pins(cx).is_some() {
-            if let Some(pending) = &self.sidebar_pin_write {
+        if !local && self.optimistic_sidebar_pins(cx).is_some()
+            && let Some(pending) = &self.sidebar_pin_write {
                 for change in &pending.queue {
                     change.project_sections(&mut sections);
                 }
             }
-        }
         sections
     }
 

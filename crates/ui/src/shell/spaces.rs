@@ -3898,7 +3898,8 @@ pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         // Non-done statuses sit well below full
         // strength: at full alpha the colored words shouted across the
         // whole sidebar (user request) — only Done keeps its pop.
-        ChatIndicator::Working => theme.busy.opacity(0.55),
+        // (Waiting reads as Working here: `display_status_for`.)
+        ChatIndicator::Working | ChatIndicator::Waiting => theme.busy.opacity(0.55),
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
         ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
@@ -4562,8 +4563,8 @@ impl Shell {
             self.cancel_sidebar_session_transfer(cx);
             return;
         }
-        if let SidebarSessionDrop::Section(id) = &target {
-            if !self
+        if let SidebarSessionDrop::Section(id) = &target
+            && !self
                 .active_sidebar_sections(cx)
                 .iter()
                 .any(|section| &section.id == id)
@@ -4571,7 +4572,6 @@ impl Shell {
                 self.cancel_sidebar_session_transfer(cx);
                 return;
             }
-        }
         let saved = self.raw_sidebar_pins(cx);
         let next = sidebar_session_drop_pins(
             &saved,
@@ -5221,14 +5221,13 @@ impl Shell {
             }
         }
         self.schedule_save(cx);
-        if row.closes_submenu() {
-            if let Some(menu) = self.sidebar_view_menu.open_mut() {
+        if row.closes_submenu()
+            && let Some(menu) = self.sidebar_view_menu.open_mut() {
                 menu.submenu = None;
                 menu.submenu_active = None;
                 menu.submenu_bounds = None;
                 menu.hover_intent.cancel();
             }
-        }
         cx.notify();
     }
 
@@ -5334,13 +5333,12 @@ impl Shell {
             }
             "right" | "enter" | "space" => {
                 if let Some(group) = menu.submenu {
-                    if key == "enter" {
-                        if let Some(choice) = menu.submenu_active {
+                    if key == "enter"
+                        && let Some(choice) = menu.submenu_active {
                             let row =
                                 SIDEBAR_VIEW_ROWS[SIDEBAR_VIEW_GROUPS[group].1.start + choice];
                             self.activate_sidebar_view_row(row, cx);
                         }
-                    }
                 } else {
                     let group = menu.active.unwrap_or(0);
                     if group == SIDEBAR_VIEW_GROUPS.len() + 1 {
@@ -5473,12 +5471,11 @@ impl Shell {
                     move |bounds, window, cx| {
                         let left = bounds.right() + px(244.0) > window.viewport_size().width;
                         let _ = entity.update(cx, |this, cx| {
-                            if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                                if menu.submenu_on_left != left {
+                            if let Some(menu) = this.sidebar_view_menu.open_mut()
+                                && menu.submenu_on_left != left {
                                     menu.submenu_on_left = left;
                                     cx.notify();
                                 }
-                            }
                         });
                     },
                     move |trigger, _, window, _| {
@@ -6493,8 +6490,8 @@ impl Shell {
                     .read(cx)
                     .space_for_chat(chat)
                     .map(zeron_proto::view::project_key);
-                if let Some(key) = project_key {
-                    if self.settings.sidebar_organization == SidebarOrganization::ByProject
+                if let Some(key) = project_key
+                    && self.settings.sidebar_organization == SidebarOrganization::ByProject
                         && section.project_keys.contains(&key)
                     {
                         let collapse_key = self.sidebar_group_collapse_key(&key);
@@ -6503,7 +6500,6 @@ impl Shell {
                             .sidebar_collapsed_groups
                             .remove(&collapse_key);
                     }
-                }
             } else if let Some(group) = self.sidebar_group_key(self.state.read(cx), chat) {
                 let collapse_key = self.sidebar_group_collapse_key(&group);
                 if self
@@ -6705,7 +6701,7 @@ impl Shell {
         let mut rows: Vec<ActiveChatRow> = chats_sorted
             .iter()
             .map(|&(status, chat)| {
-                self.sidebar_chat_data(status, chat, &state, Some(&project_by_space))
+                self.sidebar_chat_data(status, chat, state, Some(&project_by_space))
             })
             .collect();
         // Pins lead, in the user's own order; every other row keeps the recency
@@ -7377,8 +7373,8 @@ impl Shell {
                 }
                 continue;
             };
-            if let Some(id) = key.strip_prefix("section:") {
-                if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
+            if let Some(id) = key.strip_prefix("section:")
+                && let Some(section) = custom_sections.iter().find(|section| section.id == id) {
                     let drag =
                         section_order
                             .clone()
@@ -7423,7 +7419,6 @@ impl Shell {
                     ));
                     continue;
                 }
-            }
             let collapse_key = self.sidebar_group_collapse_key(&key);
             let motion_key = format!("group:{collapse_key}");
             let collapsed = self
@@ -7809,7 +7804,7 @@ impl Shell {
         chats
             .into_iter()
             .map(|chat| {
-                self.sidebar_chat_data(state.display_status_for(chat, now), chat, &state, None)
+                self.sidebar_chat_data(state.display_status_for(chat, now), chat, state, None)
             })
             .collect()
     }
@@ -8904,7 +8899,7 @@ impl Shell {
             return;
         };
         match flow.step {
-            ProjectStep::Devices => return,
+            ProjectStep::Devices => (),
             ProjectStep::Locations | ProjectStep::Repositories => {
                 self.add_space_back_to(ProjectStep::Devices, cx)
             }
@@ -10738,6 +10733,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            sleep: None,
         }
     }
 

@@ -86,8 +86,8 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice,
-    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus, ToolCall,
-    UserInputAnswer, UserInputQuestion,
+    ModelProvider, ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, TodoStatus,
+    ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::process::{Child, Command, Stdio};
@@ -550,15 +550,9 @@ impl OpencodeHarness {
             });
         }
         let result = if let Some(restore) = files {
-            rewind::commit(
-                &server,
-                &session_id,
-                directory.as_deref(),
-                &target,
-                restore,
-            )
-            .await
-            .map(|()| None)
+            rewind::commit(&server, &session_id, directory.as_deref(), &target, restore)
+                .await
+                .map(|()| None)
         } else {
             rewind::preview(&server, &session_id, directory.as_deref(), &target)
                 .await
@@ -706,8 +700,10 @@ impl Harness for OpencodeHarness {
     fn fallback_models(&self) -> Vec<Model> {
         vec![
             Model {
+                default: false,
                 id: "opencode/beam-free".into(),
                 label: "Beam Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -719,8 +715,10 @@ impl Harness for OpencodeHarness {
                 options: vec![],
             },
             Model {
+                default: false,
                 id: "opencode/flint-40b-free".into(),
                 label: "Flint 40B Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -1124,9 +1122,13 @@ impl Server {
                 .get("OPENCODE_CONFIG_CONTENT")
                 .cloned()
                 .or_else(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok());
-            let mut inline =
-                inline_config(inherited.as_deref(), mcp_layer, extra_mcp, headroom.as_ref())
-                    .map_err(fatal)?;
+            let mut inline = inline_config(
+                inherited.as_deref(),
+                mcp_layer,
+                extra_mcp,
+                headroom.as_ref(),
+            )
+            .map_err(fatal)?;
             if restricted {
                 // A restricted run never starts without its rules: it would
                 // do unasked what the person chose to approve.
@@ -1838,8 +1840,13 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
                 levels.sort();
                 levels.dedup();
                 Model {
+                    default: false,
                     id: format!("{provider_id}/{model_id}"),
                     label,
+                    provider: Some(ModelProvider {
+                        id: provider_id.to_owned(),
+                        name: provider_name.to_owned(),
+                    }),
                     description: Some(provider_name.to_owned()),
                     reasoning_levels: levels,
                     options: Vec::new(),
@@ -1854,8 +1861,10 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
     if out.is_empty() {
         out = vec![
             Model {
+                default: false,
                 id: "opencode/beam-free".into(),
                 label: "Beam Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -1867,8 +1876,10 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
                 options: vec![],
             },
             Model {
+                default: false,
                 id: "opencode/flint-40b-free".into(),
                 label: "Flint 40B Free".into(),
+                provider: None,
                 description: Some("OpenCode free tier model".into()),
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
@@ -4920,6 +4931,8 @@ fn part_snapshot_events(
                     is_error: status == "error",
                     output,
                     diff: None,
+                    preview_paths: Vec::new(),
+                    image_payloads: Vec::new(),
                     exit_code: None,
                 });
             }
@@ -6299,7 +6312,16 @@ const ASKED_PERMISSIONS: [&str; 3] = ["bash", "webfetch", "websearch"];
 /// live on 1.19.4): looking around, the agent's own todo list and
 /// questions, and subagents, whose tools answer to the same rules.
 const UNASKED_PERMISSIONS: [&str; 10] = [
-    "read", "glob", "grep", "list", "lsp", "todoread", "todowrite", "question", "task", "skill",
+    "read",
+    "glob",
+    "grep",
+    "list",
+    "lsp",
+    "todoread",
+    "todowrite",
+    "question",
+    "task",
+    "skill",
 ];
 
 /// Where the `plan` agent writes its plan: `.opencode/plans/` in a
@@ -6904,7 +6926,8 @@ mod headroom_injection_tests {
         // plugin resolved for a proxy that never answered.
         assert!(HeadroomRoute::from_env(&env(&[("HEADROOM_PROXY_URL", "   ")])).is_none());
         assert!(
-            HeadroomRoute::from_env(&env(&[("ZERON_HEADROOM_OPENCODE_PLUGIN", "/p/nope")])).is_none()
+            HeadroomRoute::from_env(&env(&[("ZERON_HEADROOM_OPENCODE_PLUGIN", "/p/nope")]))
+                .is_none()
         );
     }
 }

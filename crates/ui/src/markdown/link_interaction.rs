@@ -238,9 +238,9 @@ impl Element for LinkRanges {
                     overlays.push(hit);
                 }
             }
-            if state.menu.borrow().is_none() && !state.dismissed.get() {
-                if let Some(index) = focused {
-                    if let Some(rect) =
+            if state.menu.borrow().is_none() && !state.dismissed.get()
+                && let Some(index) = focused
+                    && let Some(rect) =
                         range_rects(&self.layout, &self.links[index].0, 0., 0.).first()
                     {
                         let shown = self
@@ -286,8 +286,6 @@ impl Element for LinkRanges {
                         );
                         overlays.push(popup);
                     }
-                }
-            }
             if let Some((index, position)) = *state.menu.borrow() {
                 let theme = theme.for_popup();
                 let menu = state.menu.clone();

@@ -37,8 +37,50 @@ members = [
     "apps/zeron",
 ]
 
+# This fork allows clippy's style and API-shape lints. They are judgement calls
+# the upstream project makes differently, and rewriting them here would diverge
+# from code we keep syncing. Correctness lints still warn, and a build fails on
+# errors. Every member opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+blocks_in_conditions = "allow"
+chunks_exact_to_as_chunks = "allow"
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_doc_comments = "allow"
+explicit_counter_loop = "allow"
+field_reassign_with_default = "allow"
+format_in_format_args = "allow"
+if_same_then_else = "allow"
+large_enum_variant = "allow"
+len_without_is_empty = "allow"
+len_zero = "allow"
+manual_clamp = "allow"
+manual_is_multiple_of = "allow"
+map_entry = "allow"
+match_like_matches_macro = "allow"
+module_inception = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_return = "allow"
+possible_missing_else = "allow"
+question_mark = "allow"
+redundant_closure = "allow"
+redundant_field_names = "allow"
+redundant_iter_cloned = "allow"
+redundant_locals = "allow"
+result_large_err = "allow"
+result_unit_err = "allow"
+too_many_arguments = "allow"
+trim_split_whitespace = "allow"
+type_complexity = "allow"
+unnecessary_get_then_check = "allow"
+unnecessary_operation = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_unwrap = "allow"
+wrong_self_convention = "allow"
+
 [workspace.package]
-version = "0.2.137"
+version = "0.3.4"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -113,15 +155,18 @@ loro-protocol = "0.3"
 # Atlas tiles updated in place from pixels or imported dma-bufs, display-rate
 # frame callbacks in inactive windows, and Wayland frames that no longer stop
 # after a forced draw (b564a34, zeronsh/zui#18).
-gpui = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef1da04121c4a287758f94993d9" }
-gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef1da04121c4a287758f94993d9", features = [
+# Dropped images stay in the atlas until the next draw, so presenting the last
+# frame again no longer aborts with "texture must exist" (15ee708,
+# zeronsh/zui#19; gpui-base cab50b0, zeronsh/gpui-component#7).
+gpui = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "b564a34413bb7ef1da04121c4a287758f94993d9" }
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "59f89243cea79dd70eb7a619b3930c374ef6958a" }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "cab50b071497683a119ae0e4038880f195c0f23f" }
 
 # diffs
 similar = "2"
@@ -188,6 +233,8 @@ fff-search = "=0.11.0"
 [profile.release]
 # Distribution profile (scripts/package/package-linux.sh): thin LTO buys most of fat
 # LTO's size/speed win at a fraction of the link time; strip debug symbols.
+# scripts/package-linux.sh builds the Linux release with fat LTO in one codegen
+# unit instead (16% smaller, which Cloud wakes copy back in).
 lto = "thin"
 strip = "symbols"
 

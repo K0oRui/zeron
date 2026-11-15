@@ -286,7 +286,7 @@ fn change_message(before: &Snapshot, now: &Snapshot, status: &BillingStatus) -> 
 
 /// `$20` (whole dollars), `$12.50` otherwise.
 pub fn format_price(cents: u32) -> String {
-    if cents % 100 == 0 {
+    if cents.is_multiple_of(100) {
         format!("${}", cents / 100)
     } else {
         format!("${}.{:02}", cents / 100, cents % 100)
@@ -304,10 +304,10 @@ fn short_date(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// "about 750 hours" of the default machine.
+/// "about 750 small-machine hours": a credit is a minute of a small machine.
 fn hours(credits: f64) -> String {
     format!(
-        "about {} hours",
+        "about {} small-machine hours",
         crate::cloud::group_number((credits / 60.0).round())
     )
 }
@@ -991,7 +991,7 @@ mod tests {
     fn prices_and_changes_read_naturally() {
         assert_eq!(format_price(2000), "$20");
         assert_eq!(format_price(1250), "$12.50");
-        assert_eq!(hours(45000.0), "about 750 hours");
+        assert_eq!(hours(45000.0), "about 750 small-machine hours");
         let before = status(None, 0.0, false);
         let bought = status(None, 24000.0, false);
         assert_eq!(

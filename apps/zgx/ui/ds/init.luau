@@ -26,6 +26,7 @@ export type SidebarProject = sidebar.Project
 export type StatusKind = status.Kind
 export type Harness = model_picker.Harness
 export type Model = model_picker.Model
+export type ComposerSizes = composer.Sizes
 export type ComposerDevice = composer.Device
 export type ComposerUsage = composer.Usage
 export type ComposerFixed = composer.Fixed
@@ -117,6 +118,7 @@ return {
 	Select = require("@self/select"),
 	Slider = require("@self/slider"),
 	NumberStepper = require("@self/stepper"),
+	DatePicker = require("@self/date_picker"),
 	Tabs = require("@self/tabs"),
 	Badge = badge.Badge,
 	Tag = badge.Tag,

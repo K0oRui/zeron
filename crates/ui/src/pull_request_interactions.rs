@@ -157,7 +157,7 @@ impl PullRequestDetailPage {
                     }
                 }
             }
-            let _ = submission.update(cx, |submission, cx| {
+            submission.update(cx, |submission, cx| {
                 submission.result = Some(result);
                 cx.notify();
             });

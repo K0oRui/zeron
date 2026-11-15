@@ -28,3 +28,6 @@ harness = false
 core-text = "21"
 core-foundation = "0.10"
 core-graphics = "0.24"
+
+[lints]
+workspace = true

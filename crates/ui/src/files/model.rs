@@ -566,11 +566,10 @@ impl FileTreeModel {
             }
             self.nodes.insert(next, node);
         }
-        if let Some(entry) = entry {
-            if let Some(node) = self.nodes.get_mut(new) {
+        if let Some(entry) = entry
+            && let Some(node) = self.nodes.get_mut(new) {
                 node.entry = entry;
             }
-        }
         self.expanded = self.expanded.iter().map(|p| remap(p)).collect();
         self.selected = self.selected.as_deref().map(remap);
         self.selection = self.selection.iter().map(|p| remap(p)).collect();
@@ -581,11 +580,10 @@ impl FileTreeModel {
             ancestor = parent_path(&path);
         }
         self.listing_children.clear();
-        if let Some(parent) = self.nodes.get_mut(&new_parent) {
-            if !parent.children.iter().any(|p| p == new) {
+        if let Some(parent) = self.nodes.get_mut(&new_parent)
+            && !parent.children.iter().any(|p| p == new) {
                 parent.children.push(new.into());
             }
-        }
         for parent in [&old_parent, &new_parent] {
             if let Some(node) = self.nodes.get_mut(parent) {
                 node.stale = true;

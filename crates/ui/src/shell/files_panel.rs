@@ -308,17 +308,17 @@ impl Shell {
                         this.attach_workspace_drag(&payload, &composer, window, cx);
                     }
                     FilesEvent::Mutate(intent)
-                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                        if this.accepts_file_navigation(&owner, source, cx) =>
                     {
                         this.start_file_mutation(source.clone(), intent.clone(), cx);
                     }
                     FilesEvent::MutateMany(intents)
-                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                        if this.accepts_file_navigation(&owner, source, cx) =>
                     {
                         this.start_file_mutations(source.clone(), intents.clone(), cx);
                     }
                     FilesEvent::OpenFile(path)
-                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                        if this.accepts_file_navigation(&owner, source, cx) =>
                     {
                         this.add_file_surface(path.clone(), window, cx);
                     }

@@ -52,8 +52,8 @@ impl AudioIo {
         let failed = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(generation));
-        let ic: StreamConfig = input_config.clone().into();
-        let oc: StreamConfig = output_config.clone().into();
+        let ic: StreamConfig = input_config.into();
+        let oc: StreamConfig = output_config.into();
         if ic.channels == 0 || oc.channels == 0 || ic.channels > 8 || oc.channels > 8 {
             return Err(AudioError::Device);
         }

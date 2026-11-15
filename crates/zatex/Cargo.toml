@@ -18,3 +18,6 @@ bundled = []
 
 [dev-dependencies]
 tiny-skia = "0.11"
+
+[lints]
+workspace = true

@@ -340,11 +340,10 @@ fn diff_block(ctx: &mut Ctx, st: &Styles, diff: &zeron_proto::ToolDiff) -> Optio
 /// Result detail (desktop `tool_detail`): a diff wins, then stats, then output.
 fn result_block(ctx: &mut Ctx, st: &Styles, part: &MessagePart) -> Option<DetailBlock> {
     let MessagePart::Tool { output, diff, diff_stats, .. } = part else { return None };
-    if let Some(diff) = diff {
-        if let Some(b) = diff_block(ctx, st, diff) {
+    if let Some(diff) = diff
+        && let Some(b) = diff_block(ctx, st, diff) {
             return Some(b);
         }
-    }
     if let Some(stats) = diff_stats.as_ref().filter(|s| !s.is_empty()) {
         return Some(DetailBlock::Stats(
             stats
@@ -1010,11 +1009,10 @@ fn place_line_header(line: &ToolLine, px: Px, x: f32, ry: f32, cw: f32, o: &mut 
             );
             place_text_lines(name, dx + d(px, 27.0), ry + (row_h - name.lh) / 2.0, (bw - d(px, 33.0)).max(1.0), 1, px, o);
         }
-    } else if let Some(detail) = &line.detail {
-        if avail > 1.0 {
+    } else if let Some(detail) = &line.detail
+        && avail > 1.0 {
             place_text_lines(detail, dx, ry + (row_h - detail.lh) / 2.0, avail, 1, px, o);
         }
-    }
     o.widget(WidgetKind::ToolToggle { detail: line.key, open: line.open }, (x, ry, cw, row_h), None);
 }
 
@@ -1140,10 +1138,10 @@ fn place_block(block: &DetailBlock, px: Px, bx: f32, by: f32, bw: f32, out: Opti
 /// Subagent spawns: 38pt rows holding a bordered 30pt card — icon tile,
 /// "Agent", the description, the model it was given, then a mini spinner
 /// while it runs or a chevron: the whole card opens the child's transcript.
-fn place_agents(t: &ToolGroup, px: Px, x: f32, y: f32, cw: f32, mut out: Option<&mut DisplayBuilder>) -> f32 {
+fn place_agents(t: &ToolGroup, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut DisplayBuilder>) -> f32 {
     let row = d(px, AGENT_ROW);
     let h = row * t.lines.len() as f32;
-    let Some(o) = out.as_deref_mut() else { return h };
+    let Some(o) = out else { return h };
     for (i, line) in t.lines.iter().enumerate() {
         let ry = y + i as f32 * row;
         let card_y = ry + (row - d(px, AGENT_CARD)) / 2.0;

@@ -186,7 +186,7 @@ impl Gpu {
             for y in 0..height as usize {
                 let src = &mapped[y * row as usize..][..width as usize * 4];
                 let dst = &mut bgra[y * width as usize * 4..][..width as usize * 4];
-                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.chunks_exact(4)) {
                     d[0] = s[2];
                     d[1] = s[1];
                     d[2] = s[0];

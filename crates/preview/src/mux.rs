@@ -196,6 +196,10 @@ impl Mux {
     pub fn is_closed(&self) -> bool {
         self.0.stop.is_cancelled()
     }
+    /// Streams open on this connection right now.
+    pub fn stream_count(&self) -> usize {
+        self.0.slots.lock().unwrap().len()
+    }
     async fn send(&self, frame: Frame) -> anyhow::Result<()> {
         tokio::select! { _ = self.0.stop.cancelled() => anyhow::bail!("preview connection closed"), result = self.0.outgoing.send(frame) => { result?; Ok(()) } }
     }
@@ -323,9 +327,8 @@ impl Mux {
             tokio::spawn(async move {
                 let cancel = stream.cancel.clone();
                 tokio::select! { _ = cancel.cancelled() => {}, _ = async {
-                    if let Ok(Ok(mut socket)) = tokio::time::timeout(std::time::Duration::from_secs(5), connector.connect(&service)).await {
-                        if mux.send(Frame::new(READY, id, Vec::new())).await.is_ok() { let _ = tokio::io::copy_bidirectional(&mut stream, &mut socket).await; }
-                    }
+                    if let Ok(Ok(mut socket)) = tokio::time::timeout(std::time::Duration::from_secs(5), connector.connect(&service)).await
+                        && mux.send(Frame::new(READY, id, Vec::new())).await.is_ok() { let _ = tokio::io::copy_bidirectional(&mut stream, &mut socket).await; }
                 } => {} }
             });
             return Ok(());

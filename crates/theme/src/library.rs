@@ -69,16 +69,13 @@ impl CustomThemeSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum CustomThemeStatus {
+    #[default]
     Ready,
     Warning { message: String },
 }
 
-impl Default for CustomThemeStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

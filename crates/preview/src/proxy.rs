@@ -241,11 +241,10 @@ fn rewrite_location(headers: &mut HeaderMap, upstream: &str, preview: &str) {
                 || path.starts_with('/')
                 || path.starts_with('?')
                 || path.starts_with('#')
-        }) {
-            if let Ok(value) = HeaderValue::from_str(&format!("{preview}{path}")) {
+        })
+            && let Ok(value) = HeaderValue::from_str(&format!("{preview}{path}")) {
                 headers.insert(header::LOCATION, value);
             }
-        }
     }
 }
 fn error(message: String) -> Response<Body> {

@@ -547,7 +547,7 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     crate::dictation::init(data_dir.clone(), cx);
     cx.set_global(SettingsStore {
         current: settings,
-        data_dir: data_dir.into(),
+        data_dir: data_dir,
         revision: 0,
         saved_revision: 0,
         code_fences_generation: 0,
@@ -2388,7 +2388,8 @@ impl UiSettings {
                         .get_mut("keymap")
                         .and_then(serde_json::Value::as_object_mut)
                     {
-                        for (id, field) in [(ShortcutId::ToggleFiles, "toggleFiles")] {
+                        {
+                            let (id, field) = (ShortcutId::ToggleFiles, "toggleFiles");
                             let default = platform_combo(id.default_combo());
                             let taken = !keymap.contains_key(field)
                                 && keymap.values().any(|existing| {

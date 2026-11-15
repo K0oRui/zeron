@@ -105,8 +105,10 @@ pub(super) fn spec() -> AcpAgentSpec {
 /// anonymous install still runs.
 fn fallback_rows() -> Vec<Model> {
     vec![Model {
+        default: false,
         id: "kilo/kilo-auto/free".into(),
         label: "Kilo Auto (Free)".into(),
+        provider: None,
         description: Some("Kilo's router picks a model for the task".into()),
         reasoning_levels: Vec::new(),
         options: Vec::new(),
@@ -190,8 +192,10 @@ mod tests {
     #[test]
     fn gateway_rows_keep_all_models_and_drop_the_prefix() {
         let row = |id: &str, label: &str| Model {
+            default: false,
             id: id.into(),
             label: label.into(),
+            provider: None,
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
@@ -231,8 +235,10 @@ mod tests {
     #[test]
     fn discovery_does_not_make_a_balance_decision() {
         let row = |id: &str, label: &str| Model {
+            default: false,
             id: id.into(),
             label: label.into(),
+            provider: None,
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
