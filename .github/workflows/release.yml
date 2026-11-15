@@ -39,10 +39,9 @@ permissions:
 # There is no trigger loop to worry about: creating a release does not emit a
 # push event, and this workflow only runs on push/workflow_dispatch.
 concurrency:
-  group: release-${{ github.ref }}
-  # A lost runner can leave a run "in progress" for an hour, and a queued run
-  # behind it then never starts. A newer run supersedes the older one; publish
-  # a tag deliberately by re-running it.
+  # Per commit, not just per ref: a lost runner on an older commit must not
+  # block a newer commit's release. A re-run of the same commit still serialises.
+  group: release-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
